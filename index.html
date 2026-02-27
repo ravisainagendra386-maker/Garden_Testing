@@ -1,0 +1,785 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Garden Finance — Test Suite</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+  :root {
+    --bg:        #0a0c0f;
+    --bg2:       #111418;
+    --bg3:       #181c22;
+    --border:    #1f2730;
+    --green:     #22c55e;
+    --red:       #ef4444;
+    --yellow:    #f59e0b;
+    --blue:      #3b82f6;
+    --purple:    #a855f7;
+    --cyan:      #06b6d4;
+    --text:      #e2e8f0;
+    --muted:     #64748b;
+    --accent:    #22c55e;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'Space Grotesk', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ── LAYOUT ── */
+  .app { display: grid; grid-template-columns: 260px 1fr; grid-template-rows: 56px 1fr; height: 100vh; }
+  .header { grid-column: 1/-1; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+  .sidebar { background: var(--bg2); border-right: 1px solid var(--border); overflow-y: auto; padding: 16px 0; }
+  .main { overflow-y: auto; padding: 24px; }
+
+  /* ── HEADER ── */
+  .logo { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 15px; }
+  .logo-dot { width: 8px; height: 8px; background: var(--green); border-radius: 50%; animation: pulse 2s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.5;transform:scale(1.4)} }
+
+  .header-right { display: flex; align-items: center; gap: 12px; }
+
+  .env-toggle { display: flex; gap: 4px; background: var(--bg3); border-radius: 8px; padding: 3px; }
+  .env-btn { padding: 4px 12px; border-radius: 6px; border: none; font-size: 12px; font-family: inherit; font-weight: 600; cursor: pointer; transition: all .2s; background: transparent; color: var(--muted); }
+  .env-btn.active { background: var(--accent); color: #000; }
+
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+  .status-dot.disconnected { background: var(--red); }
+
+  /* ── SIDEBAR NAV ── */
+  .nav-section { padding: 6px 16px; font-size: 10px; font-weight: 700; letter-spacing: .1em; color: var(--muted); text-transform: uppercase; margin-bottom: 4px; margin-top: 12px; }
+  .nav-item { display: flex; align-items: center; gap: 10px; padding: 9px 16px; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--muted); transition: all .15s; border-left: 2px solid transparent; }
+  .nav-item:hover { color: var(--text); background: var(--bg3); }
+  .nav-item.active { color: var(--accent); border-left-color: var(--accent); background: rgba(34,197,94,.07); }
+  .nav-icon { width: 16px; text-align: center; font-size: 14px; }
+
+  /* ── TABS / PANELS ── */
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ── CARDS ── */
+  .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
+  .card-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 4px; }
+  .card-value { font-size: 28px; font-weight: 700; line-height: 1; }
+
+  .stats-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }
+
+  /* ── BUTTONS ── */
+  .btn { display: inline-flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 8px; font-family: inherit; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: all .2s; }
+  .btn-green { background: var(--green); color: #000; }
+  .btn-green:hover { background: #16a34a; }
+  .btn-red { background: var(--red); color: #fff; }
+  .btn-red:hover { background: #dc2626; }
+  .btn-ghost { background: var(--bg3); color: var(--text); border: 1px solid var(--border); }
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+
+  /* ── ROUTE MATRIX ── */
+  .matrix-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 20px; }
+  .route-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+  .route-card { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 14px; cursor: pointer; transition: all .2s; }
+  .route-card:hover { border-color: var(--accent); }
+  .route-card.pass  { border-color: var(--green); background: rgba(34,197,94,.06); }
+  .route-card.fail  { border-color: var(--red); background: rgba(239,68,68,.06); }
+  .route-card.running { border-color: var(--yellow); background: rgba(245,158,11,.06); animation: blink .8s infinite; }
+  .route-card.skipped { opacity: .5; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.6} }
+
+  .route-label { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+  .route-status { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 10px; font-weight: 700; }
+  .badge.pass    { background: rgba(34,197,94,.2); color: var(--green); }
+  .badge.fail    { background: rgba(239,68,68,.2); color: var(--red); }
+  .badge.running { background: rgba(245,158,11,.2); color: var(--yellow); }
+  .badge.pending { background: rgba(100,116,139,.2); color: var(--muted); }
+  .badge.skipped { background: rgba(100,116,139,.15); color: var(--muted); }
+
+  /* ── STEP LOG ── */
+  .step-log { font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.7; }
+  .step-row { display: flex; align-items: flex-start; gap: 10px; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,.03); }
+  .step-name { width: 200px; flex-shrink: 0; color: var(--text); }
+  .step-detail { flex: 1; color: var(--muted); }
+  .step-tx { color: var(--cyan); text-decoration: none; font-size: 11px; }
+  .step-tx:hover { text-decoration: underline; }
+  .step-pass  { color: var(--green); }
+  .step-fail  { color: var(--red); }
+  .step-running { color: var(--yellow); }
+
+  /* ── APPROVAL MODAL ── */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.8); display: flex; align-items: center; justify-content: center; z-index: 100; display: none; }
+  .modal-overlay.open { display: flex; }
+  .modal { background: var(--bg2); border: 1px solid var(--border); border-radius: 16px; padding: 28px; width: 440px; max-width: 95vw; }
+  .modal-title { font-size: 17px; font-weight: 700; margin-bottom: 8px; }
+  .modal-subtitle { font-size: 13px; color: var(--muted); margin-bottom: 20px; }
+  .modal-details { background: var(--bg3); border-radius: 10px; padding: 16px; margin-bottom: 20px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  .detail-row { display: flex; justify-content: space-between; padding: 3px 0; }
+  .detail-key { color: var(--muted); }
+  .detail-val { color: var(--text); font-weight: 600; }
+  .modal-actions { display: flex; gap: 10px; }
+
+  /* ── CHATBOT ── */
+  .chat-container { display: flex; flex-direction: column; height: calc(100vh - 130px); }
+  .chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .chat-bubble { max-width: 80%; padding: 12px 16px; border-radius: 12px; font-size: 13px; line-height: 1.5; }
+  .chat-bubble.bot { background: var(--bg3); border: 1px solid var(--border); align-self: flex-start; border-radius: 4px 12px 12px 12px; }
+  .chat-bubble.user { background: var(--accent); color: #000; align-self: flex-end; border-radius: 12px 12px 4px 12px; font-weight: 600; }
+  .chat-input-row { display: flex; gap: 10px; padding: 16px; border-top: 1px solid var(--border); }
+  .chat-input { flex: 1; background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; color: var(--text); font-family: inherit; font-size: 13px; outline: none; }
+  .chat-input:focus { border-color: var(--accent); }
+  .chat-suggestions { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 16px 12px; }
+  .suggestion { padding: 5px 12px; border-radius: 20px; background: var(--bg3); border: 1px solid var(--border); font-size: 12px; cursor: pointer; color: var(--muted); transition: all .15s; }
+  .suggestion:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* ── WALLET SETTINGS ── */
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .field-group { display: flex; flex-direction: column; gap: 6px; }
+  .field-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+  .field-input { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 9px 12px; color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 12px; outline: none; width: 100%; }
+  .field-input:focus { border-color: var(--accent); }
+  .field-hint { font-size: 11px; color: var(--muted); }
+
+  /* ── ISSUE PANELS ── */
+  .issue-list { display: flex; flex-direction: column; gap: 10px; }
+  .issue-item { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  .issue-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+  .issue-title { font-size: 13px; font-weight: 600; }
+  .issue-detail { font-size: 12px; color: var(--muted); }
+  .sev-critical { color: var(--red); }
+  .sev-warning  { color: var(--yellow); }
+  .sev-info     { color: var(--blue); }
+
+  /* ── LIVE LOG ── */
+  .live-log { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; line-height: 1.8; padding: 16px; background: var(--bg3); border-radius: 10px; height: 300px; overflow-y: auto; border: 1px solid var(--border); }
+  .log-line { padding: 1px 0; }
+  .log-ts { color: var(--muted); margin-right: 10px; }
+  .log-pass { color: var(--green); }
+  .log-fail { color: var(--red); }
+  .log-info { color: var(--cyan); }
+  .log-warn { color: var(--yellow); }
+
+  /* ── MISC ── */
+  .divider { height: 1px; background: var(--border); margin: 20px 0; }
+  .section-title { font-size: 16px; font-weight: 700; margin-bottom: 16px; }
+  .empty-state { text-align: center; color: var(--muted); padding: 48px 0; font-size: 13px; }
+  .spinner { width: 14px; height: 14px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  pre { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); }
+
+  ::-webkit-scrollbar { width: 4px; } 
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      Garden Finance Test Suite
+    </div>
+    <div class="header-right">
+      <span id="envLabel" style="font-size:12px;color:var(--muted)">TESTNET</span>
+      <div class="env-toggle">
+        <button class="env-btn active" id="btnTestnet" onclick="switchEnv('testnet')">Testnet</button>
+        <button class="env-btn" id="btnMainnet" onclick="switchEnv('mainnet')">Mainnet</button>
+      </div>
+      <div class="status-dot" id="wsStatus" title="WebSocket disconnected"></div>
+      <span style="font-size:12px;color:var(--muted)" id="wsLabel">Connecting…</span>
+    </div>
+  </header>
+
+  <!-- SIDEBAR -->
+  <nav class="sidebar">
+    <div class="nav-section">Testing</div>
+    <div class="nav-item active" onclick="showPanel('dashboard')">
+      <span class="nav-icon">🏠</span> Dashboard
+    </div>
+    <div class="nav-item" onclick="showPanel('routes')">
+      <span class="nav-icon">🗺️</span> Route Matrix
+    </div>
+    <div class="nav-item" onclick="showPanel('issues')">
+      <span class="nav-icon">🐛</span> Issues <span id="issueCount" style="margin-left:auto;font-size:10px;background:rgba(239,68,68,.2);color:#ef4444;padding:1px 6px;border-radius:10px;display:none"></span>
+    </div>
+    <div class="nav-section">Tools</div>
+    <div class="nav-item" onclick="showPanel('chatbot')">
+      <span class="nav-icon">💬</span> Trade Chatbot
+    </div>
+    <div class="nav-item" onclick="showPanel('wallets')">
+      <span class="nav-icon">💳</span> Wallet Settings
+    </div>
+    <div class="nav-section">Monitor</div>
+    <div class="nav-item" onclick="showPanel('livelog')">
+      <span class="nav-icon">📡</span> Live Log
+    </div>
+  </nav>
+
+  <!-- MAIN CONTENT -->
+  <main class="main">
+
+    <!-- DASHBOARD PANEL -->
+    <div class="panel active" id="panel-dashboard">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+        <div>
+          <h1 style="font-size:22px;font-weight:700">Overview</h1>
+          <div style="font-size:13px;color:var(--muted);margin-top:2px" id="lastRunLabel">No tests run yet</div>
+        </div>
+        <div style="display:flex;gap:10px">
+          <button class="btn btn-ghost" onclick="runApiOnly()">🔌 API Tests</button>
+          <button class="btn btn-green" id="btnRunAll" onclick="runAll()">▶ Run All Tests</button>
+        </div>
+      </div>
+
+      <div class="stats-grid">
+        <div class="card">
+          <div class="card-title">Total Routes</div>
+          <div class="card-value" id="statTotal">—</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Passed</div>
+          <div class="card-value" id="statPassed" style="color:var(--green)">—</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Failed</div>
+          <div class="card-value" id="statFailed" style="color:var(--red)">—</div>
+        </div>
+        <div class="card">
+          <div class="card-title">Pass Rate</div>
+          <div class="card-value" id="statRate">—</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+          <div class="section-title" style="margin:0">Active Test</div>
+          <div id="activeTestBadge"></div>
+        </div>
+        <div id="activeTestSteps" class="step-log">
+          <div class="empty-state">No test running</div>
+        </div>
+      </div>
+
+      <!-- Approval modal area -->
+      <div id="approvalBanner" style="display:none;background:rgba(245,158,11,.1);border:1px solid var(--yellow);border-radius:12px;padding:16px;margin-bottom:16px">
+        <div style="font-size:14px;font-weight:700;color:var(--yellow);margin-bottom:8px">⏸ Manual Approval Required</div>
+        <div id="approvalInfo" style="font-family:'JetBrains Mono',monospace;font-size:12px;margin-bottom:14px;color:var(--muted)"></div>
+        <div style="display:flex;gap:10px">
+          <button class="btn btn-green" onclick="sendApproval(true)">✅ Approve & Send TX</button>
+          <button class="btn btn-red" onclick="sendApproval(false)">❌ Reject</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ROUTES PANEL -->
+    <div class="panel" id="panel-routes">
+      <div class="matrix-header">
+        <h1 class="section-title" style="margin:0">Route Matrix — All Chains</h1>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-ghost" id="btnFilterAll" onclick="filterRoutes('all')" style="font-size:11px;padding:5px 10px">All</button>
+          <button class="btn btn-ghost" id="btnFilterFail" onclick="filterRoutes('fail')" style="font-size:11px;padding:5px 10px">Failed</button>
+        </div>
+      </div>
+      <div class="route-grid" id="routeGrid">
+        <div class="empty-state" style="grid-column:1/-1">Routes will appear here after server connects…</div>
+      </div>
+    </div>
+
+    <!-- ISSUES PANEL -->
+    <div class="panel" id="panel-issues">
+      <h1 class="section-title">Issues Detected</h1>
+      <div style="display:flex;gap:10px;margin-bottom:20px">
+        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('all')">All</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('tech')">🔧 Tech</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('ux')">🎨 UX/UI</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('critical')">🔴 Critical</button>
+      </div>
+      <div class="issue-list" id="issueList">
+        <div class="empty-state">No issues detected yet — run tests first</div>
+      </div>
+    </div>
+
+    <!-- CHATBOT PANEL -->
+    <div class="panel" id="panel-chatbot">
+      <h1 class="section-title">Trade Chatbot</h1>
+      <div class="chat-container card" style="padding:0">
+        <div class="chat-messages" id="chatMessages">
+          <div class="chat-bubble bot">
+            👋 Hi! I can initiate a trade on any Garden Finance route.<br><br>
+            Try: <b>"swap 50000 sats from Bitcoin to Arbitrum"</b><br>
+            Or: <b>"bridge BTC to Base"</b><br>
+            Or ask: <b>"what routes are available?"</b>
+          </div>
+        </div>
+        <div class="chat-suggestions" id="chatSuggestions">
+          <span class="suggestion" onclick="chatSend('swap BTC to Arbitrum')">BTC → Arbitrum</span>
+          <span class="suggestion" onclick="chatSend('swap BTC to Base')">BTC → Base</span>
+          <span class="suggestion" onclick="chatSend('swap BTC to MegaETH')">BTC → MegaETH</span>
+          <span class="suggestion" onclick="chatSend('swap BTC to Solana')">BTC → Solana</span>
+          <span class="suggestion" onclick="chatSend('what routes are available')">Available routes?</span>
+        </div>
+        <div class="chat-input-row">
+          <input class="chat-input" id="chatInput" placeholder="e.g. swap 50000 sats from Bitcoin to Arbitrum…" onkeydown="if(event.key==='Enter') chatSend()">
+          <button class="btn btn-green" onclick="chatSend()">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- WALLET SETTINGS PANEL -->
+    <div class="panel" id="panel-wallets">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
+        <h1 class="section-title" style="margin:0">Wallet Settings</h1>
+        <button class="btn btn-green" onclick="saveWallets()">💾 Save Changes</button>
+      </div>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:20px">
+        Override the wallet address used for each chain type. Leave blank to use your Privy wallet address automatically.
+      </p>
+      <div class="settings-grid">
+        <div class="field-group">
+          <div class="field-label">EVM Address</div>
+          <input class="field-input" id="w-evm" placeholder="0x... (Ethereum, Arbitrum, Base, +8 more)">
+          <div class="field-hint">Used for all EVM chains (11 chains)</div>
+        </div>
+        <div class="field-group">
+          <div class="field-label">Bitcoin Address</div>
+          <input class="field-input" id="w-btc" placeholder="bc1q... or tb1q...">
+          <div class="field-hint">Run npm run generate-btc-key to get a testnet key</div>
+        </div>
+        <div class="field-group">
+          <div class="field-label">Solana Address</div>
+          <input class="field-input" id="w-solana" placeholder="...">
+          <div class="field-hint">Used for Solana routes</div>
+        </div>
+        <div class="field-group">
+          <div class="field-label">Starknet Address</div>
+          <input class="field-input" id="w-starknet" placeholder="0x...">
+          <div class="field-hint">Used for Starknet routes</div>
+        </div>
+        <div class="field-group">
+          <div class="field-label">Sui Address</div>
+          <input class="field-input" id="w-sui" placeholder="0x...">
+          <div class="field-hint">Used for Sui routes</div>
+        </div>
+        <div class="field-group">
+          <div class="field-label">Tron Address</div>
+          <input class="field-input" id="w-tron" placeholder="T...">
+          <div class="field-hint">Used for Tron routes</div>
+        </div>
+      </div>
+      <div class="divider"></div>
+      <div style="background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.3);border-radius:10px;padding:14px;font-size:12px;color:var(--yellow)">
+        ⚠️ Changes made here update the <code>.env</code> file via the server. Restart the server after saving.
+      </div>
+      <div class="divider"></div>
+      <h2 style="font-size:14px;font-weight:700;margin-bottom:14px">Manual Approve Mode</h2>
+      <div style="display:flex;align-items:center;gap:14px">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+          <input type="checkbox" id="manualApproveToggle" style="width:16px;height:16px;cursor:pointer" onchange="toggleManualApprove()">
+          Require manual approval before every transaction
+        </label>
+      </div>
+      <p style="font-size:12px;color:var(--muted);margin-top:8px">When enabled, a prompt will appear in the Dashboard before each transaction is broadcast on-chain.</p>
+    </div>
+
+    <!-- LIVE LOG PANEL -->
+    <div class="panel" id="panel-livelog">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+        <h1 class="section-title" style="margin:0">Live Event Log</h1>
+        <button class="btn btn-ghost" onclick="clearLog()">Clear</button>
+      </div>
+      <div class="live-log" id="liveLog">
+        <div class="log-line log-info"><span class="log-ts">[--:--:--]</span> Waiting for events…</div>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+<!-- APPROVAL MODAL -->
+<div class="modal-overlay" id="approvalModal">
+  <div class="modal">
+    <div class="modal-title">✋ Approve Transaction?</div>
+    <div class="modal-subtitle">Review this transaction before it's sent on-chain</div>
+    <div class="modal-details" id="approvalDetails"></div>
+    <div class="modal-actions">
+      <button class="btn btn-green" style="flex:1" onclick="sendApproval(true)">✅ Approve & Send</button>
+      <button class="btn btn-red" style="flex:1" onclick="sendApproval(false)">❌ Reject</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── STATE ──
+let ws = null;
+let pendingApproval = null;
+let routeStates = {};
+let issues = [];
+let allChains = [];
+let suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
+
+// ── WEBSOCKET ──
+function connectWS() {
+  ws = new WebSocket(`ws://${location.host}`);
+  ws.onopen = () => {
+    setWsStatus(true);
+    loadConfig();
+    loadChains();
+  };
+  ws.onclose = () => { setWsStatus(false); setTimeout(connectWS, 3000); };
+  ws.onmessage = (e) => handleWsMessage(JSON.parse(e.data));
+}
+
+function setWsStatus(ok) {
+  document.getElementById('wsStatus').className = 'status-dot' + (ok ? '' : ' disconnected');
+  document.getElementById('wsLabel').textContent = ok ? 'Connected' : 'Reconnecting…';
+}
+
+function handleWsMessage({ event, data }) {
+  logEvent(event, data);
+  if (event === 'suite_start')     handleSuiteStart(data);
+  if (event === 'test_start')      handleTestStart(data);
+  if (event === 'test_step')       handleTestStep(data);
+  if (event === 'test_end')        handleTestEnd(data);
+  if (event === 'suite_end')       handleSuiteEnd(data);
+  if (event === 'approval_request') handleApprovalRequest(data);
+  if (event === 'api_tests_done')  handleApiTestsDone(data);
+  if (event === 'error')           addIssue('tech', 'critical', 'Server Error', data.message);
+}
+
+// ── EVENT HANDLERS ──
+function handleSuiteStart(d) {
+  suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
+  updateStats();
+  document.getElementById('lastRunLabel').textContent = `Running… (${d.env.toUpperCase()})`;
+}
+
+function handleTestStart({ testId, label }) {
+  routeStates[label] = { status: 'running', steps: [], testId };
+  refreshRouteGrid();
+  document.getElementById('activeTestBadge').innerHTML = `<span class="badge running"><span class="spinner"></span> ${label}</span>`;
+  document.getElementById('activeTestSteps').innerHTML = '';
+}
+
+function handleTestStep({ label, step }) {
+  if (!routeStates[label]) routeStates[label] = { steps: [], status: 'running' };
+  routeStates[label].steps.push(step);
+  appendStep(step, document.getElementById('activeTestSteps'));
+  refreshRouteGrid();
+}
+
+function handleTestEnd({ label, status, error, steps }) {
+  if (routeStates[label]) routeStates[label].status = status;
+  suiteStats.total++;
+  if (status === 'pass') suiteStats.passed++;
+  else if (status === 'fail') { suiteStats.failed++; addIssue('tech','critical', `${label} failed`, error || 'See step log'); }
+  else suiteStats.skipped++;
+  updateStats();
+  refreshRouteGrid();
+  document.getElementById('activeTestBadge').innerHTML = `<span class="badge ${status}">${status.toUpperCase()}: ${label}</span>`;
+}
+
+function handleSuiteEnd(d) {
+  document.getElementById('lastRunLabel').textContent = 
+    `Last run: ${new Date().toLocaleTimeString()} — ${d.passed}/${d.total} passed`;
+  document.getElementById('btnRunAll').disabled = false;
+  document.getElementById('btnRunAll').innerHTML = '▶ Run All Tests';
+}
+
+function handleApprovalRequest(data) {
+  pendingApproval = data;
+  document.getElementById('approvalModal').classList.add('open');
+  document.getElementById('approvalDetails').innerHTML = `
+    <div class="detail-row"><span class="detail-key">Order ID</span><span class="detail-val">${data.orderId}</span></div>
+    <div class="detail-row"><span class="detail-key">Route</span><span class="detail-val">${data.label}</span></div>
+    <div class="detail-row"><span class="detail-key">From</span><span class="detail-val">${data.fromChain} — ${data.amount}</span></div>
+    <div class="detail-row"><span class="detail-key">To</span><span class="detail-val">${data.toChain} — ~${data.outputAmount}</span></div>
+    <div class="detail-row"><span class="detail-key">HTLC Address</span><span class="detail-val" style="font-size:10px">${data.htlcAddress}</span></div>
+  `;
+}
+
+function handleApiTestsDone(results) {
+  results.filter(r => r.status === 'fail').forEach(r => {
+    addIssue('tech', 'critical', `API Test Failed: ${r.name}`, r.error || '');
+  });
+}
+
+// ── APPROVAL ──
+function sendApproval(approved) {
+  if (!pendingApproval) return;
+  fetch('/api/approve', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ id: pendingApproval.id, approved }) });
+  document.getElementById('approvalModal').classList.remove('open');
+  pendingApproval = null;
+}
+
+// ── ROUTE GRID ──
+function refreshRouteGrid() {
+  const grid = document.getElementById('routeGrid');
+  if (!allChains.length) return;
+
+  const chains = allChains.filter(c => c.id !== 'bitcoin');
+  let html = '';
+  ['bitcoin', ...chains.map(c => c.id)].forEach(src => {
+    const targets = src === 'bitcoin' ? chains.map(c => c.id) : ['bitcoin'];
+    targets.forEach(dst => {
+      const srcName = allChains.find(c => c.id === src)?.name || src;
+      const dstName = allChains.find(c => c.id === dst)?.name || dst;
+      const label = `${srcName} → ${dstName}`;
+      const state = routeStates[label] || { status: 'pending' };
+      const statusIcon = { pass:'✅', fail:'❌', running:'⏳', skipped:'⏭', pending:'○' }[state.status] || '○';
+      html += `<div class="route-card ${state.status}" onclick="showRouteDetail('${label}')">
+        <div class="route-label">${statusIcon} ${label}</div>
+        <div class="route-status"><span class="badge ${state.status}">${state.status}</span></div>
+      </div>`;
+    });
+  });
+  grid.innerHTML = html;
+}
+
+function showRouteDetail(label) {
+  const state = routeStates[label];
+  if (!state || !state.steps.length) return;
+  showPanel('dashboard');
+  const el = document.getElementById('activeTestSteps');
+  el.innerHTML = '';
+  state.steps.forEach(s => appendStep(s, el));
+  document.getElementById('activeTestBadge').innerHTML = `<span class="badge ${state.status}">${label}</span>`;
+}
+
+function appendStep(step, container) {
+  if (container.querySelector('.empty-state')) container.innerHTML = '';
+  const icon = { pass:'✅', fail:'❌', running:'⏳', pending:'⏸', skipped:'⏭', pass_skip:'✅' }[step.status] || '•';
+  const cls = step.status === 'fail' ? 'step-fail' : step.status === 'pass' ? 'step-pass' : 'step-running';
+  const tx = step.txHash && step.txHash !== 'solver_auto_redeem'
+    ? `<a class="step-tx" href="#" title="${step.txHash}">[tx]</a>` : '';
+  container.innerHTML += `<div class="step-row">
+    <span class="step-name ${cls}">${icon} ${step.name}</span>
+    <span class="step-detail">${step.detail || ''} ${tx}</span>
+  </div>`;
+  container.scrollTop = container.scrollHeight;
+}
+
+// ── ISSUES ──
+function addIssue(type, severity, title, detail) {
+  issues.push({ type, severity, title, detail, ts: new Date().toLocaleTimeString() });
+  renderIssues();
+  const badge = document.getElementById('issueCount');
+  badge.textContent = issues.length;
+  badge.style.display = 'inline';
+}
+
+function renderIssues(filter = 'all') {
+  const list = document.getElementById('issueList');
+  const filtered = filter === 'all' ? issues : issues.filter(i => i.type === filter || i.severity === filter);
+  if (!filtered.length) { list.innerHTML = '<div class="empty-state">No issues detected yet — run tests first</div>'; return; }
+  list.innerHTML = filtered.map(i => `
+    <div class="issue-item">
+      <div class="issue-header">
+        <span class="issue-title">${i.title}</span>
+        <span class="badge sev-${i.severity}">${i.severity.toUpperCase()}</span>
+      </div>
+      <div class="issue-detail">${i.detail}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">${i.type.toUpperCase()} · ${i.ts}</div>
+    </div>`).join('');
+}
+
+function filterIssues(f) { renderIssues(f); }
+
+// ── STATS ──
+function updateStats() {
+  document.getElementById('statTotal').textContent  = suiteStats.total || '—';
+  document.getElementById('statPassed').textContent = suiteStats.passed || '—';
+  document.getElementById('statFailed').textContent = suiteStats.failed || '—';
+  const rate = suiteStats.total ? Math.round(suiteStats.passed / suiteStats.total * 100) + '%' : '—';
+  document.getElementById('statRate').textContent = rate;
+  document.getElementById('statRate').style.color = suiteStats.failed > 0 ? 'var(--red)' : 'var(--green)';
+}
+
+// ── ACTIONS ──
+function runAll() {
+  document.getElementById('btnRunAll').disabled = true;
+  document.getElementById('btnRunAll').innerHTML = '<span class="spinner"></span> Running…';
+  suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
+  updateStats();
+  issues = [];
+  renderIssues();
+  fetch('/api/run', { method: 'POST' });
+}
+
+function runApiOnly() {
+  fetch('/api/run/api-tests', { method: 'POST' });
+}
+
+function switchEnv(env) {
+  if (!confirm(`Switch to ${env.toUpperCase()}? The server must be restarted manually after.`)) return;
+  fetch('/api/switch-env', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ env }) })
+    .then(r => r.json()).then(d => alert(d.message));
+  document.getElementById('envLabel').textContent = env.toUpperCase();
+  document.getElementById('btnTestnet').classList.toggle('active', env === 'testnet');
+  document.getElementById('btnMainnet').classList.toggle('active', env === 'mainnet');
+}
+
+function saveWallets() {
+  const fields = { evm:'w-evm', btc:'w-btc', solana:'w-solana', starknet:'w-starknet', sui:'w-sui', tron:'w-tron' };
+  const updates = {};
+  for (const [key, id] of Object.entries(fields)) {
+    const v = document.getElementById(id).value.trim();
+    if (v) updates[key] = v;
+  }
+  alert('Address overrides saved!\n\nAdd these to your .env as OVERRIDE_EVM_ADDRESS etc, then restart the server.\n\n' + JSON.stringify(updates, null, 2));
+}
+
+function toggleManualApprove() {
+  const on = document.getElementById('manualApproveToggle').checked;
+  alert(`Manual approve mode ${on ? 'ENABLED' : 'DISABLED'}.\n\nSet MANUAL_APPROVE=${on} in your .env and restart server.`);
+}
+
+// ── CHATBOT ──
+const chainAliases = {
+  btc: 'bitcoin', bitcoin: 'bitcoin', arbitrum: 'arbitrum', arb: 'arbitrum',
+  base: 'base', solana: 'solana', sol: 'solana', ethereum: 'ethereum', eth: 'ethereum',
+  megaeth: 'megaeth', mega: 'megaeth', bnb: 'bnbchain', bsc: 'bnbchain',
+  berachain: 'berachain', bera: 'berachain', unichain: 'unichain', uni: 'unichain',
+  hyperevm: 'hyperevm', hyper: 'hyperevm', corn: 'corn', botanix: 'botanix',
+  core: 'core', starknet: 'starknet', stark: 'starknet', sui: 'sui', tron: 'tron',
+};
+
+function botMsg(text) {
+  const msgs = document.getElementById('chatMessages');
+  msgs.innerHTML += `<div class="chat-bubble bot">${text}</div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function userMsg(text) {
+  const msgs = document.getElementById('chatMessages');
+  msgs.innerHTML += `<div class="chat-bubble user">${text}</div>`;
+  msgs.scrollTop = msgs.scrollHeight;
+}
+
+function chatSend(msg) {
+  const input = document.getElementById('chatInput');
+  const text = msg || input.value.trim();
+  if (!text) return;
+  input.value = '';
+  userMsg(text);
+  processChatCommand(text.toLowerCase());
+}
+
+async function processChatCommand(text) {
+  // Routes query
+  if (text.includes('available') || text.includes('routes') || text.includes('chains')) {
+    const chains = allChains.map(c => c.name).join(', ');
+    botMsg(`Available chains: <b>${chains}</b><br><br>All routes go through Bitcoin as the source or destination.`);
+    return;
+  }
+
+  // Quote query
+  if (text.includes('quote') || text.includes('how much')) {
+    const match = parseRoute(text);
+    if (!match) { botMsg("I couldn't parse that. Try: <b>quote 50000 sats BTC to Arbitrum</b>"); return; }
+    botMsg(`⏳ Getting quote for ${match.fromName} → ${match.toName}…`);
+    const q = await fetch('/api/quote', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ fromChain: match.from, toChain: match.to, amount: match.amount }) }).then(r=>r.json());
+    if (q.error) { botMsg(`❌ ${q.error}`); return; }
+    const out = q.result?.output_amount || q.result?.to_amount;
+    botMsg(`📊 Quote: <b>${match.amount}</b> ${match.fromName} → <b>~${out}</b> ${match.toName}`);
+    return;
+  }
+
+  // Initiate trade
+  if (text.includes('swap') || text.includes('bridge') || text.includes('trade') || text.includes('send')) {
+    const match = parseRoute(text);
+    if (!match) { botMsg("I couldn't parse that. Try: <b>swap 50000 sats from Bitcoin to Arbitrum</b>"); return; }
+    botMsg(`🚀 Initiating trade: <b>${match.fromName} → ${match.toName}</b> with amount <b>${match.amount}</b>…`);
+    const r = await fetch('/api/trade', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ fromChain: match.from, toChain: match.to, amount: match.amount }) }).then(r=>r.json());
+    if (r.error) { botMsg(`❌ ${r.error}`); return; }
+    botMsg(`✅ Test trade started! Switch to <b>Dashboard</b> or <b>Live Log</b> to monitor progress.`);
+    return;
+  }
+
+  botMsg(`I can help you:<br>• <b>swap BTC to Arbitrum</b> — initiate a test trade<br>• <b>quote 50000 sats BTC to Base</b> — get a price quote<br>• <b>what routes are available?</b> — list all chains`);
+}
+
+function parseRoute(text) {
+  const amountMatch = text.match(/(\d+)/);
+  const amount = amountMatch ? parseInt(amountMatch[1]) : 50000;
+  let from = null, to = null;
+  const words = text.split(/\s+/);
+  let foundFrom = false;
+  for (const w of words) {
+    const chain = chainAliases[w.replace(/[^a-z]/g,'')];
+    if (chain && !foundFrom) { from = chain; foundFrom = true; }
+    else if (chain && foundFrom) { to = chain; break; }
+  }
+  if (!from || !to) return null;
+  const fromName = allChains.find(c => c.id === from)?.name || from;
+  const toName = allChains.find(c => c.id === to)?.name || to;
+  return { from, to, amount, fromName, toName };
+}
+
+// ── LIVE LOG ──
+function logEvent(event, data) {
+  const log = document.getElementById('liveLog');
+  const ts = new Date().toLocaleTimeString();
+  const cls = event.includes('pass') || event.includes('end') ? 'log-pass'
+            : event.includes('fail') || event.includes('error') ? 'log-fail'
+            : event.includes('start') ? 'log-info' : 'log-warn';
+  const detail = typeof data === 'object' ? (data.label || data.message || data.event || '') : '';
+  log.innerHTML += `<div class="log-line ${cls}"><span class="log-ts">[${ts}]</span> ${event}${detail ? ' — ' + detail : ''}</div>`;
+  log.scrollTop = log.scrollHeight;
+  if (log.children.length > 500) log.removeChild(log.firstChild);
+}
+
+function clearLog() { document.getElementById('liveLog').innerHTML = ''; }
+
+// ── LOAD CONFIG ──
+async function loadConfig() {
+  const cfg = await fetch('/api/config').then(r => r.json()).catch(() => ({}));
+  if (cfg.env) {
+    document.getElementById('btnTestnet').classList.toggle('active', cfg.env === 'testnet');
+    document.getElementById('btnMainnet').classList.toggle('active', cfg.env === 'mainnet');
+    document.getElementById('envLabel').textContent = cfg.env.toUpperCase();
+  }
+  if (cfg.manualApprove !== undefined) {
+    document.getElementById('manualApproveToggle').checked = cfg.manualApprove;
+  }
+}
+
+async function loadChains() {
+  allChains = await fetch('/api/chains').then(r => r.json()).catch(() => []);
+  refreshRouteGrid();
+  // Pre-populate stats
+  const srcCount = allChains.filter(c => c.id !== 'bitcoin').length;
+  document.getElementById('statTotal').textContent = srcCount * 2 + ' routes';
+}
+
+// ── NAVIGATION ──
+function showPanel(id) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById(`panel-${id}`).classList.add('active');
+  const items = document.querySelectorAll('.nav-item');
+  items.forEach(item => { if (item.getAttribute('onclick')?.includes(id)) item.classList.add('active'); });
+}
+
+function filterRoutes(f) {
+  document.querySelectorAll('.route-card').forEach(card => {
+    if (f === 'all') card.style.display = '';
+    else card.style.display = card.classList.contains(f) ? '' : 'none';
+  });
+}
+
+// ── INIT ──
+connectWS();
+</script>
+</body>
+</html>

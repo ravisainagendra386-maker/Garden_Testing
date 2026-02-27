@@ -1,0 +1,29 @@
+{
+  "name": "garden-test-suite",
+  "version": "1.0.0",
+  "description": "Garden Finance E2E automated testing dashboard - all chains",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node src/tests/runner.js",
+    "generate-btc-key": "node src/wallet/generate-btc-key.js",
+    "validate-env": "node src/config.js"
+  },
+  "dependencies": {
+    "@privy-io/node": "^0.9.0",
+    "@solana/web3.js": "^1.90.0",
+    "@mysten/sui.js": "^0.50.1",
+    "axios": "^1.6.7",
+    "bitcoinjs-lib": "^6.1.5",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.1",
+    "ecpair": "^2.1.0",
+    "ethers": "^6.11.1",
+    "express": "^4.18.2",
+    "tiny-secp256k1": "^2.2.3",
+    "starknet": "^6.11.0",
+    "tronweb": "^5.3.2",
+    "ws": "^8.16.0"
+  },
+  "engines": { "node": ">=18.0.0" }
+}
