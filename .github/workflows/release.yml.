@@ -1,0 +1,30 @@
+name: Create Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # Triggers when you create a tag like v1.0.0
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: |
+          ## Changes in this Release
+          - Automated release from GitHub Actions
+          - Check commits for detailed changes
+        draft: false
+        prerelease: false
+    
+    - name: Release notification
+      run: echo "🎉 Release ${{ github.ref }} created successfully!"
