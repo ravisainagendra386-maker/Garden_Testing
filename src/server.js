@@ -7,6 +7,15 @@ const path = require("path");
 const axios = require("axios");
 const config = require("./config");
 const runner = require("./tests/runner");
+const walletStore = {
+  privy:    null,
+  btc:      null,
+  evm:      null,
+  solana:   null,
+  starknet: null,
+  sui:      null,
+  tron:     null,
+};
 const garden = require("./api/garden");
 
 const app = express();
@@ -104,13 +113,8 @@ app.post("/api/privy/connect", async (req, res) => {
   try {
     const { PrivyClient } = require("@privy-io/node");
     const privy = new PrivyClient(appId, appSecret);
-    const evmWallet = await privy.walletApi.getWallet({ id: evmWalletId });
-    const evmAddress = evmWallet.address;
-    let solanaAddress = null;
-    if (solanaWalletId) {
-      const sw = await privy.walletApi.getWallet({ id: solanaWalletId });
-      solanaAddress = sw.address;
-    }
+    const evmAddress = `privy:${evmWalletId}`;
+    let solanaAddress = solanaWalletId ? `privy:${solanaWalletId}` : null;
     walletStore.privy = { appId, appSecret, evmWalletId, solanaWalletId, evmAddress, solanaAddress };
     res.json({ ok: true, evmAddress, solanaAddress });
   } catch (err) {
@@ -207,4 +211,16 @@ server.listen(config.port, () => {
   console.log(`   Chains: ${Object.keys(config.chains).length}\n`);
 });
 
+app.post("/api/privy/connect", async (req, res) => {
+  const { appId, appSecret, evmWalletId, solanaWalletId } = req.body;
+  if (!appId || !appSecret || !evmWalletId) return res.status(400).json({ error: "appId, appSecret, evmWalletId required" });
+  try {
+    const evmAddress = `privy:${evmWalletId}`;
+    const solanaAddress = solanaWalletId ? `privy:${solanaWalletId}` : null;
+    walletStore.privy = { appId, appSecret, evmWalletId, solanaWalletId, evmAddress, solanaAddress };
+    res.json({ ok: true, evmAddress, solanaAddress });
+  } catch (err) {
+    res.status(500).json({ error: `Privy failed: ${err.message}` });
+  }
+});
 module.exports = { server, broadcast };
