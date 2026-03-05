@@ -1,186 +1,210 @@
+// src/server.js
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
 const cors = require("cors");
 const path = require("path");
+const axios = require("axios");
 const config = require("./config");
 const runner = require("./tests/runner");
 const garden = require("./api/garden");
-const { getBtcBalanceSats } = require("./wallet/btc");
-const { getAddress } = require("./wallet/privy");
-const { ethers } = require("ethers");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// Serve dashboard
 app.use(express.static(path.join(__dirname, "../dashboard")));
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
+// ── IN-MEMORY WALLET STORE (never written to disk) ────────────
+const walletStore = {
+  privy:    null, // { appId, appSecret, evmWalletId, solanaWalletId, evmAddress, solanaAddress }
+  btc:      null, // { address, wif, balance }
+  evm:      null, // { address }
+  solana:   null, // { address, balance }
+  starknet: null, // { address }
+  sui:      null, // { address }
+  tron:     null, // { address }
+};
+
 function broadcast(event, data) {
   const msg = JSON.stringify({ event, data, ts: new Date().toISOString() });
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) client.send(msg);
-  });
+  wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
 }
-
 runner.setEmitter(broadcast);
 
-app.post("/api/run", async (_req, res) => {
+// ── HEALTH ────────────────────────────────────────────────────
+app.get("/api/health", (req, res) => res.json({ status: "ok" }));
+
+// ── TEST ROUTES ───────────────────────────────────────────────
+app.post("/api/run", async (req, res) => {
   res.json({ started: true, env: config.env });
-  runner.runAll().catch((err) => broadcast("error", { message: err.message }));
+  runner.runAll().catch(err => broadcast("error", { message: err.message }));
 });
 
 app.post("/api/run/route", async (req, res) => {
-  const { fromChain, toChain } = req.body || {};
-  if (!fromChain || !toChain)
-    return res
-      .status(400)
-      .json({ error: "fromChain and toChain required" });
+  const { fromChain, toChain } = req.body;
+  if (!fromChain || !toChain) return res.status(400).json({ error: "fromChain and toChain required" });
   const from = config.chains[fromChain];
   const to = config.chains[toChain];
   if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
   res.json({ started: true });
-  runner
-    .runRoute({
-      fromChain,
-      toChain,
-      fromAsset: from.asset,
-      toAsset: to.asset,
-      amount:
-        fromChain === "bitcoin"
-          ? config.test.btcAmountSats
-          : config.test.evmAmount,
-      label: `${from.name} → ${to.name}`,
-    })
-    .catch((err) => broadcast("error", { message: err.message }));
+  runner.runRoute({ fromChain, toChain, fromAsset: from.asset, toAsset: to.asset, amount: 50000, label: `${from.name} → ${to.name}` })
+    .catch(err => broadcast("error", { message: err.message }));
 });
 
-app.post("/api/run/api-tests", async (_req, res) => {
+app.post("/api/run/api-tests", async (req, res) => {
   const results = await runner.runApiTests();
   res.json(results);
 });
 
 app.post("/api/approve", (req, res) => {
-  const { id, approved } = req.body || {};
-  runner.handleApproval(id, approved);
+  runner.handleApproval(req.body.id, req.body.approved);
   res.json({ ok: true });
 });
 
-app.get("/api/chains", (_req, res) => {
-  res.json(
-    Object.values(config.chains).map((c) => ({
-      id: c.id,
-      name: c.name,
-      type: c.type,
-      rpc: c.rpc,
-      explorer: c.explorer,
-      asset: c.asset,
-    }))
-  );
+app.get("/api/chains", (req, res) => {
+  res.json(Object.values(config.chains).map(c => ({ id: c.id, name: c.name, type: c.type, rpc: c.rpc, explorer: c.explorer, asset: c.asset })));
 });
 
-app.get("/api/config", (_req, res) => {
-  res.json({
-    env: config.env,
-    isMainnet: config.isMainnet,
-    manualApprove: config.manualApprove,
-    chainCount: Object.keys(config.chains).length,
-    envValidationSkipped: config.envValidationSkipped,
-    hasGardenApiKey: Boolean(config.garden.apiKey),
-  });
+app.get("/api/config", (req, res) => {
+  res.json({ env: config.env, isMainnet: config.isMainnet, manualApprove: config.manualApprove, chainCount: Object.keys(config.chains).length });
 });
 
 app.post("/api/switch-env", (req, res) => {
-  const { env } = req.body || {};
-  if (!["testnet", "mainnet"].includes(env))
-    return res.status(400).json({ error: "Invalid env" });
+  const { env } = req.body;
+  if (!["testnet", "mainnet"].includes(env)) return res.status(400).json({ error: "Invalid env" });
   process.env.GARDEN_ENV = env;
   res.json({ ok: true, message: `Switched to ${env}. Please restart the server.` });
 });
 
 app.post("/api/quote", async (req, res) => {
-  const { fromChain, toChain, amount } = req.body || {};
-  const from = config.chains[fromChain];
-  const to = config.chains[toChain];
+  const { fromChain, toChain, amount } = req.body;
+  const from = config.chains[fromChain]; const to = config.chains[toChain];
   if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
-  try {
-    const q = await garden.getQuote(from.asset, to.asset, amount);
-    res.json(q);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-app.get("/api/balance", async (req, res) => {
-  const chain = String(req.query.chain || "bitcoin");
-  const c = config.chains[chain];
-  if (!c) return res.status(400).json({ error: "Unknown chain" });
-
-  try {
-    if (c.type === "bitcoin") {
-      const address = config.btc.address;
-      if (!address) return res.status(400).json({ error: "BTC_ADDRESS is missing in .env" });
-      const balanceSats = await getBtcBalanceSats(address);
-      return res.json({ chain, type: c.type, address, balanceSats });
-    }
-    if (c.type === "evm") {
-      const address = await getAddress("evm");
-      const provider = new ethers.JsonRpcProvider(c.rpc);
-      const wei = await provider.getBalance(address);
-      return res.json({ chain, type: c.type, address, balanceWei: wei.toString(), balanceEth: ethers.formatEther(wei) });
-    }
-    return res.json({ chain, type: c.type, address: null, balance: null, note: "Balance not implemented for this chain type yet." });
-  } catch (err) {
-    return res.status(500).json({ error: err.message });
-  }
+  try { res.json(await garden.getQuote(from.asset, to.asset, amount)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/trade", async (req, res) => {
-  const { fromChain, toChain, amount } = req.body || {};
-  if (!fromChain || !toChain || !amount)
-    return res.status(400).json({ error: "fromChain, toChain, amount required" });
-  const from = config.chains[fromChain];
-  const to = config.chains[toChain];
+  const { fromChain, toChain, amount } = req.body;
+  if (!fromChain || !toChain || !amount) return res.status(400).json({ error: "fromChain, toChain, amount required" });
+  const from = config.chains[fromChain]; const to = config.chains[toChain];
   if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
+  res.json({ started: true });
+  runner.runRoute({ fromChain, toChain, fromAsset: from.asset, toAsset: to.asset, amount, label: `Chatbot: ${from.name} → ${to.name}` })
+    .catch(err => broadcast("error", { message: err.message }));
+});
+
+// ── WALLET: PRIVY ─────────────────────────────────────────────
+app.post("/api/privy/connect", async (req, res) => {
+  const { appId, appSecret, evmWalletId, solanaWalletId } = req.body;
+  if (!appId || !appSecret || !evmWalletId) return res.status(400).json({ error: "appId, appSecret, evmWalletId required" });
   try {
-    const label = `Trade: ${from.name} → ${to.name}`;
-    const result = await runner.runRoute({
-      fromChain,
-      toChain,
-      fromAsset: from.asset,
-      toAsset: to.asset,
-      amount,
-      label,
-    });
-    if (result.status === "fail") return res.status(400).json({ error: result.error || "Trade failed" });
-    return res.json({
-      ok: true,
-      label,
-      testId: result.testId,
-      orderId: result.orderId || null,
-      depositTo: result.depositTo || null,
-      depositAmount: result.depositAmount || null,
-      note: "Order created and status monitoring started. See Dashboard/Live Log.",
-    });
+    const { PrivyClient } = require("@privy-io/node");
+    const privy = new PrivyClient(appId, appSecret);
+    const evmWallet = await privy.walletApi.getWallet({ id: evmWalletId });
+    const evmAddress = evmWallet.address;
+    let solanaAddress = null;
+    if (solanaWalletId) {
+      const sw = await privy.walletApi.getWallet({ id: solanaWalletId });
+      solanaAddress = sw.address;
+    }
+    walletStore.privy = { appId, appSecret, evmWalletId, solanaWalletId, evmAddress, solanaAddress };
+    res.json({ ok: true, evmAddress, solanaAddress });
   } catch (err) {
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: `Privy failed: ${err.message}` });
   }
 });
 
+app.get("/api/privy/status", (req, res) => {
+  if (!walletStore.privy) return res.json({ connected: false });
+  res.json({ connected: true, evmAddress: walletStore.privy.evmAddress, solanaAddress: walletStore.privy.solanaAddress });
+});
+
+app.post("/api/privy/disconnect", (req, res) => {
+  walletStore.privy = null;
+  res.json({ ok: true });
+});
+
+// ── WALLET: BTC ───────────────────────────────────────────────
+app.post("/api/wallet/btc", async (req, res) => {
+  const { address, wif } = req.body;
+  if (!address) return res.status(400).json({ error: "address required" });
+  try {
+    const net = config.isMainnet ? "" : "/testnet4";
+    const r = await axios.get(`https://mempool.space${net}/api/address/${address}`);
+    const s = r.data?.chain_stats || {};
+    const sats = (s.funded_txo_sum || 0) - (s.spent_txo_sum || 0);
+    const balance = (sats / 1e8).toFixed(8);
+    walletStore.btc = { address, wif: wif || null, balance };
+    res.json({ ok: true, address, balance });
+  } catch (_) {
+    walletStore.btc = { address, wif: wif || null, balance: "unknown" };
+    res.json({ ok: true, address, balance: "unknown" });
+  }
+});
+
+// ── WALLET: EVM (from MetaMask frontend) ─────────────────────
+app.post("/api/wallet/evm", (req, res) => {
+  const { address } = req.body;
+  if (!address) return res.status(400).json({ error: "address required" });
+  walletStore.evm = { address };
+  res.json({ ok: true, address });
+});
+
+// ── WALLET: SOLANA (from Phantom frontend) ───────────────────
+app.post("/api/wallet/solana", (req, res) => {
+  const { address, balance } = req.body;
+  if (!address) return res.status(400).json({ error: "address required" });
+  walletStore.solana = { address, balance: balance || null };
+  res.json({ ok: true, address });
+});
+
+// ── WALLET: STARKNET / SUI / TRON ────────────────────────────
+app.post("/api/wallet/starknet", (req, res) => { walletStore.starknet = req.body.address ? { address: req.body.address } : null; res.json({ ok: true }); });
+app.post("/api/wallet/sui",      (req, res) => { walletStore.sui      = req.body.address ? { address: req.body.address } : null; res.json({ ok: true }); });
+app.post("/api/wallet/tron",     (req, res) => { walletStore.tron     = req.body.address ? { address: req.body.address } : null; res.json({ ok: true }); });
+
+// ── WALLET: DISCONNECT ────────────────────────────────────────
+app.post("/api/wallet/disconnect", (req, res) => {
+  const { type } = req.body;
+  if (type in walletStore) walletStore[type] = null;
+  res.json({ ok: true });
+});
+
+// ── WALLET: GET ALL STATUSES ──────────────────────────────────
+app.get("/api/wallet/balances", async (req, res) => {
+  // Refresh BTC balance live
+  if (walletStore.btc?.address) {
+    try {
+      const net = config.isMainnet ? "" : "/testnet4";
+      const r = await axios.get(`https://mempool.space${net}/api/address/${walletStore.btc.address}`);
+      const s = r.data?.chain_stats || {};
+      const sats = (s.funded_txo_sum || 0) - (s.spent_txo_sum || 0);
+      walletStore.btc.balance = (sats / 1e8).toFixed(8);
+    } catch (_) {}
+  }
+  res.json({
+    evm:      walletStore.evm      ? { address: walletStore.evm.address } : null,
+    btc:      walletStore.btc      ? { address: walletStore.btc.address, balance: walletStore.btc.balance } : null,
+    solana:   walletStore.solana   ? { address: walletStore.solana.address, balance: walletStore.solana.balance } : null,
+    starknet: walletStore.starknet ? { address: walletStore.starknet.address } : null,
+    sui:      walletStore.sui      ? { address: walletStore.sui.address } : null,
+    tron:     walletStore.tron     ? { address: walletStore.tron.address } : null,
+    privy:    walletStore.privy    ? { connected: true, evmAddress: walletStore.privy.evmAddress, solanaAddress: walletStore.privy.solanaAddress } : { connected: false },
+  });
+});
+
+// ── START ─────────────────────────────────────────────────────
 server.listen(config.port, () => {
   console.log(`\n✅  Garden Test Suite running`);
   console.log(`   Dashboard: http://localhost:${config.port}`);
   console.log(`   Environment: ${config.env.toUpperCase()}`);
-  console.log(`   Manual Approve: ${config.manualApprove ? "ON ✋" : "OFF"}`);
-  if (config.envValidationSkipped) {
-    console.log(`   Env validation: SKIPPED (set SKIP_ENV_VALIDATE=false to enforce)`);
-  }
+  console.log(`   Manual Approve: ${config.manualApprove ? "ON ✋" : "OFF 🤖"}`);
+  console.log(`   Env validation: ${process.env.SKIP_ENV_VALIDATE === 'true' ? 'SKIPPED (set SKIP_ENV_VALIDATE=false to enforce)' : 'ACTIVE'}`);
   console.log(`   Chains: ${Object.keys(config.chains).length}\n`);
 });
 
 module.exports = { server, broadcast };
-

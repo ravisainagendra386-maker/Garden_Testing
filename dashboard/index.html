@@ -164,15 +164,6 @@
   .log-info { color: var(--cyan); }
   .log-warn { color: var(--yellow); }
 
-  /* ── WALLET BALANCES ── */
-  .wallet-balance-list { margin-top: 10px; display:flex; flex-direction:column; gap:8px; }
-  .wallet-balance-row { display:flex; align-items:center; justify-content:space-between; padding:8px 10px; border-radius:8px; background:var(--bg3); border:1px solid var(--border); font-size:12px; }
-  .wallet-balance-chain { font-weight:600; }
-  .wallet-balance-address { font-family:'JetBrains Mono',monospace; font-size:11px; color:var(--muted); margin-top:2px; }
-  .wallet-balance-right { display:flex; align-items:center; gap:8px; }
-  .wallet-balance-amount { font-weight:600; }
-  .wallet-copy-btn { font-size:11px; padding:4px 10px; }
-
   /* ── MISC ── */
   .divider { height: 1px; background: var(--border); margin: 20px 0; }
   .section-title { font-size: 16px; font-weight: 700; margin-bottom: 16px; }
@@ -181,7 +172,16 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   pre { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); }
 
-  ::-webkit-scrollbar { width: 4px; } 
+  /* ── WALLET GROUPS ── */
+  .wallet-group { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 14px; }
+  .wallet-group-header { display: flex; align-items: center; justify-content: space-between; }
+  .chain-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid rgba(255,255,255,.04); margin-top: 10px; font-size: 12px; }
+  .chain-name { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .chain-addr { font-family: 'JetBrains Mono', monospace; color: var(--muted); font-size: 11px; }
+  .chain-connected { color: var(--green); }
+  .chain-wrong { color: var(--yellow); }
+
+  ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 </style>
@@ -224,7 +224,7 @@
       <span class="nav-icon">💬</span> Trade Chatbot
     </div>
     <div class="nav-item" onclick="showPanel('wallets')">
-      <span class="nav-icon">💳</span> Wallet Settings
+      <span class="nav-icon">💳</span> Connect Wallets <span id="walletCount" style="margin-left:auto;font-size:10px;background:rgba(34,197,94,.2);color:#22c55e;padding:1px 6px;border-radius:10px;display:none"></span>
     </div>
     <div class="nav-section">Monitor</div>
     <div class="nav-item" onclick="showPanel('livelog')">
@@ -331,6 +331,7 @@
         <div class="chat-suggestions" id="chatSuggestions">
           <span class="suggestion" onclick="chatSend('swap BTC to Arbitrum')">BTC → Arbitrum</span>
           <span class="suggestion" onclick="chatSend('swap BTC to Base')">BTC → Base</span>
+          <span class="suggestion" onclick="chatSend('swap BTC to MegaETH')">BTC → MegaETH</span>
           <span class="suggestion" onclick="chatSend('swap BTC to Solana')">BTC → Solana</span>
           <span class="suggestion" onclick="chatSend('what routes are available')">Available routes?</span>
         </div>
@@ -341,36 +342,181 @@
       </div>
     </div>
 
-    <!-- WALLET SETTINGS PANEL -->
+    <!-- CONNECT WALLETS PANEL -->
     <div class="panel" id="panel-wallets">
-      <h1 class="section-title" style="margin:0 0 8px 0">Wallet Settings</h1>
-      <p style="font-size:13px;color:var(--muted);margin-bottom:16px">
-        View your wallet address and balance per chain. Use the copy and edit buttons to fund or update receiving wallets.
-      </p>
-      <div class="divider"></div>
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-        <h2 style="font-size:14px;font-weight:700;margin:0">Wallet Balances</h2>
-        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="loadWalletBalances()">↻ Refresh</button>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <h1 class="section-title" style="margin:0">💳 Connected Wallets</h1>
+        <span id="walletSummary" style="font-size:12px;color:var(--muted)">0/7 wallets connected</span>
       </div>
-      <p style="font-size:12px;color:var(--muted);margin-bottom:10px">
-        Shows your current address and balance per chain where available. Use the copy button to fund wallets from faucets or exchanges.
-      </p>
-      <div id="walletBalanceList" class="wallet-balance-list">
-        <div class="empty-state">Balances will appear here…</div>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:24px">Connect your wallets to enable test execution across all Garden Finance chains.</p>
+
+      <!-- EVM GROUP -->
+      <div class="wallet-group" id="wg-evm">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">🦊</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">EVM Chains — MetaMask</div>
+              <div style="font-size:11px;color:var(--muted)">Covers 11 chains with one connection</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="evm-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <button class="btn btn-green" id="evm-btn" onclick="connectMetaMask()" style="font-size:12px;padding:6px 14px">Connect MetaMask</button>
+          </div>
+        </div>
+        <div class="chain-list" id="evm-chain-list">
+          <!-- populated by JS -->
+        </div>
       </div>
-      <div class="divider"></div>
-      <div style="background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.3);border-radius:10px;padding:14px;font-size:12px;color:var(--yellow)">
-        ⚠️ Changes made here update the <code>.env</code> file via the server. Restart the server after saving.
+
+      <!-- BITCOIN GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">₿</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Bitcoin</div>
+              <div style="font-size:11px;color:var(--muted)">Manual entry — paste your address</div>
+            </div>
+          </div>
+          <span id="btc-balance" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)"></span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;padding:14px 0 0">
+          <div>
+            <div class="field-label" style="margin-bottom:5px">BTC Address</div>
+            <input class="field-input" id="btc-address-input" placeholder="tb1q... or bc1q...">
+          </div>
+          <div>
+            <div class="field-label" style="margin-bottom:5px">Private Key (WIF) — stored in memory only</div>
+            <input class="field-input" id="btc-wif-input" type="password" placeholder="••••••••">
+          </div>
+          <div style="display:flex;align-items:flex-end">
+            <button class="btn btn-green" onclick="saveBtcWallet()" style="font-size:12px;padding:6px 14px">Save</button>
+          </div>
+        </div>
+        <div id="btc-status" style="font-size:12px;color:var(--muted);margin-top:8px;padding-top:8px"></div>
       </div>
+
+      <!-- SOLANA GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">👻</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Solana — Phantom</div>
+              <div style="font-size:11px;color:var(--muted)">Requires Phantom browser extension</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="sol-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <span id="sol-balance" style="font-size:11px;color:var(--cyan)"></span>
+            <button class="btn btn-green" id="sol-btn" onclick="connectPhantom()" style="font-size:12px;padding:6px 14px">Connect Phantom</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- PRIVY GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">🔐</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Privy — Manual Task Execution</div>
+              <div style="font-size:11px;color:var(--muted)">Server-side wallet for automated E2E tests</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="privy-status-badge" style="font-size:11px;color:var(--muted)">Not configured</span>
+            <button class="btn btn-ghost" onclick="togglePrivyForm()" style="font-size:12px;padding:6px 14px">Configure Privy</button>
+          </div>
+        </div>
+        <div id="privy-form" style="display:none;padding-top:14px;display:none">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+            <div>
+              <div class="field-label" style="margin-bottom:5px">Privy App ID</div>
+              <input class="field-input" id="privy-app-id" placeholder="your-privy-app-id">
+            </div>
+            <div>
+              <div class="field-label" style="margin-bottom:5px">Privy App Secret</div>
+              <input class="field-input" id="privy-app-secret" type="password" placeholder="••••••••">
+            </div>
+            <div>
+              <div class="field-label" style="margin-bottom:5px">EVM Wallet ID</div>
+              <input class="field-input" id="privy-evm-id" placeholder="wallet-id-from-privy-dashboard">
+            </div>
+            <div>
+              <div class="field-label" style="margin-bottom:5px">Solana Wallet ID (optional)</div>
+              <input class="field-input" id="privy-sol-id" placeholder="wallet-id-from-privy-dashboard">
+            </div>
+          </div>
+          <div style="display:flex;gap:10px">
+            <button class="btn btn-green" onclick="connectPrivy()" style="font-size:12px">🔐 Connect Privy</button>
+            <button class="btn btn-red" onclick="disconnectPrivy()" style="font-size:12px">Disconnect</button>
+          </div>
+          <div id="privy-result" style="font-size:12px;margin-top:10px;color:var(--muted)"></div>
+        </div>
+      </div>
+
+      <!-- STARKNET GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">⭐</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Starknet — ArgentX / Braavos</div>
+              <div style="font-size:11px;color:var(--muted)">Requires ArgentX or Braavos extension</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="stark-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <button class="btn btn-green" id="stark-btn" onclick="connectStarknet()" style="font-size:12px;padding:6px 14px">Connect ArgentX</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- SUI GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">💧</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Sui Wallet</div>
+              <div style="font-size:11px;color:var(--muted)">Requires Sui Wallet extension</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="sui-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <button class="btn btn-green" id="sui-btn" onclick="connectSui()" style="font-size:12px;padding:6px 14px">Connect Sui</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- TRON GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">🔴</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Tron — TronLink</div>
+              <div style="font-size:11px;color:var(--muted)">Requires TronLink extension</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="tron-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <button class="btn btn-green" id="tron-btn" onclick="connectTron()" style="font-size:12px;padding:6px 14px">Connect TronLink</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- MANUAL APPROVE TOGGLE -->
       <div class="divider"></div>
       <h2 style="font-size:14px;font-weight:700;margin-bottom:14px">Manual Approve Mode</h2>
-      <div style="display:flex;align-items:center;gap:14px">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
-          <input type="checkbox" id="manualApproveToggle" style="width:16px;height:16px;cursor:pointer" onchange="toggleManualApprove()">
-          Require manual approval before every transaction
-        </label>
-      </div>
-      <p style="font-size:12px;color:var(--muted);margin-top:8px">When enabled, a prompt will appear in the Dashboard before each transaction is broadcast on-chain.</p>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+        <input type="checkbox" id="manualApproveToggle" style="width:16px;height:16px;cursor:pointer" onchange="toggleManualApprove()">
+        Require manual approval before every transaction
+      </label>
+      <p style="font-size:12px;color:var(--muted);margin-top:8px">When enabled, a prompt appears before each transaction is sent on-chain.</p>
     </div>
 
     <!-- LIVE LOG PANEL -->
@@ -400,56 +546,20 @@
   </div>
 </div>
 
-<!-- WALLET EDIT MODAL -->
-<div class="modal-overlay" id="walletEditModal">
-  <div class="modal">
-    <div class="modal-title" id="walletEditTitle">Edit Wallet</div>
-    <div class="modal-subtitle" id="walletEditSubtitle">Update receiving address for this chain.</div>
-    <div class="modal-details">
-      <div class="detail-row">
-        <span class="detail-key">Chain</span>
-        <span class="detail-val" id="walletEditChainLabel"></span>
-      </div>
-      <div class="detail-row">
-        <span class="detail-key">Current sending wallet</span>
-        <span class="detail-val" id="walletEditSourceAddress" style="font-size:10px"></span>
-      </div>
-    </div>
-    <div class="modal-details">
-      <div class="field-group" style="margin-bottom:8px">
-        <div class="field-label">New receiving address</div>
-        <input class="field-input" id="walletEditReceive" placeholder="0x... / bc1q...">
-      </div>
-      <div class="field-group">
-        <div class="field-label">Private key (optional)</div>
-        <input class="field-input" id="walletEditPrivate" placeholder="Never share this publicly">
-        <div class="field-hint" style="margin-top:4px" id="walletEditWarning"></div>
-      </div>
-    </div>
-    <div class="modal-subtitle" style="margin-top:8px;font-size:11px">
-      This dashboard does <b>not</b> save or transmit your private key. It will only show you the exact
-      <code>.env</code> lines to update locally.
-    </div>
-    <div class="modal-actions" style="margin-top:16px">
-      <button class="btn btn-ghost" style="flex:1" onclick="closeWalletEdit()">Cancel</button>
-      <button class="btn btn-green" style="flex:1" onclick="confirmWalletEdit()">Generate .env Snippet</button>
-    </div>
-  </div>
-</div>
-
 <script>
+// ── STATE ──
 let ws = null;
 let pendingApproval = null;
 let routeStates = {};
 let issues = [];
 let allChains = [];
 let suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
-let pendingTrade = null; // { from,to,fromName,toName, amount, stage }
-let walletBalancesCache = []; // [{ chain, data }]
-let walletEditState = null;
 
+// ── WEBSOCKET ──
 function connectWS() {
-  ws = new WebSocket(`ws://${location.host}`);
+  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsHost  = location.host || 'localhost:3001';
+  ws = new WebSocket(`${wsProto}://${wsHost}`);
   ws.onopen = () => {
     setWsStatus(true);
     loadConfig();
@@ -473,17 +583,18 @@ function handleWsMessage({ event, data }) {
   if (event === 'suite_end')       handleSuiteEnd(data);
   if (event === 'approval_request') handleApprovalRequest(data);
   if (event === 'api_tests_done')  handleApiTestsDone(data);
-  if (event === 'error')           addIssue('tech', 'critical', 'Server Error', data.message, { routeLabel: data?.label || data?.routeLabel || null });
+  if (event === 'error')           addIssue('tech', 'critical', 'Server Error', data.message);
 }
 
+// ── EVENT HANDLERS ──
 function handleSuiteStart(d) {
   suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
   updateStats();
-  document.getElementById('lastRunLabel').textContent = `Running… (${(d.env || 'testnet').toUpperCase()})`;
+  document.getElementById('lastRunLabel').textContent = `Running… (${d.env.toUpperCase()})`;
 }
 
-function handleTestStart({ label }) {
-  routeStates[label] = { status: 'running', steps: [] };
+function handleTestStart({ testId, label }) {
+  routeStates[label] = { status: 'running', steps: [], testId };
   refreshRouteGrid();
   document.getElementById('activeTestBadge').innerHTML = `<span class="badge running"><span class="spinner"></span> ${label}</span>`;
   document.getElementById('activeTestSteps').innerHTML = '';
@@ -496,19 +607,19 @@ function handleTestStep({ label, step }) {
   refreshRouteGrid();
 }
 
-function handleTestEnd({ label, status, error }) {
+function handleTestEnd({ label, status, error, steps }) {
   if (routeStates[label]) routeStates[label].status = status;
   suiteStats.total++;
   if (status === 'pass') suiteStats.passed++;
-  else if (status === 'fail') { suiteStats.failed++; addIssue('tech','critical', `${label} failed`, error || 'See step log', { routeLabel: label }); }
+  else if (status === 'fail') { suiteStats.failed++; addIssue('tech','critical', `${label} failed`, error || 'See step log'); }
   else suiteStats.skipped++;
   updateStats();
   refreshRouteGrid();
-  document.getElementById('activeTestBadge').innerHTML = `<span class="badge ${status}">${String(status).toUpperCase()}: ${label}</span>`;
+  document.getElementById('activeTestBadge').innerHTML = `<span class="badge ${status}">${status.toUpperCase()}: ${label}</span>`;
 }
 
 function handleSuiteEnd(d) {
-  document.getElementById('lastRunLabel').textContent =
+  document.getElementById('lastRunLabel').textContent = 
     `Last run: ${new Date().toLocaleTimeString()} — ${d.passed}/${d.total} passed`;
   document.getElementById('btnRunAll').disabled = false;
   document.getElementById('btnRunAll').innerHTML = '▶ Run All Tests';
@@ -528,10 +639,11 @@ function handleApprovalRequest(data) {
 
 function handleApiTestsDone(results) {
   results.filter(r => r.status === 'fail').forEach(r => {
-    addIssue('tech', 'critical', `API Test Failed: ${r.name}`, r.error || '', { source: 'api' });
+    addIssue('tech', 'critical', `API Test Failed: ${r.name}`, r.error || '');
   });
 }
 
+// ── APPROVAL ──
 function sendApproval(approved) {
   if (!pendingApproval) return;
   fetch('/api/approve', { method:'POST', headers:{'Content-Type':'application/json'},
@@ -540,6 +652,7 @@ function sendApproval(approved) {
   pendingApproval = null;
 }
 
+// ── ROUTE GRID ──
 function refreshRouteGrid() {
   const grid = document.getElementById('routeGrid');
   if (!allChains.length) return;
@@ -564,22 +677,13 @@ function refreshRouteGrid() {
 }
 
 function showRouteDetail(label) {
+  const state = routeStates[label];
+  if (!state || !state.steps.length) return;
   showPanel('dashboard');
   const el = document.getElementById('activeTestSteps');
   el.innerHTML = '';
-  const state = routeStates[label];
-  if (!state || !state.steps || !state.steps.length) {
-    el.innerHTML = `<div class="empty-state">No step log for <b>${label}</b> yet</div>`;
-    document.getElementById('activeTestBadge').innerHTML = `<span class="badge pending">${label}</span>`;
-    return;
-  }
   state.steps.forEach(s => appendStep(s, el));
   document.getElementById('activeTestBadge').innerHTML = `<span class="badge ${state.status}">${label}</span>`;
-}
-
-function openIssueRoute(label) {
-  if (!label) return;
-  showRouteDetail(label);
 }
 
 function appendStep(step, container) {
@@ -595,10 +699,9 @@ function appendStep(step, container) {
   container.scrollTop = container.scrollHeight;
 }
 
-function addIssue(type, severity, title, detail, meta = {}) {
-  const routeLabel = meta?.routeLabel || null;
-  const source = meta?.source || (routeLabel ? 'route' : 'unknown');
-  issues.push({ type, severity, title, detail, routeLabel, source, ts: new Date().toLocaleTimeString() });
+// ── ISSUES ──
+function addIssue(type, severity, title, detail) {
+  issues.push({ type, severity, title, detail, ts: new Date().toLocaleTimeString() });
   renderIssues();
   const badge = document.getElementById('issueCount');
   badge.textContent = issues.length;
@@ -612,22 +715,17 @@ function renderIssues(filter = 'all') {
   list.innerHTML = filtered.map(i => `
     <div class="issue-item">
       <div class="issue-header">
-        <span class="issue-title">
-          ${i.title}
-          ${i.routeLabel ? `<span class="badge pending" style="margin-left:8px">Route: ${i.routeLabel}</span>` : (i.source === 'api' ? `<span class="badge pending" style="margin-left:8px">API</span>` : '')}
-        </span>
-        <span style="display:flex;gap:8px;align-items:center">
-          ${i.routeLabel ? `<button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick='openIssueRoute(${JSON.stringify(i.routeLabel)})'>Open route</button>` : ``}
-          <span class="badge sev-${i.severity}">${String(i.severity).toUpperCase()}</span>
-        </span>
+        <span class="issue-title">${i.title}</span>
+        <span class="badge sev-${i.severity}">${i.severity.toUpperCase()}</span>
       </div>
       <div class="issue-detail">${i.detail}</div>
-      <div style="font-size:11px;color:var(--muted);margin-top:4px">${String(i.type).toUpperCase()} · ${i.ts}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:4px">${i.type.toUpperCase()} · ${i.ts}</div>
     </div>`).join('');
 }
 
 function filterIssues(f) { renderIssues(f); }
 
+// ── STATS ──
 function updateStats() {
   document.getElementById('statTotal').textContent  = suiteStats.total || '—';
   document.getElementById('statPassed').textContent = suiteStats.passed || '—';
@@ -637,6 +735,7 @@ function updateStats() {
   document.getElementById('statRate').style.color = suiteStats.failed > 0 ? 'var(--red)' : 'var(--green)';
 }
 
+// ── ACTIONS ──
 function runAll() {
   document.getElementById('btnRunAll').disabled = true;
   document.getElementById('btnRunAll').innerHTML = '<span class="spinner"></span> Running…';
@@ -654,10 +753,20 @@ function runApiOnly() {
 function switchEnv(env) {
   if (!confirm(`Switch to ${env.toUpperCase()}? The server must be restarted manually after.`)) return;
   fetch('/api/switch-env', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ env }) })
-    .then(r => r.json()).then(d => alert(d.message || 'OK'));
+    .then(r => r.json()).then(d => alert(d.message));
   document.getElementById('envLabel').textContent = env.toUpperCase();
   document.getElementById('btnTestnet').classList.toggle('active', env === 'testnet');
   document.getElementById('btnMainnet').classList.toggle('active', env === 'mainnet');
+}
+
+function saveWallets() {
+  const fields = { evm:'w-evm', btc:'w-btc', solana:'w-solana', starknet:'w-starknet', sui:'w-sui', tron:'w-tron' };
+  const updates = {};
+  for (const [key, id] of Object.entries(fields)) {
+    const v = document.getElementById(id).value.trim();
+    if (v) updates[key] = v;
+  }
+  alert('Address overrides saved!\n\nAdd these to your .env as OVERRIDE_EVM_ADDRESS etc, then restart the server.\n\n' + JSON.stringify(updates, null, 2));
 }
 
 function toggleManualApprove() {
@@ -665,10 +774,14 @@ function toggleManualApprove() {
   alert(`Manual approve mode ${on ? 'ENABLED' : 'DISABLED'}.\n\nSet MANUAL_APPROVE=${on} in your .env and restart server.`);
 }
 
+// ── CHATBOT ──
 const chainAliases = {
   btc: 'bitcoin', bitcoin: 'bitcoin', arbitrum: 'arbitrum', arb: 'arbitrum',
   base: 'base', solana: 'solana', sol: 'solana', ethereum: 'ethereum', eth: 'ethereum',
-  bnb: 'bnbchain', bsc: 'bnbchain', starknet: 'starknet', stark: 'starknet', tron: 'tron', sui: 'sui',
+  megaeth: 'megaeth', mega: 'megaeth', bnb: 'bnbchain', bsc: 'bnbchain',
+  berachain: 'berachain', bera: 'berachain', unichain: 'unichain', uni: 'unichain',
+  hyperevm: 'hyperevm', hyper: 'hyperevm', corn: 'corn', botanix: 'botanix',
+  core: 'core', starknet: 'starknet', stark: 'starknet', sui: 'sui', tron: 'tron',
 };
 
 function botMsg(text) {
@@ -693,73 +806,14 @@ function chatSend(msg) {
 }
 
 async function processChatCommand(text) {
-  // Pending trade flow
-  if (pendingTrade) {
-    const t = pendingTrade;
-    const trimmed = text.trim();
-
-    if (trimmed === 'cancel' || trimmed === 'stop' || trimmed === 'no') {
-      pendingTrade = null;
-      botMsg('✅ Cancelled. Tell me a new route anytime (e.g. <b>swap BTC to Arbitrum</b>).');
-      return;
-    }
-
-    if (t.stage === 'await_amount') {
-      const m = trimmed.match(/\b(\d+)\b/);
-      if (!m) {
-        botMsg(`How many sats? Reply with a number (or type <b>cancel</b>).`);
-        return;
-      }
-      t.amount = parseInt(m[1]);
-      t.stage = 'await_confirm';
-      const bal = await getBalanceHint(t.from);
-      botMsg(`${bal}<br>Confirm swap of <b>${t.amount}</b> sats from <b>${t.fromName}</b> → <b>${t.toName}</b>? Reply <b>yes</b> to proceed or <b>cancel</b>.`);
-      return;
-    }
-
-    if (t.stage === 'await_confirm') {
-      if (trimmed === 'yes' || trimmed === 'y' || trimmed === 'ok' || trimmed === 'confirm') {
-        const balObj = await fetch(`/api/balance?chain=${encodeURIComponent(t.from)}`).then(r => r.json()).catch(() => ({}));
-        if (balObj?.balanceSats !== undefined && typeof t.amount === 'number' && balObj.balanceSats < t.amount) {
-          botMsg(`❌ Insufficient balance. You have <b>${balObj.balanceSats}</b> sats but tried to swap <b>${t.amount}</b> sats.`);
-          pendingTrade = null;
-          return;
-        }
-
-        botMsg(`⏳ Creating order for <b>${t.fromName} → ${t.toName}</b> with <b>${t.amount}</b>…`);
-        const r = await fetch('/api/trade', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ fromChain: t.from, toChain: t.to, amount: t.amount })
-        }).then(r => r.json());
-
-        if (r.error) {
-          botMsg(`❌ ${r.error}`);
-          pendingTrade = null;
-          return;
-        }
-
-        if (r.orderId) {
-          const depositLine = r.depositTo ? `<br><br><b>Deposit</b>: send <b>${r.depositAmount || t.amount}</b> sats to:<br><code style="font-size:11px">${r.depositTo}</code>` : '';
-          botMsg(`✅ Order created: <code style="font-size:11px">${r.orderId}</code>${depositLine}<br><br>Live status will stream in <b>Dashboard</b> / <b>Live Log</b>.`);
-        } else {
-          botMsg(`✅ Started. Live status will stream in <b>Dashboard</b> / <b>Live Log</b>.`);
-        }
-
-        pendingTrade = null;
-        return;
-      }
-
-      botMsg(`Reply <b>yes</b> to proceed or <b>cancel</b>.`);
-      return;
-    }
-  }
-
+  // Routes query
   if (text.includes('available') || text.includes('routes') || text.includes('chains')) {
     const chains = allChains.map(c => c.name).join(', ');
     botMsg(`Available chains: <b>${chains}</b><br><br>All routes go through Bitcoin as the source or destination.`);
     return;
   }
+
+  // Quote query
   if (text.includes('quote') || text.includes('how much')) {
     const match = parseRoute(text);
     if (!match) { botMsg("I couldn't parse that. Try: <b>quote 50000 sats BTC to Arbitrum</b>"); return; }
@@ -767,33 +821,29 @@ async function processChatCommand(text) {
     const q = await fetch('/api/quote', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ fromChain: match.from, toChain: match.to, amount: match.amount }) }).then(r=>r.json());
     if (q.error) { botMsg(`❌ ${q.error}`); return; }
-    const out = q.result?.output_amount || q.result?.to_amount || q.result?.destination?.amount;
+    const out = q.result?.output_amount || q.result?.to_amount;
     botMsg(`📊 Quote: <b>${match.amount}</b> ${match.fromName} → <b>~${out}</b> ${match.toName}`);
     return;
   }
+
+  // Initiate trade
   if (text.includes('swap') || text.includes('bridge') || text.includes('trade') || text.includes('send')) {
     const match = parseRoute(text);
     if (!match) { botMsg("I couldn't parse that. Try: <b>swap 50000 sats from Bitcoin to Arbitrum</b>"); return; }
-    const bal = await getBalanceHint(match.from);
-
-    // Always ask for amount + confirm, showing balance.
-    if (!match.amountProvided) {
-      pendingTrade = { ...match, amount: null, stage: 'await_amount' };
-      botMsg(`${bal}<br>How much do you want to swap from <b>${match.fromName}</b> → <b>${match.toName}</b>? Reply with a number of <b>sats</b> (or type <b>cancel</b>).`);
-      return;
-    }
-
-    pendingTrade = { ...match, stage: 'await_confirm' };
-    botMsg(`${bal}<br>Confirm swap of <b>${match.amount}</b> sats from <b>${match.fromName}</b> → <b>${match.toName}</b>? Reply <b>yes</b> to proceed or <b>cancel</b>.`);
+    botMsg(`🚀 Initiating trade: <b>${match.fromName} → ${match.toName}</b> with amount <b>${match.amount}</b>…`);
+    const r = await fetch('/api/trade', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ fromChain: match.from, toChain: match.to, amount: match.amount }) }).then(r=>r.json());
+    if (r.error) { botMsg(`❌ ${r.error}`); return; }
+    botMsg(`✅ Test trade started! Switch to <b>Dashboard</b> or <b>Live Log</b> to monitor progress.`);
     return;
   }
+
   botMsg(`I can help you:<br>• <b>swap BTC to Arbitrum</b> — initiate a test trade<br>• <b>quote 50000 sats BTC to Base</b> — get a price quote<br>• <b>what routes are available?</b> — list all chains`);
 }
 
 function parseRoute(text) {
-  const amountMatch = text.match(/\b(\d+)\b/);
-  const amountProvided = Boolean(amountMatch);
-  const amount = amountProvided ? parseInt(amountMatch[1]) : null;
+  const amountMatch = text.match(/(\d+)/);
+  const amount = amountMatch ? parseInt(amountMatch[1]) : 50000;
   let from = null, to = null;
   const words = text.split(/\s+/);
   let foundFrom = false;
@@ -805,183 +855,16 @@ function parseRoute(text) {
   if (!from || !to) return null;
   const fromName = allChains.find(c => c.id === from)?.name || from;
   const toName = allChains.find(c => c.id === to)?.name || to;
-  return { from, to, amount, amountProvided, fromName, toName };
+  return { from, to, amount, fromName, toName };
 }
 
-async function getBalanceHint(chainKey) {
-  try {
-    const b = await fetch(`/api/balance?chain=${encodeURIComponent(chainKey)}`).then(r => r.json());
-    if (b?.error) return `⚠️ Balance unavailable: ${b.error}`;
-    if (b?.type === 'bitcoin') return `💰 Your BTC balance: <b>${b.balanceSats}</b> sats<br><span style="color:var(--muted);font-size:12px">${b.address}</span>`;
-    if (b?.type === 'evm' && b?.balanceEth !== undefined) return `💰 Your ${chainKey} balance: <b>${b.balanceEth}</b> (native)<br><span style="color:var(--muted);font-size:12px">${b.address}</span>`;
-    return `💰 Balance: unavailable for ${chainKey}`;
-  } catch {
-    return `⚠️ Balance unavailable right now.`;
-  }
-}
-
-async function loadWalletBalances() {
-  const container = document.getElementById('walletBalanceList');
-  if (!container) return;
-  container.innerHTML = '<div class="empty-state">Loading balances…</div>';
-  try {
-    if (!allChains.length) {
-      allChains = await fetch('/api/chains').then(r => r.json()).catch(() => []);
-    }
-    const items = [];
-    for (const c of allChains) {
-      try {
-        const res = await fetch(`/api/balance?chain=${encodeURIComponent(c.id)}`);
-        const json = await res.json();
-        items.push({ chain: c, data: json, ok: res.ok && !json.error });
-      } catch (e) {
-        items.push({ chain: c, data: { error: e.message }, ok: false });
-      }
-    }
-    walletBalancesCache = items;
-    renderWalletBalances(items);
-  } catch {
-    container.innerHTML = '<div class="empty-state">Could not load balances. Try again.</div>';
-  }
-}
-
-function renderWalletBalances(items) {
-  const container = document.getElementById('walletBalanceList');
-  if (!container) return;
-  if (!items || !items.length) {
-    container.innerHTML = '<div class="empty-state">No chains loaded yet.</div>';
-    return;
-  }
-  container.innerHTML = items.map(({ chain, data }) => {
-    const addr = data?.address || '';
-    let balanceText = '—';
-    if (data?.error) balanceText = `Error: ${data.error}`;
-    else if (chain.type === 'bitcoin' && data?.balanceSats !== undefined) balanceText = `${data.balanceSats} sats`;
-    else if (chain.type === 'evm' && data?.balanceEth !== undefined) balanceText = `${data.balanceEth} native`;
-    const addrLabel = addr ? addr : '<span style="color:var(--muted)">Not configured</span>';
-    const copyBtn = addr
-      ? `<button class="btn btn-ghost wallet-copy-btn" data-addr="${addr}" onclick="copyText(this.dataset.addr)">Copy</button>`
-      : '';
-    return `<div class="wallet-balance-row">
-      <div>
-        <div class="wallet-balance-chain">${chain.name} <span style="color:var(--muted);font-size:10px;text-transform:uppercase">(${chain.type})</span></div>
-        <div class="wallet-balance-address">${addrLabel}</div>
-      </div>
-      <div class="wallet-balance-right">
-        <div class="wallet-balance-amount">${balanceText}</div>
-        ${copyBtn}
-        <button class="btn btn-ghost wallet-copy-btn" onclick="openWalletEdit('${chain.id}')">Edit</button>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-function copyText(value) {
-  if (!value) return;
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(value).catch(()=>{});
-  } else {
-    const ta = document.createElement('textarea');
-    ta.value = value;
-    document.body.appendChild(ta);
-    ta.select();
-    try { document.execCommand('copy'); } catch (_) {}
-    document.body.removeChild(ta);
-  }
-}
-
-function openWalletEdit(chainId) {
-  const modal = document.getElementById('walletEditModal');
-  const chain = allChains.find(c => c.id === chainId) || { id: chainId, name: chainId, type: '' };
-  const item = walletBalancesCache.find(x => x.chain.id === chainId);
-  const sourceAddr = item?.data?.address || '';
-
-  walletEditState = {
-    chainId,
-    chainType: chain.type,
-    sourceAddress: sourceAddr,
-  };
-
-  document.getElementById('walletEditChainLabel').textContent = `${chain.name} (${chain.type || 'unknown'})`;
-  document.getElementById('walletEditSourceAddress').textContent = sourceAddr || 'Not configured';
-  const recvInput = document.getElementById('walletEditReceive');
-  const pkInput = document.getElementById('walletEditPrivate');
-  recvInput.value = '';
-  pkInput.value = '';
-  document.getElementById('walletEditWarning').textContent =
-    'If you only change the receiving address, on-chain sends will still come from the current sending wallet above.';
-
-  modal.classList.add('open');
-}
-
-function closeWalletEdit() {
-  const modal = document.getElementById('walletEditModal');
-  modal.classList.remove('open');
-  walletEditState = null;
-  const recvInput = document.getElementById('walletEditReceive');
-  const pkInput = document.getElementById('walletEditPrivate');
-  if (recvInput) recvInput.value = '';
-  if (pkInput) pkInput.value = '';
-}
-
-function confirmWalletEdit() {
-  if (!walletEditState) {
-    closeWalletEdit();
-    return;
-  }
-  const recv = document.getElementById('walletEditReceive').value.trim();
-  const pk = document.getElementById('walletEditPrivate').value.trim();
-  const { chainId, chainType } = walletEditState;
-
-  if (!recv && !pk) {
-    alert('Nothing to update. Provide at least a receiving address or private key.');
-    return;
-  }
-
-  let snippet = '';
-  if (chainType === 'bitcoin') {
-    if (recv) snippet += `BTC_ADDRESS=${recv}\n`;
-    if (pk) snippet += `BTC_PRIVATE_KEY_WIF=${pk}\n`;
-  } else if (chainType === 'evm') {
-    if (recv) snippet += `OVERRIDE_EVM_ADDRESS=${recv}\n`;
-    if (pk) snippet += `OVERRIDE_EVM_PRIVATE_KEY=${pk}\n`;
-  } else if (chainType === 'solana') {
-    if (recv) snippet += `OVERRIDE_SOLANA_ADDRESS=${recv}\n`;
-    if (pk) snippet += `OVERRIDE_SOLANA_PRIVATE_KEY=${pk}\n`;
-  } else if (chainType === 'starknet') {
-    if (recv) snippet += `OVERRIDE_STARKNET_ADDRESS=${recv}\n`;
-    if (pk) snippet += `OVERRIDE_STARKNET_PRIVATE_KEY=${pk}\n`;
-  } else if (chainType === 'tron') {
-    if (recv) snippet += `OVERRIDE_TRON_ADDRESS=${recv}\n`;
-    if (pk) snippet += `OVERRIDE_TRON_PRIVATE_KEY=${pk}\n`;
-  } else if (chainType === 'sui') {
-    if (recv) snippet += `OVERRIDE_SUI_ADDRESS=${recv}\n`;
-    if (pk) snippet += `OVERRIDE_SUI_PRIVATE_KEY=${pk}\n`;
-  } else {
-    if (recv) snippet += `OVERRIDE_${chainId.toUpperCase()}_ADDRESS=${recv}\n`;
-  }
-
-  if (!snippet) {
-    alert('Unsupported chain type for .env snippet. You can still manage this wallet directly in your own tooling.');
-    closeWalletEdit();
-    return;
-  }
-
-  alert(
-    'Add or update the following lines in your .env file (do not share them with anyone):\n\n' +
-    snippet +
-    '\nAfter saving .env, restart the server (Ctrl+C then npm start).'
-  );
-
-  closeWalletEdit();
-}
-
+// ── LIVE LOG ──
 function logEvent(event, data) {
   const log = document.getElementById('liveLog');
   const ts = new Date().toLocaleTimeString();
-  const cls = String(event).includes('pass') || String(event).includes('end') ? 'log-pass'
-            : String(event).includes('fail') || String(event).includes('error') ? 'log-fail'
-            : String(event).includes('start') ? 'log-info' : 'log-warn';
+  const cls = event.includes('pass') || event.includes('end') ? 'log-pass'
+            : event.includes('fail') || event.includes('error') ? 'log-fail'
+            : event.includes('start') ? 'log-info' : 'log-warn';
   const detail = typeof data === 'object' ? (data.label || data.message || data.event || '') : '';
   log.innerHTML += `<div class="log-line ${cls}"><span class="log-ts">[${ts}]</span> ${event}${detail ? ' — ' + detail : ''}</div>`;
   log.scrollTop = log.scrollHeight;
@@ -990,6 +873,7 @@ function logEvent(event, data) {
 
 function clearLog() { document.getElementById('liveLog').innerHTML = ''; }
 
+// ── LOAD CONFIG ──
 async function loadConfig() {
   const cfg = await fetch('/api/config').then(r => r.json()).catch(() => ({}));
   if (cfg.env) {
@@ -1005,20 +889,18 @@ async function loadConfig() {
 async function loadChains() {
   allChains = await fetch('/api/chains').then(r => r.json()).catch(() => []);
   refreshRouteGrid();
+  // Pre-populate stats
   const srcCount = allChains.filter(c => c.id !== 'bitcoin').length;
   document.getElementById('statTotal').textContent = srcCount * 2 + ' routes';
 }
 
+// ── NAVIGATION ──
 function showPanel(id) {
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.getElementById(`panel-${id}`).classList.add('active');
   const items = document.querySelectorAll('.nav-item');
   items.forEach(item => { if (item.getAttribute('onclick')?.includes(id)) item.classList.add('active'); });
-
-  if (id === 'wallets') {
-    loadWalletBalances();
-  }
 }
 
 function filterRoutes(f) {
@@ -1028,7 +910,331 @@ function filterRoutes(f) {
   });
 }
 
+// ── WALLET CONNECTION ─────────────────────────────────────────
+
+// EVM chain definitions
+const EVM_CHAINS = [
+  { id: 'ethereum',  name: 'Ethereum',  chainId: '0xaa36a7', mainChainId: '0x1',     symbol: 'ETH',  icon: '⬡' },
+  { id: 'arbitrum',  name: 'Arbitrum',  chainId: '0x66eee',  mainChainId: '0xa4b1',  symbol: 'ETH',  icon: '🔵' },
+  { id: 'base',      name: 'Base',      chainId: '0x14a34',  mainChainId: '0x2105',  symbol: 'ETH',  icon: '🔷' },
+  { id: 'bnbchain',  name: 'BNB Chain', chainId: '0x61',     mainChainId: '0x38',    symbol: 'BNB',  icon: '🟡' },
+  { id: 'berachain', name: 'Berachain', chainId: '0x138d5',  mainChainId: '0x138d4', symbol: 'BERA', icon: '🐻' },
+  { id: 'unichain',  name: 'Unichain',  chainId: '0x515',    mainChainId: '0x515',   symbol: 'ETH',  icon: '🦄' },
+  { id: 'hyperevm',  name: 'HyperEVM',  chainId: '0x3e6',    mainChainId: '0x3e7',   symbol: 'ETH',  icon: '⚡' },
+  { id: 'corn',      name: 'Corn',      chainId: '0x1406f',  mainChainId: '0x1406f', symbol: 'BTCN', icon: '🌽' },
+  { id: 'botanix',   name: 'Botanix',   chainId: '0xe35',    mainChainId: '0xe35',   symbol: 'BTC',  icon: '🌿' },
+  { id: 'core',      name: 'Core',      chainId: '0x45b',    mainChainId: '0x45c',   symbol: 'CORE', icon: '⚙️' },
+  { id: 'megaeth',   name: 'MegaETH',   chainId: '0x18c6',   mainChainId: '0x18c6',  symbol: 'ETH',  icon: '🚀' },
+];
+
+let connectedWallets = { evm: false, btc: false, solana: false, privy: false, starknet: false, sui: false, tron: false };
+let evmAddress = null;
+let privyFormVisible = false;
+
+// Render EVM chain list
+function renderEvmChains(connected, address) {
+  const list = document.getElementById('evm-chain-list');
+  if (!connected) { list.innerHTML = ''; return; }
+  list.innerHTML = EVM_CHAINS.map(c => `
+    <div class="chain-row">
+      <div class="chain-name">${c.icon} ${c.name}</div>
+      <div class="chain-addr chain-connected">✅ ${shortenAddr(address)}</div>
+      <button onclick="switchToChain('${c.chainId}')" style="font-size:10px;padding:3px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer">Switch</button>
+    </div>`).join('');
+}
+
+// MetaMask connect
+async function connectMetaMask() {
+  if (!window.ethereum) {
+    alert('MetaMask not installed!\n\nInstall it from: https://metamask.io/download/');
+    return;
+  }
+  try {
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    evmAddress = accounts[0];
+    connectedWallets.evm = true;
+
+    // Tell backend
+    await fetch('/api/wallet/evm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address: evmAddress }) });
+
+    document.getElementById('evm-addr').textContent = shortenAddr(evmAddress);
+    document.getElementById('evm-addr').style.color = 'var(--green)';
+    document.getElementById('evm-btn').textContent = 'Disconnect';
+    document.getElementById('evm-btn').className = 'btn btn-red';
+    document.getElementById('evm-btn').onclick = disconnectEvm;
+    renderEvmChains(true, evmAddress);
+    updateWalletCount();
+
+    // Listen for account changes
+    window.ethereum.on('accountsChanged', (accs) => {
+      if (accs.length === 0) disconnectEvm();
+      else { evmAddress = accs[0]; document.getElementById('evm-addr').textContent = shortenAddr(evmAddress); renderEvmChains(true, evmAddress); }
+    });
+  } catch (err) {
+    alert('MetaMask connection failed: ' + err.message);
+  }
+}
+
+async function disconnectEvm() {
+  connectedWallets.evm = false; evmAddress = null;
+  await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'evm' }) });
+  document.getElementById('evm-addr').textContent = 'Not connected';
+  document.getElementById('evm-addr').style.color = 'var(--muted)';
+  document.getElementById('evm-btn').textContent = 'Connect MetaMask';
+  document.getElementById('evm-btn').className = 'btn btn-green';
+  document.getElementById('evm-btn').onclick = connectMetaMask;
+  renderEvmChains(false, null);
+  updateWalletCount();
+}
+
+async function switchToChain(chainId) {
+  if (!window.ethereum) return;
+  try {
+    await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId }] });
+  } catch (err) {
+    alert('Could not switch network: ' + err.message);
+  }
+}
+
+// BTC wallet save
+async function saveBtcWallet() {
+  const address = document.getElementById('btc-address-input').value.trim();
+  const wif = document.getElementById('btc-wif-input').value.trim();
+  if (!address) { alert('Please enter a BTC address'); return; }
+
+  const el = document.getElementById('btc-status');
+  el.textContent = '⏳ Fetching balance...';
+  el.style.color = 'var(--yellow)';
+
+  try {
+    const r = await fetch('/api/wallet/btc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, wif }) });
+    const d = await r.json();
+    connectedWallets.btc = true;
+    el.textContent = `✅ Saved — Balance: ${d.balance} BTC`;
+    el.style.color = 'var(--green)';
+    document.getElementById('btc-balance').textContent = `${d.balance} BTC`;
+    document.getElementById('btc-wif-input').value = ''; // clear key from UI
+    if (wif) document.getElementById('btc-wif-input').placeholder = '•••••••• (saved in memory)';
+    updateWalletCount();
+  } catch (err) {
+    el.textContent = '❌ Failed: ' + err.message;
+    el.style.color = 'var(--red)';
+  }
+}
+
+// Phantom (Solana) connect
+async function connectPhantom() {
+  if (!window.solana?.isPhantom) {
+    alert('Phantom not installed!\n\nInstall from: https://phantom.app/');
+    return;
+  }
+  try {
+    const resp = await window.solana.connect();
+    const address = resp.publicKey.toString();
+
+    // Fetch SOL balance
+    let balance = null;
+    try {
+      const r = await fetch('https://api.testnet.solana.com', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBalance', params: [address] })
+      });
+      const d = await r.json();
+      balance = ((d.result?.value || 0) / 1e9).toFixed(4) + ' SOL';
+    } catch (_) {}
+
+    await fetch('/api/wallet/solana', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, balance }) });
+
+    connectedWallets.solana = true;
+    document.getElementById('sol-addr').textContent = shortenAddr(address);
+    document.getElementById('sol-addr').style.color = 'var(--green)';
+    document.getElementById('sol-balance').textContent = balance || '';
+    document.getElementById('sol-btn').textContent = 'Disconnect';
+    document.getElementById('sol-btn').className = 'btn btn-red';
+    document.getElementById('sol-btn').onclick = disconnectSolana;
+    updateWalletCount();
+  } catch (err) {
+    alert('Phantom connection failed: ' + err.message);
+  }
+}
+
+async function disconnectSolana() {
+  if (window.solana) await window.solana.disconnect().catch(() => {});
+  connectedWallets.solana = false;
+  await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'solana' }) });
+  document.getElementById('sol-addr').textContent = 'Not connected';
+  document.getElementById('sol-addr').style.color = 'var(--muted)';
+  document.getElementById('sol-balance').textContent = '';
+  document.getElementById('sol-btn').textContent = 'Connect Phantom';
+  document.getElementById('sol-btn').className = 'btn btn-green';
+  document.getElementById('sol-btn').onclick = connectPhantom;
+  updateWalletCount();
+}
+
+// Privy connect
+function togglePrivyForm() {
+  privyFormVisible = !privyFormVisible;
+  document.getElementById('privy-form').style.display = privyFormVisible ? 'block' : 'none';
+}
+
+async function connectPrivy() {
+  const appId     = document.getElementById('privy-app-id').value.trim();
+  const appSecret = document.getElementById('privy-app-secret').value.trim();
+  const evmId     = document.getElementById('privy-evm-id').value.trim();
+  const solId     = document.getElementById('privy-sol-id').value.trim();
+  if (!appId || !appSecret || !evmId) { alert('App ID, App Secret and EVM Wallet ID are required'); return; }
+
+  const el = document.getElementById('privy-result');
+  el.textContent = '⏳ Connecting to Privy...';
+  el.style.color = 'var(--yellow)';
+
+  try {
+    const r = await fetch('/api/privy/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ appId, appSecret, evmWalletId: evmId, solanaWalletId: solId || null }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    connectedWallets.privy = true;
+    el.textContent = `✅ Connected — EVM: ${shortenAddr(d.evmAddress)}${d.solanaAddress ? ' | SOL: ' + shortenAddr(d.solanaAddress) : ''}`;
+    el.style.color = 'var(--green)';
+    document.getElementById('privy-status-badge').textContent = '✅ Connected';
+    document.getElementById('privy-status-badge').style.color = 'var(--green)';
+    document.getElementById('privy-app-secret').value = '';
+    updateWalletCount();
+  } catch (err) {
+    el.textContent = '❌ ' + err.message;
+    el.style.color = 'var(--red)';
+  }
+}
+
+async function disconnectPrivy() {
+  await fetch('/api/privy/disconnect', { method: 'POST' });
+  connectedWallets.privy = false;
+  document.getElementById('privy-status-badge').textContent = 'Not configured';
+  document.getElementById('privy-status-badge').style.color = 'var(--muted)';
+  document.getElementById('privy-result').textContent = '';
+  updateWalletCount();
+}
+
+// Starknet connect
+async function connectStarknet() {
+  if (!window.starknet) {
+    alert('ArgentX not installed!\n\nInstall from: https://www.argent.xyz/argent-x/');
+    return;
+  }
+  try {
+    await window.starknet.enable();
+    const address = window.starknet.selectedAddress;
+    await fetch('/api/wallet/starknet', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) });
+    connectedWallets.starknet = true;
+    document.getElementById('stark-addr').textContent = shortenAddr(address);
+    document.getElementById('stark-addr').style.color = 'var(--green)';
+    document.getElementById('stark-btn').textContent = 'Disconnect';
+    document.getElementById('stark-btn').className = 'btn btn-red';
+    document.getElementById('stark-btn').onclick = () => disconnectWallet('starknet', 'stark-addr', 'stark-btn', connectStarknet);
+    updateWalletCount();
+  } catch (err) { alert('Starknet connection failed: ' + err.message); }
+}
+
+// Sui connect
+async function connectSui() {
+  if (!window.suiWallet) {
+    alert('Sui Wallet not installed!\n\nInstall from: https://suiwallet.com/');
+    return;
+  }
+  try {
+    const perms = await window.suiWallet.requestPermissions();
+    const address = perms[0]?.address || window.suiWallet.getAccounts?.()?.[0];
+    await fetch('/api/wallet/sui', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) });
+    connectedWallets.sui = true;
+    document.getElementById('sui-addr').textContent = shortenAddr(address);
+    document.getElementById('sui-addr').style.color = 'var(--green)';
+    document.getElementById('sui-btn').textContent = 'Disconnect';
+    document.getElementById('sui-btn').className = 'btn btn-red';
+    document.getElementById('sui-btn').onclick = () => disconnectWallet('sui', 'sui-addr', 'sui-btn', connectSui);
+    updateWalletCount();
+  } catch (err) { alert('Sui connection failed: ' + err.message); }
+}
+
+// Tron connect
+async function connectTron() {
+  if (!window.tronWeb?.defaultAddress?.base58) {
+    alert('TronLink not installed!\n\nInstall from: https://www.tronlink.org/');
+    return;
+  }
+  try {
+    const address = window.tronWeb.defaultAddress.base58;
+    await fetch('/api/wallet/tron', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) });
+    connectedWallets.tron = true;
+    document.getElementById('tron-addr').textContent = shortenAddr(address);
+    document.getElementById('tron-addr').style.color = 'var(--green)';
+    document.getElementById('tron-btn').textContent = 'Disconnect';
+    document.getElementById('tron-btn').className = 'btn btn-red';
+    document.getElementById('tron-btn').onclick = () => disconnectWallet('tron', 'tron-addr', 'tron-btn', connectTron);
+    updateWalletCount();
+  } catch (err) { alert('TronLink connection failed: ' + err.message); }
+}
+
+// Generic disconnect helper
+async function disconnectWallet(type, addrId, btnId, reconnectFn) {
+  await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type }) });
+  connectedWallets[type] = false;
+  document.getElementById(addrId).textContent = 'Not connected';
+  document.getElementById(addrId).style.color = 'var(--muted)';
+  document.getElementById(btnId).textContent = 'Connect';
+  document.getElementById(btnId).className = 'btn btn-green';
+  document.getElementById(btnId).onclick = reconnectFn;
+  updateWalletCount();
+}
+
+// Update wallet count badge in header and sidebar
+function updateWalletCount() {
+  const count = Object.values(connectedWallets).filter(Boolean).length;
+  const total = Object.keys(connectedWallets).length;
+  const badge = document.getElementById('walletCount');
+  const summary = document.getElementById('walletSummary');
+  if (count > 0) { badge.textContent = count; badge.style.display = 'inline'; }
+  else badge.style.display = 'none';
+  if (summary) summary.textContent = `${count}/${total} wallets connected`;
+}
+
+// Load existing wallet states on page load
+async function loadWalletStates() {
+  try {
+    const r = await fetch('/api/wallet/balances');
+    const d = await r.json();
+    if (d.evm) {
+      connectedWallets.evm = true; evmAddress = d.evm.address;
+      document.getElementById('evm-addr').textContent = shortenAddr(d.evm.address);
+      document.getElementById('evm-addr').style.color = 'var(--green)';
+      renderEvmChains(true, d.evm.address);
+    }
+    if (d.btc) {
+      connectedWallets.btc = true;
+      document.getElementById('btc-status').textContent = `✅ ${d.btc.address} — ${d.btc.balance} BTC`;
+      document.getElementById('btc-status').style.color = 'var(--green)';
+      document.getElementById('btc-balance').textContent = d.btc.balance + ' BTC';
+    }
+    if (d.solana) {
+      connectedWallets.solana = true;
+      document.getElementById('sol-addr').textContent = shortenAddr(d.solana.address);
+      document.getElementById('sol-addr').style.color = 'var(--green)';
+    }
+    if (d.privy?.connected) {
+      connectedWallets.privy = true;
+      document.getElementById('privy-status-badge').textContent = `✅ Connected — ${shortenAddr(d.privy.evmAddress)}`;
+      document.getElementById('privy-status-badge').style.color = 'var(--green)';
+    }
+    updateWalletCount();
+  } catch (_) {}
+}
+
+function shortenAddr(addr) {
+  if (!addr) return '';
+  return addr.length > 12 ? addr.slice(0, 6) + '...' + addr.slice(-4) : addr;
+}
+
+// ── INIT ──
 connectWS();
+loadWalletStates();
 </script>
 </body>
 </html>

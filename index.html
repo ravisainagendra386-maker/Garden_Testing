@@ -172,7 +172,16 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   pre { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); }
 
-  ::-webkit-scrollbar { width: 4px; } 
+  /* ── WALLET GROUPS ── */
+  .wallet-group { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 14px; }
+  .wallet-group-header { display: flex; align-items: center; justify-content: space-between; }
+  .chain-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-top: 1px solid rgba(255,255,255,.04); margin-top: 10px; font-size: 12px; }
+  .chain-name { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+  .chain-addr { font-family: 'JetBrains Mono', monospace; color: var(--muted); font-size: 11px; }
+  .chain-connected { color: var(--green); }
+  .chain-wrong { color: var(--yellow); }
+
+  ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 </style>
@@ -215,7 +224,7 @@
       <span class="nav-icon">💬</span> Trade Chatbot
     </div>
     <div class="nav-item" onclick="showPanel('wallets')">
-      <span class="nav-icon">💳</span> Wallet Settings
+      <span class="nav-icon">💳</span> Connect Wallets <span id="walletCount" style="margin-left:auto;font-size:10px;background:rgba(34,197,94,.2);color:#22c55e;padding:1px 6px;border-radius:10px;display:none"></span>
     </div>
     <div class="nav-section">Monitor</div>
     <div class="nav-item" onclick="showPanel('livelog')">
@@ -333,60 +342,181 @@
       </div>
     </div>
 
-    <!-- WALLET SETTINGS PANEL -->
+    <!-- CONNECT WALLETS PANEL -->
     <div class="panel" id="panel-wallets">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px">
-        <h1 class="section-title" style="margin:0">Wallet Settings</h1>
-        <button class="btn btn-green" onclick="saveWallets()">💾 Save Changes</button>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <h1 class="section-title" style="margin:0">💳 Connected Wallets</h1>
+        <span id="walletSummary" style="font-size:12px;color:var(--muted)">0/7 wallets connected</span>
       </div>
-      <p style="font-size:13px;color:var(--muted);margin-bottom:20px">
-        Override the wallet address used for each chain type. Leave blank to use your Privy wallet address automatically.
-      </p>
-      <div class="settings-grid">
-        <div class="field-group">
-          <div class="field-label">EVM Address</div>
-          <input class="field-input" id="w-evm" placeholder="0x... (Ethereum, Arbitrum, Base, +8 more)">
-          <div class="field-hint">Used for all EVM chains (11 chains)</div>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:24px">Connect your wallets to enable test execution across all Garden Finance chains.</p>
+
+      <!-- EVM GROUP -->
+      <div class="wallet-group" id="wg-evm">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">🦊</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">EVM Chains — MetaMask</div>
+              <div style="font-size:11px;color:var(--muted)">Covers 11 chains with one connection</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="evm-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <button class="btn btn-green" id="evm-btn" onclick="connectMetaMask()" style="font-size:12px;padding:6px 14px">Connect MetaMask</button>
+          </div>
         </div>
-        <div class="field-group">
-          <div class="field-label">Bitcoin Address</div>
-          <input class="field-input" id="w-btc" placeholder="bc1q... or tb1q...">
-          <div class="field-hint">Run npm run generate-btc-key to get a testnet key</div>
-        </div>
-        <div class="field-group">
-          <div class="field-label">Solana Address</div>
-          <input class="field-input" id="w-solana" placeholder="...">
-          <div class="field-hint">Used for Solana routes</div>
-        </div>
-        <div class="field-group">
-          <div class="field-label">Starknet Address</div>
-          <input class="field-input" id="w-starknet" placeholder="0x...">
-          <div class="field-hint">Used for Starknet routes</div>
-        </div>
-        <div class="field-group">
-          <div class="field-label">Sui Address</div>
-          <input class="field-input" id="w-sui" placeholder="0x...">
-          <div class="field-hint">Used for Sui routes</div>
-        </div>
-        <div class="field-group">
-          <div class="field-label">Tron Address</div>
-          <input class="field-input" id="w-tron" placeholder="T...">
-          <div class="field-hint">Used for Tron routes</div>
+        <div class="chain-list" id="evm-chain-list">
+          <!-- populated by JS -->
         </div>
       </div>
-      <div class="divider"></div>
-      <div style="background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.3);border-radius:10px;padding:14px;font-size:12px;color:var(--yellow)">
-        ⚠️ Changes made here update the <code>.env</code> file via the server. Restart the server after saving.
+
+      <!-- BITCOIN GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">₿</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Bitcoin</div>
+              <div style="font-size:11px;color:var(--muted)">Manual entry — paste your address</div>
+            </div>
+          </div>
+          <span id="btc-balance" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)"></span>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:10px;padding:14px 0 0">
+          <div>
+            <div class="field-label" style="margin-bottom:5px">BTC Address</div>
+            <input class="field-input" id="btc-address-input" placeholder="tb1q... or bc1q...">
+          </div>
+          <div>
+            <div class="field-label" style="margin-bottom:5px">Private Key (WIF) — stored in memory only</div>
+            <input class="field-input" id="btc-wif-input" type="password" placeholder="••••••••">
+          </div>
+          <div style="display:flex;align-items:flex-end">
+            <button class="btn btn-green" onclick="saveBtcWallet()" style="font-size:12px;padding:6px 14px">Save</button>
+          </div>
+        </div>
+        <div id="btc-status" style="font-size:12px;color:var(--muted);margin-top:8px;padding-top:8px"></div>
       </div>
+
+      <!-- SOLANA GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">👻</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Solana — Phantom</div>
+              <div style="font-size:11px;color:var(--muted)">Requires Phantom browser extension</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="sol-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <span id="sol-balance" style="font-size:11px;color:var(--cyan)"></span>
+            <button class="btn btn-green" id="sol-btn" onclick="connectPhantom()" style="font-size:12px;padding:6px 14px">Connect Phantom</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- PRIVY GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">🔐</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Privy — Manual Task Execution</div>
+              <div style="font-size:11px;color:var(--muted)">Server-side wallet for automated E2E tests</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="privy-status-badge" style="font-size:11px;color:var(--muted)">Not configured</span>
+            <button class="btn btn-ghost" onclick="togglePrivyForm()" style="font-size:12px;padding:6px 14px">Configure Privy</button>
+          </div>
+        </div>
+        <div id="privy-form" style="display:none;padding-top:14px;display:none">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+            <div>
+              <div class="field-label" style="margin-bottom:5px">Privy App ID</div>
+              <input class="field-input" id="privy-app-id" placeholder="your-privy-app-id">
+            </div>
+            <div>
+              <div class="field-label" style="margin-bottom:5px">Privy App Secret</div>
+              <input class="field-input" id="privy-app-secret" type="password" placeholder="••••••••">
+            </div>
+            <div>
+              <div class="field-label" style="margin-bottom:5px">EVM Wallet ID</div>
+              <input class="field-input" id="privy-evm-id" placeholder="wallet-id-from-privy-dashboard">
+            </div>
+            <div>
+              <div class="field-label" style="margin-bottom:5px">Solana Wallet ID (optional)</div>
+              <input class="field-input" id="privy-sol-id" placeholder="wallet-id-from-privy-dashboard">
+            </div>
+          </div>
+          <div style="display:flex;gap:10px">
+            <button class="btn btn-green" onclick="connectPrivy()" style="font-size:12px">🔐 Connect Privy</button>
+            <button class="btn btn-red" onclick="disconnectPrivy()" style="font-size:12px">Disconnect</button>
+          </div>
+          <div id="privy-result" style="font-size:12px;margin-top:10px;color:var(--muted)"></div>
+        </div>
+      </div>
+
+      <!-- STARKNET GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">⭐</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Starknet — ArgentX / Braavos</div>
+              <div style="font-size:11px;color:var(--muted)">Requires ArgentX or Braavos extension</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="stark-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <button class="btn btn-green" id="stark-btn" onclick="connectStarknet()" style="font-size:12px;padding:6px 14px">Connect ArgentX</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- SUI GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">💧</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Sui Wallet</div>
+              <div style="font-size:11px;color:var(--muted)">Requires Sui Wallet extension</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="sui-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <button class="btn btn-green" id="sui-btn" onclick="connectSui()" style="font-size:12px;padding:6px 14px">Connect Sui</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- TRON GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">🔴</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Tron — TronLink</div>
+              <div style="font-size:11px;color:var(--muted)">Requires TronLink extension</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="tron-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <button class="btn btn-green" id="tron-btn" onclick="connectTron()" style="font-size:12px;padding:6px 14px">Connect TronLink</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- MANUAL APPROVE TOGGLE -->
       <div class="divider"></div>
       <h2 style="font-size:14px;font-weight:700;margin-bottom:14px">Manual Approve Mode</h2>
-      <div style="display:flex;align-items:center;gap:14px">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
-          <input type="checkbox" id="manualApproveToggle" style="width:16px;height:16px;cursor:pointer" onchange="toggleManualApprove()">
-          Require manual approval before every transaction
-        </label>
-      </div>
-      <p style="font-size:12px;color:var(--muted);margin-top:8px">When enabled, a prompt will appear in the Dashboard before each transaction is broadcast on-chain.</p>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:13px">
+        <input type="checkbox" id="manualApproveToggle" style="width:16px;height:16px;cursor:pointer" onchange="toggleManualApprove()">
+        Require manual approval before every transaction
+      </label>
+      <p style="font-size:12px;color:var(--muted);margin-top:8px">When enabled, a prompt appears before each transaction is sent on-chain.</p>
     </div>
 
     <!-- LIVE LOG PANEL -->
@@ -427,7 +557,9 @@ let suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
 
 // ── WEBSOCKET ──
 function connectWS() {
-  ws = new WebSocket(`ws://${location.host}`);
+  const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsHost  = location.host || 'localhost:3001';
+  ws = new WebSocket(`${wsProto}://${wsHost}`);
   ws.onopen = () => {
     setWsStatus(true);
     loadConfig();
@@ -778,8 +910,331 @@ function filterRoutes(f) {
   });
 }
 
+// ── WALLET CONNECTION ─────────────────────────────────────────
+
+// EVM chain definitions
+const EVM_CHAINS = [
+  { id: 'ethereum',  name: 'Ethereum',  chainId: '0xaa36a7', mainChainId: '0x1',     symbol: 'ETH',  icon: '⬡' },
+  { id: 'arbitrum',  name: 'Arbitrum',  chainId: '0x66eee',  mainChainId: '0xa4b1',  symbol: 'ETH',  icon: '🔵' },
+  { id: 'base',      name: 'Base',      chainId: '0x14a34',  mainChainId: '0x2105',  symbol: 'ETH',  icon: '🔷' },
+  { id: 'bnbchain',  name: 'BNB Chain', chainId: '0x61',     mainChainId: '0x38',    symbol: 'BNB',  icon: '🟡' },
+  { id: 'berachain', name: 'Berachain', chainId: '0x138d5',  mainChainId: '0x138d4', symbol: 'BERA', icon: '🐻' },
+  { id: 'unichain',  name: 'Unichain',  chainId: '0x515',    mainChainId: '0x515',   symbol: 'ETH',  icon: '🦄' },
+  { id: 'hyperevm',  name: 'HyperEVM',  chainId: '0x3e6',    mainChainId: '0x3e7',   symbol: 'ETH',  icon: '⚡' },
+  { id: 'corn',      name: 'Corn',      chainId: '0x1406f',  mainChainId: '0x1406f', symbol: 'BTCN', icon: '🌽' },
+  { id: 'botanix',   name: 'Botanix',   chainId: '0xe35',    mainChainId: '0xe35',   symbol: 'BTC',  icon: '🌿' },
+  { id: 'core',      name: 'Core',      chainId: '0x45b',    mainChainId: '0x45c',   symbol: 'CORE', icon: '⚙️' },
+  { id: 'megaeth',   name: 'MegaETH',   chainId: '0x18c6',   mainChainId: '0x18c6',  symbol: 'ETH',  icon: '🚀' },
+];
+
+let connectedWallets = { evm: false, btc: false, solana: false, privy: false, starknet: false, sui: false, tron: false };
+let evmAddress = null;
+let privyFormVisible = false;
+
+// Render EVM chain list
+function renderEvmChains(connected, address) {
+  const list = document.getElementById('evm-chain-list');
+  if (!connected) { list.innerHTML = ''; return; }
+  list.innerHTML = EVM_CHAINS.map(c => `
+    <div class="chain-row">
+      <div class="chain-name">${c.icon} ${c.name}</div>
+      <div class="chain-addr chain-connected">✅ ${shortenAddr(address)}</div>
+      <button onclick="switchToChain('${c.chainId}')" style="font-size:10px;padding:3px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer">Switch</button>
+    </div>`).join('');
+}
+
+// MetaMask connect
+async function connectMetaMask() {
+  if (!window.ethereum) {
+    alert('MetaMask not installed!\n\nInstall it from: https://metamask.io/download/');
+    return;
+  }
+  try {
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    evmAddress = accounts[0];
+    connectedWallets.evm = true;
+
+    // Tell backend
+    await fetch('/api/wallet/evm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address: evmAddress }) });
+
+    document.getElementById('evm-addr').textContent = shortenAddr(evmAddress);
+    document.getElementById('evm-addr').style.color = 'var(--green)';
+    document.getElementById('evm-btn').textContent = 'Disconnect';
+    document.getElementById('evm-btn').className = 'btn btn-red';
+    document.getElementById('evm-btn').onclick = disconnectEvm;
+    renderEvmChains(true, evmAddress);
+    updateWalletCount();
+
+    // Listen for account changes
+    window.ethereum.on('accountsChanged', (accs) => {
+      if (accs.length === 0) disconnectEvm();
+      else { evmAddress = accs[0]; document.getElementById('evm-addr').textContent = shortenAddr(evmAddress); renderEvmChains(true, evmAddress); }
+    });
+  } catch (err) {
+    alert('MetaMask connection failed: ' + err.message);
+  }
+}
+
+async function disconnectEvm() {
+  connectedWallets.evm = false; evmAddress = null;
+  await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'evm' }) });
+  document.getElementById('evm-addr').textContent = 'Not connected';
+  document.getElementById('evm-addr').style.color = 'var(--muted)';
+  document.getElementById('evm-btn').textContent = 'Connect MetaMask';
+  document.getElementById('evm-btn').className = 'btn btn-green';
+  document.getElementById('evm-btn').onclick = connectMetaMask;
+  renderEvmChains(false, null);
+  updateWalletCount();
+}
+
+async function switchToChain(chainId) {
+  if (!window.ethereum) return;
+  try {
+    await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId }] });
+  } catch (err) {
+    alert('Could not switch network: ' + err.message);
+  }
+}
+
+// BTC wallet save
+async function saveBtcWallet() {
+  const address = document.getElementById('btc-address-input').value.trim();
+  const wif = document.getElementById('btc-wif-input').value.trim();
+  if (!address) { alert('Please enter a BTC address'); return; }
+
+  const el = document.getElementById('btc-status');
+  el.textContent = '⏳ Fetching balance...';
+  el.style.color = 'var(--yellow)';
+
+  try {
+    const r = await fetch('/api/wallet/btc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, wif }) });
+    const d = await r.json();
+    connectedWallets.btc = true;
+    el.textContent = `✅ Saved — Balance: ${d.balance} BTC`;
+    el.style.color = 'var(--green)';
+    document.getElementById('btc-balance').textContent = `${d.balance} BTC`;
+    document.getElementById('btc-wif-input').value = ''; // clear key from UI
+    if (wif) document.getElementById('btc-wif-input').placeholder = '•••••••• (saved in memory)';
+    updateWalletCount();
+  } catch (err) {
+    el.textContent = '❌ Failed: ' + err.message;
+    el.style.color = 'var(--red)';
+  }
+}
+
+// Phantom (Solana) connect
+async function connectPhantom() {
+  if (!window.solana?.isPhantom) {
+    alert('Phantom not installed!\n\nInstall from: https://phantom.app/');
+    return;
+  }
+  try {
+    const resp = await window.solana.connect();
+    const address = resp.publicKey.toString();
+
+    // Fetch SOL balance
+    let balance = null;
+    try {
+      const r = await fetch('https://api.testnet.solana.com', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBalance', params: [address] })
+      });
+      const d = await r.json();
+      balance = ((d.result?.value || 0) / 1e9).toFixed(4) + ' SOL';
+    } catch (_) {}
+
+    await fetch('/api/wallet/solana', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, balance }) });
+
+    connectedWallets.solana = true;
+    document.getElementById('sol-addr').textContent = shortenAddr(address);
+    document.getElementById('sol-addr').style.color = 'var(--green)';
+    document.getElementById('sol-balance').textContent = balance || '';
+    document.getElementById('sol-btn').textContent = 'Disconnect';
+    document.getElementById('sol-btn').className = 'btn btn-red';
+    document.getElementById('sol-btn').onclick = disconnectSolana;
+    updateWalletCount();
+  } catch (err) {
+    alert('Phantom connection failed: ' + err.message);
+  }
+}
+
+async function disconnectSolana() {
+  if (window.solana) await window.solana.disconnect().catch(() => {});
+  connectedWallets.solana = false;
+  await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'solana' }) });
+  document.getElementById('sol-addr').textContent = 'Not connected';
+  document.getElementById('sol-addr').style.color = 'var(--muted)';
+  document.getElementById('sol-balance').textContent = '';
+  document.getElementById('sol-btn').textContent = 'Connect Phantom';
+  document.getElementById('sol-btn').className = 'btn btn-green';
+  document.getElementById('sol-btn').onclick = connectPhantom;
+  updateWalletCount();
+}
+
+// Privy connect
+function togglePrivyForm() {
+  privyFormVisible = !privyFormVisible;
+  document.getElementById('privy-form').style.display = privyFormVisible ? 'block' : 'none';
+}
+
+async function connectPrivy() {
+  const appId     = document.getElementById('privy-app-id').value.trim();
+  const appSecret = document.getElementById('privy-app-secret').value.trim();
+  const evmId     = document.getElementById('privy-evm-id').value.trim();
+  const solId     = document.getElementById('privy-sol-id').value.trim();
+  if (!appId || !appSecret || !evmId) { alert('App ID, App Secret and EVM Wallet ID are required'); return; }
+
+  const el = document.getElementById('privy-result');
+  el.textContent = '⏳ Connecting to Privy...';
+  el.style.color = 'var(--yellow)';
+
+  try {
+    const r = await fetch('/api/privy/connect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ appId, appSecret, evmWalletId: evmId, solanaWalletId: solId || null }) });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error);
+    connectedWallets.privy = true;
+    el.textContent = `✅ Connected — EVM: ${shortenAddr(d.evmAddress)}${d.solanaAddress ? ' | SOL: ' + shortenAddr(d.solanaAddress) : ''}`;
+    el.style.color = 'var(--green)';
+    document.getElementById('privy-status-badge').textContent = '✅ Connected';
+    document.getElementById('privy-status-badge').style.color = 'var(--green)';
+    document.getElementById('privy-app-secret').value = '';
+    updateWalletCount();
+  } catch (err) {
+    el.textContent = '❌ ' + err.message;
+    el.style.color = 'var(--red)';
+  }
+}
+
+async function disconnectPrivy() {
+  await fetch('/api/privy/disconnect', { method: 'POST' });
+  connectedWallets.privy = false;
+  document.getElementById('privy-status-badge').textContent = 'Not configured';
+  document.getElementById('privy-status-badge').style.color = 'var(--muted)';
+  document.getElementById('privy-result').textContent = '';
+  updateWalletCount();
+}
+
+// Starknet connect
+async function connectStarknet() {
+  if (!window.starknet) {
+    alert('ArgentX not installed!\n\nInstall from: https://www.argent.xyz/argent-x/');
+    return;
+  }
+  try {
+    await window.starknet.enable();
+    const address = window.starknet.selectedAddress;
+    await fetch('/api/wallet/starknet', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) });
+    connectedWallets.starknet = true;
+    document.getElementById('stark-addr').textContent = shortenAddr(address);
+    document.getElementById('stark-addr').style.color = 'var(--green)';
+    document.getElementById('stark-btn').textContent = 'Disconnect';
+    document.getElementById('stark-btn').className = 'btn btn-red';
+    document.getElementById('stark-btn').onclick = () => disconnectWallet('starknet', 'stark-addr', 'stark-btn', connectStarknet);
+    updateWalletCount();
+  } catch (err) { alert('Starknet connection failed: ' + err.message); }
+}
+
+// Sui connect
+async function connectSui() {
+  if (!window.suiWallet) {
+    alert('Sui Wallet not installed!\n\nInstall from: https://suiwallet.com/');
+    return;
+  }
+  try {
+    const perms = await window.suiWallet.requestPermissions();
+    const address = perms[0]?.address || window.suiWallet.getAccounts?.()?.[0];
+    await fetch('/api/wallet/sui', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) });
+    connectedWallets.sui = true;
+    document.getElementById('sui-addr').textContent = shortenAddr(address);
+    document.getElementById('sui-addr').style.color = 'var(--green)';
+    document.getElementById('sui-btn').textContent = 'Disconnect';
+    document.getElementById('sui-btn').className = 'btn btn-red';
+    document.getElementById('sui-btn').onclick = () => disconnectWallet('sui', 'sui-addr', 'sui-btn', connectSui);
+    updateWalletCount();
+  } catch (err) { alert('Sui connection failed: ' + err.message); }
+}
+
+// Tron connect
+async function connectTron() {
+  if (!window.tronWeb?.defaultAddress?.base58) {
+    alert('TronLink not installed!\n\nInstall from: https://www.tronlink.org/');
+    return;
+  }
+  try {
+    const address = window.tronWeb.defaultAddress.base58;
+    await fetch('/api/wallet/tron', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address }) });
+    connectedWallets.tron = true;
+    document.getElementById('tron-addr').textContent = shortenAddr(address);
+    document.getElementById('tron-addr').style.color = 'var(--green)';
+    document.getElementById('tron-btn').textContent = 'Disconnect';
+    document.getElementById('tron-btn').className = 'btn btn-red';
+    document.getElementById('tron-btn').onclick = () => disconnectWallet('tron', 'tron-addr', 'tron-btn', connectTron);
+    updateWalletCount();
+  } catch (err) { alert('TronLink connection failed: ' + err.message); }
+}
+
+// Generic disconnect helper
+async function disconnectWallet(type, addrId, btnId, reconnectFn) {
+  await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type }) });
+  connectedWallets[type] = false;
+  document.getElementById(addrId).textContent = 'Not connected';
+  document.getElementById(addrId).style.color = 'var(--muted)';
+  document.getElementById(btnId).textContent = 'Connect';
+  document.getElementById(btnId).className = 'btn btn-green';
+  document.getElementById(btnId).onclick = reconnectFn;
+  updateWalletCount();
+}
+
+// Update wallet count badge in header and sidebar
+function updateWalletCount() {
+  const count = Object.values(connectedWallets).filter(Boolean).length;
+  const total = Object.keys(connectedWallets).length;
+  const badge = document.getElementById('walletCount');
+  const summary = document.getElementById('walletSummary');
+  if (count > 0) { badge.textContent = count; badge.style.display = 'inline'; }
+  else badge.style.display = 'none';
+  if (summary) summary.textContent = `${count}/${total} wallets connected`;
+}
+
+// Load existing wallet states on page load
+async function loadWalletStates() {
+  try {
+    const r = await fetch('/api/wallet/balances');
+    const d = await r.json();
+    if (d.evm) {
+      connectedWallets.evm = true; evmAddress = d.evm.address;
+      document.getElementById('evm-addr').textContent = shortenAddr(d.evm.address);
+      document.getElementById('evm-addr').style.color = 'var(--green)';
+      renderEvmChains(true, d.evm.address);
+    }
+    if (d.btc) {
+      connectedWallets.btc = true;
+      document.getElementById('btc-status').textContent = `✅ ${d.btc.address} — ${d.btc.balance} BTC`;
+      document.getElementById('btc-status').style.color = 'var(--green)';
+      document.getElementById('btc-balance').textContent = d.btc.balance + ' BTC';
+    }
+    if (d.solana) {
+      connectedWallets.solana = true;
+      document.getElementById('sol-addr').textContent = shortenAddr(d.solana.address);
+      document.getElementById('sol-addr').style.color = 'var(--green)';
+    }
+    if (d.privy?.connected) {
+      connectedWallets.privy = true;
+      document.getElementById('privy-status-badge').textContent = `✅ Connected — ${shortenAddr(d.privy.evmAddress)}`;
+      document.getElementById('privy-status-badge').style.color = 'var(--green)';
+    }
+    updateWalletCount();
+  } catch (_) {}
+}
+
+function shortenAddr(addr) {
+  if (!addr) return '';
+  return addr.length > 12 ? addr.slice(0, 6) + '...' + addr.slice(-4) : addr;
+}
+
 // ── INIT ──
 connectWS();
+loadWalletStates();
 </script>
 </body>
 </html>
