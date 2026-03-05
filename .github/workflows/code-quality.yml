@@ -1,0 +1,40 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18.x'
+    
+    - name: Install Python linting tools
+      run: |
+        pip install flake8 black pylint
+    
+    - name: Check Python code style
+      run: flake8 . --max-line-length=100 --count
+      continue-on-error: true
+    
+    - name: Install Node dependencies
+      run: npm install
+      continue-on-error: true
+    
+    - name: Check Node code style
+      run: npm run lint
+      continue-on-error: true
