@@ -26,17 +26,6 @@ app.use(express.static(path.join(__dirname, "../dashboard")));
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// ── IN-MEMORY WALLET STORE (never written to disk) ────────────
-const walletStore = {
-  privy:    null, // { appId, appSecret, evmWalletId, solanaWalletId, evmAddress, solanaAddress }
-  btc:      null, // { address, wif, balance }
-  evm:      null, // { address }
-  solana:   null, // { address, balance }
-  starknet: null, // { address }
-  sui:      null, // { address }
-  tron:     null, // { address }
-};
-
 function broadcast(event, data) {
   const msg = JSON.stringify({ event, data, ts: new Date().toISOString() });
   wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
