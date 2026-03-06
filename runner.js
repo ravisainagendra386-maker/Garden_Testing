@@ -6,7 +6,8 @@ const config = require("../config");
 const { generateSecret } = require("../htlc/secret");
 const { initiateEvm, redeemEvm, approveIfNeeded, waitForConfirmation } = require("../htlc/evm");
 const { initiateHtlc } = require("../wallet/btc");
-const { getAddress, sendEvmTransaction } = require("../wallet/privy");
+const { sendEvmTransaction } = require("../wallet/privy");
+const walletState = require("../wallet/state");
 
 let _emit = null; // WebSocket emit function injected by server.js
 let _approvalQueue = []; // Queue for manual approval requests
@@ -77,8 +78,12 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label 
     // 5. Get wallet addresses
     const fromType = config.chains[fromChain]?.type || "evm";
     const toType = config.chains[toChain]?.type || "evm";
-    const fromAddress = fromType === "bitcoin" ? config.btc.address : await getAddress(fromType === "evm" ? "evm" : fromType);
-    const toAddress = toType === "bitcoin" ? config.btc.address : await getAddress(toType === "evm" ? "evm" : toType);
+
+    const fromAddress = walletState.getAddressByType(fromType === "evm" ? "evm" : fromType);
+    const toAddress   = walletState.getAddressByType(toType   === "evm" ? "evm" : toType);
+
+    if (!fromAddress) throw new Error(`No ${fromType} wallet connected. Go to Connect Wallets tab.`);
+    if (!toAddress)   throw new Error(`No ${toType} wallet connected. Go to Connect Wallets tab.`);
 
     // 6. Create order
     step("Create Order", "running");
