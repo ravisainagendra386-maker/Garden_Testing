@@ -172,6 +172,22 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   pre { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); }
 
+  /* ── COMBO CARDS ── */
+  .combo-card { background:var(--bg2); border:1px solid var(--border); border-radius:12px; padding:14px; position:relative; transition: border-color .2s; }
+  .combo-card.can-trade  { border-color: rgba(34,197,94,.4); }
+  .combo-card.partial    { border-color: rgba(245,158,11,.3); }
+  .combo-card.no-wallet  { opacity:.6; }
+  .combo-arrow { font-size:18px; color:var(--muted); margin:0 8px; }
+  .combo-asset { font-weight:700; font-size:13px; }
+  .combo-chain { font-size:11px; color:var(--muted); }
+  .combo-badge { font-size:10px; padding:2px 7px; border-radius:10px; font-weight:600; }
+  .combo-badge.ready   { background:rgba(34,197,94,.15);  color:var(--green); }
+  .combo-badge.partial { background:rgba(245,158,11,.15); color:var(--yellow); }
+  .combo-badge.no      { background:rgba(239,68,68,.1);   color:var(--red); }
+  .combo-amount-row { display:flex; align-items:center; gap:8px; margin-top:10px; }
+  .combo-amount-input { background:var(--bg3); border:1px solid var(--border); border-radius:6px; padding:5px 8px; color:var(--fg); font-size:12px; font-family:'JetBrains Mono',monospace; width:110px; }
+  .combo-filter.active { background:var(--accent); color:#000; }
+
   /* ── WALLET GROUPS ── */
   .wallet-group { background: var(--bg2); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 14px; }
   .wallet-group-header { display: flex; align-items: center; justify-content: space-between; }
@@ -213,6 +229,9 @@
     <div class="nav-item active" onclick="showPanel('dashboard')">
       <span class="nav-icon">🏠</span> Dashboard
     </div>
+    <div class="nav-item" onclick="showPanel('combinations')">
+      <span class="nav-icon">⚡</span> Trade Combinations <span id="comboBadge" style="margin-left:auto;font-size:10px;background:rgba(34,197,94,.2);color:#22c55e;padding:1px 6px;border-radius:10px;display:none"></span>
+    </div>
     <div class="nav-item" onclick="showPanel('routes')">
       <span class="nav-icon">🗺️</span> Route Matrix
     </div>
@@ -245,6 +264,7 @@
         <div style="display:flex;gap:10px">
           <button class="btn btn-ghost" onclick="runApiOnly()">🔌 API Tests</button>
           <button class="btn btn-green" id="btnRunAll" onclick="runAll()">▶ Run All Tests</button>
+          <button class="btn" id="btnStop" onclick="stopAll()" style="display:none;background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.3)">⏹ Stop</button>
         </div>
       </div>
 
@@ -277,6 +297,9 @@
         </div>
       </div>
 
+      <!-- Stuck orders -->
+      <div id="stuckOrdersContainer" style="display:none;margin-bottom:16px"></div>
+
       <!-- Approval modal area -->
       <div id="approvalBanner" style="display:none;background:rgba(245,158,11,.1);border:1px solid var(--yellow);border-radius:12px;padding:16px;margin-bottom:16px">
         <div style="font-size:14px;font-weight:700;color:var(--yellow);margin-bottom:8px">⏸ Manual Approval Required</div>
@@ -288,17 +311,50 @@
       </div>
     </div>
 
+    <!-- TRADE COMBINATIONS PANEL -->
+    <div class="panel" id="panel-combinations">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div>
+          <h1 class="section-title" style="margin:0">⚡ Trade Combinations</h1>
+          <div style="font-size:12px;color:var(--muted);margin-top:4px" id="comboSubtitle">Fetching active assets from Garden API…</div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <span id="comboStats" style="font-size:12px;color:var(--muted)"></span>
+          <button class="btn btn-ghost" onclick="loadCombinations()" style="font-size:12px">🔄 Refresh</button>
+          <button class="btn btn-green" id="btnRunTradeable" onclick="runAllTradeable()" style="font-size:12px">▶ Run All Tradeable</button>
+          <button class="btn" id="btnStopTradeable" onclick="stopAll()" style="display:none;font-size:12px;background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.3)">⏹ Stop</button>
+        </div>
+      </div>
+
+      <!-- Filter bar -->
+      <div style="display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap">
+        <button class="btn btn-ghost combo-filter active" data-filter="all"     onclick="filterCombos('all')"      style="font-size:11px;padding:4px 10px">All</button>
+        <button class="btn btn-ghost combo-filter"        data-filter="ready"   onclick="filterCombos('ready')"    style="font-size:11px;padding:4px 10px">✅ Ready to Trade</button>
+        <button class="btn btn-ghost combo-filter"        data-filter="partial" onclick="filterCombos('partial')"  style="font-size:11px;padding:4px 10px">⚠️ Partial</button>
+        <button class="btn btn-ghost combo-filter"        data-filter="no"      onclick="filterCombos('no')"       style="font-size:11px;padding:4px 10px">❌ Not Connected</button>
+      </div>
+
+      <!-- Combinations grid -->
+      <div id="combosLoading" style="text-align:center;padding:40px;color:var(--muted)">
+        <div class="spinner" style="display:inline-block;margin-bottom:10px"></div>
+        <div>Loading active assets from Garden API…</div>
+      </div>
+      <div id="combosGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;display:none"></div>
+      <div id="combosEmpty" style="display:none;text-align:center;padding:40px;color:var(--muted)">No combinations found for this filter</div>
+    </div>
+
     <!-- ROUTES PANEL -->
     <div class="panel" id="panel-routes">
       <div class="matrix-header">
-        <h1 class="section-title" style="margin:0">Route Matrix — All Chains</h1>
-        <div style="display:flex;gap:8px">
-          <button class="btn btn-ghost" id="btnFilterAll" onclick="filterRoutes('all')" style="font-size:11px;padding:5px 10px">All</button>
+        <h1 class="section-title" style="margin:0">Route Matrix — Active Assets</h1>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn btn-ghost" onclick="refreshRouteGrid()" style="font-size:11px;padding:5px 10px">🔄 Refresh Assets</button>
+          <button class="btn btn-ghost" id="btnFilterAll"  onclick="filterRoutes('all')"  style="font-size:11px;padding:5px 10px">All</button>
           <button class="btn btn-ghost" id="btnFilterFail" onclick="filterRoutes('fail')" style="font-size:11px;padding:5px 10px">Failed</button>
         </div>
       </div>
       <div class="route-grid" id="routeGrid">
-        <div class="empty-state" style="grid-column:1/-1">Routes will appear here after server connects…</div>
+        <div class="empty-state" style="grid-column:1/-1">Loading assets from Garden API…</div>
       </div>
     </div>
 
@@ -310,6 +366,7 @@
         <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('tech')">🔧 Tech</button>
         <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('ux')">🎨 UX/UI</button>
         <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('critical')">🔴 Critical</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('rpc')">📡 RPC</button>
       </div>
       <div class="issue-list" id="issueList">
         <div class="empty-state">No issues detected yet — run tests first</div>
@@ -362,6 +419,7 @@
           </div>
           <div style="display:flex;align-items:center;gap:10px">
             <span id="evm-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <span id="evm-rpc-status" style="font-size:11px;color:var(--muted)"></span>
             <button class="btn btn-green" id="evm-btn" onclick="connectMetaMask()" style="font-size:12px;padding:6px 14px">Connect MetaMask</button>
           </div>
         </div>
@@ -564,6 +622,7 @@ function connectWS() {
     setWsStatus(true);
     loadConfig();
     loadChains();
+    checkStuckOrders(); // check for stuck orders on connect
   };
   ws.onclose = () => { setWsStatus(false); setTimeout(connectWS, 3000); };
   ws.onmessage = (e) => handleWsMessage(JSON.parse(e.data));
@@ -583,6 +642,7 @@ function handleWsMessage({ event, data }) {
   if (event === 'suite_end')       handleSuiteEnd(data);
   if (event === 'approval_request') handleApprovalRequest(data);
   if (event === 'api_tests_done')  handleApiTestsDone(data);
+  if (event === 'evm_tx_request')  handleEvmTxRequest(data);
   if (event === 'error')           addIssue('tech', 'critical', 'Server Error', data.message);
 }
 
@@ -619,10 +679,24 @@ function handleTestEnd({ label, status, error, steps }) {
 }
 
 function handleSuiteEnd(d) {
-  document.getElementById('lastRunLabel').textContent = 
-    `Last run: ${new Date().toLocaleTimeString()} — ${d.passed}/${d.total} passed`;
+  const msg = d.total === 0
+    ? `No routes ran — ${d.message || 'connect wallets first'}`
+    : `Last run: ${new Date().toLocaleTimeString()} — ${d.passed}/${d.total} passed`;
+  document.getElementById('lastRunLabel').textContent = msg;
   document.getElementById('btnRunAll').disabled = false;
   document.getElementById('btnRunAll').innerHTML = '▶ Run All Tests';
+  document.getElementById('btnStop').style.display = 'none';
+  if (d.total === 0 && d.message) {
+    addIssue('tech', 'warning', 'No routes built', d.message || 'Connect wallets and retry');
+  }
+}
+
+async function stopAll() {
+  await fetch('/api/abort', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({}) });
+  document.getElementById('btnStop').style.display = 'none';
+  document.getElementById('btnRunAll').disabled = false;
+  document.getElementById('btnRunAll').innerHTML = '▶ Run All Tests';
+  document.getElementById('lastRunLabel').textContent = 'Stopped by user';
 }
 
 function handleApprovalRequest(data) {
@@ -643,6 +717,43 @@ function handleApiTestsDone(results) {
   });
 }
 
+async function handleEvmTxRequest({ id, orderId, label, to, data, value, chainId, gasLimit }) {
+  // Garden sends a pre-built tx — we need to send it via MetaMask
+  if (!window.ethereum) {
+    addIssue('tech', 'critical', 'MetaMask required', 'EVM HTLC needs MetaMask to sign. Connect MetaMask first.');
+    await fetch('/api/evm-tx-response', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ id, txHash: false }) });
+    return;
+  }
+  try {
+    // Switch to the right chain first
+    const chainHex = '0x' + parseInt(chainId).toString(16);
+    try { await window.ethereum.request({ method:'wallet_switchEthereumChain', params:[{chainId: chainHex}] }); }
+    catch(switchErr) { console.warn('Chain switch failed:', switchErr.message); }
+
+    logEvent('info', { label: `🦊 MetaMask: sign EVM HTLC for ${label}` });
+    const accounts = await window.ethereum.request({ method:'eth_requestAccounts' });
+    const txHash = await window.ethereum.request({
+      method: 'eth_sendTransaction',
+      params: [{
+        from:     accounts[0],
+        to,
+        data,
+        value:    value || '0x0',
+        gas:      gasLimit || '0x493e0',
+        chainId:  chainHex,
+      }]
+    });
+    await fetch('/api/evm-tx-response', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ id, txHash }) });
+    logEvent('info', { label: `✅ EVM HTLC sent: ${txHash}` });
+  } catch(err) {
+    addIssue('tech', 'warning', `MetaMask rejected: ${label}`, err.message);
+    await fetch('/api/evm-tx-response', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ id, txHash: false }) });
+  }
+}
+
 // ── APPROVAL ──
 function sendApproval(approved) {
   if (!pendingApproval) return;
@@ -653,27 +764,59 @@ function sendApproval(approved) {
 }
 
 // ── ROUTE GRID ──
-function refreshRouteGrid() {
-  const grid = document.getElementById('routeGrid');
-  if (!allChains.length) return;
+let gardenAssets = [];
 
-  const chains = allChains.filter(c => c.id !== 'bitcoin');
+async function refreshRouteGrid() {
+  const grid = document.getElementById('routeGrid');
+  grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1">⏳ Fetching active assets from Garden API…</div>';
+
+  try {
+    const r = await fetch('/api/assets');
+    const d = await r.json();
+    gardenAssets = d.result || d.assets || d || [];
+  } catch (e) {
+    grid.innerHTML = `<div class="empty-state" style="grid-column:1/-1;color:var(--red)">Failed to load assets: ${e.message}</div>`;
+    return;
+  }
+
+  if (!gardenAssets.length) {
+    grid.innerHTML = '<div class="empty-state" style="grid-column:1/-1">No assets returned from Garden API</div>';
+    return;
+  }
+
+  renderRouteGrid('all');
+}
+
+function renderRouteGrid(filter) {
+  const grid = document.getElementById('routeGrid');
   let html = '';
-  ['bitcoin', ...chains.map(c => c.id)].forEach(src => {
-    const targets = src === 'bitcoin' ? chains.map(c => c.id) : ['bitcoin'];
-    targets.forEach(dst => {
-      const srcName = allChains.find(c => c.id === src)?.name || src;
-      const dstName = allChains.find(c => c.id === dst)?.name || dst;
-      const label = `${srcName} → ${dstName}`;
-      const state = routeStates[label] || { status: 'pending' };
+
+  for (const from of gardenAssets) {
+    for (const to of gardenAssets) {
+      if (from.id === to.id) continue;
+      const fromTicker = (from.name || '').split(':').pop();
+      const toTicker   = (to.name   || '').split(':').pop();
+      const fromChain  = from.id.split(':')[0].replace(/_/g,' ').replace(/\b\w/g,l=>l.toUpperCase());
+      const toChain    = to.id.split(':')[0].replace(/_/g,' ').replace(/\b\w/g,l=>l.toUpperCase());
+      const label      = `${from.id} → ${to.id}`;
+      const display    = `${fromTicker} (${fromChain}) → ${toTicker} (${toChain})`;
+      const state      = routeStates[label] || routeStates[`${from.name} → ${to.name}`] || { status: 'pending' };
+
+      if (filter === 'fail' && state.status !== 'fail') continue;
+
       const statusIcon = { pass:'✅', fail:'❌', running:'⏳', skipped:'⏭', pending:'○' }[state.status] || '○';
+      const fromIcon = from.icon ? `<img src="${from.icon}" style="width:14px;height:14px;border-radius:50%;vertical-align:middle;margin-right:3px" onerror="this.style.display='none'">` : '';
+      const toIcon   = to.icon   ? `<img src="${to.icon}"   style="width:14px;height:14px;border-radius:50%;vertical-align:middle;margin-right:3px" onerror="this.style.display='none'">` : '';
+
       html += `<div class="route-card ${state.status}" onclick="showRouteDetail('${label}')">
-        <div class="route-label">${statusIcon} ${label}</div>
+        <div class="route-label">${statusIcon} ${fromIcon}${fromTicker} → ${toIcon}${toTicker}</div>
+        <div class="route-status" style="font-size:10px;color:var(--muted)">${fromChain} → ${toChain}</div>
         <div class="route-status"><span class="badge ${state.status}">${state.status}</span></div>
       </div>`;
-    });
-  });
-  grid.innerHTML = html;
+    }
+  }
+
+  grid.innerHTML = html || '<div class="empty-state" style="grid-column:1/-1">No routes match this filter</div>';
 }
 
 function showRouteDetail(label) {
@@ -736,13 +879,18 @@ function updateStats() {
 }
 
 // ── ACTIONS ──
-function runAll() {
-  document.getElementById('btnRunAll').disabled = true;
-  document.getElementById('btnRunAll').innerHTML = '<span class="spinner"></span> Running…';
+async function runAll() {
+  const btn  = document.getElementById('btnRunAll');
+  const stop = document.getElementById('btnStop');
+  // Show stop button IMMEDIATELY
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Running…';
+  stop.style.display = 'inline-flex';
   suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
   updateStats();
   issues = [];
   renderIssues();
+  document.getElementById('lastRunLabel').textContent = '⏳ Running tests…';
   fetch('/api/run', { method: 'POST' });
 }
 
@@ -901,14 +1049,372 @@ function showPanel(id) {
   document.getElementById(`panel-${id}`).classList.add('active');
   const items = document.querySelectorAll('.nav-item');
   items.forEach(item => { if (item.getAttribute('onclick')?.includes(id)) item.classList.add('active'); });
+  if (id === 'combinations') loadCombinations();
+  if (id === 'routes') refreshRouteGrid();
 }
 
 function filterRoutes(f) {
-  document.querySelectorAll('.route-card').forEach(card => {
-    if (f === 'all') card.style.display = '';
-    else card.style.display = card.classList.contains(f) ? '' : 'none';
-  });
+  renderRouteGrid(f);
 }
+
+// ── TRADE COMBINATIONS ────────────────────────────────────────
+
+let allCombos    = [];
+let currentFilter = "all";
+
+async function loadCombinations() {
+  const grid    = document.getElementById("combosGrid");
+  const loading = document.getElementById("combosLoading");
+  const empty   = document.getElementById("combosEmpty");
+  const subtitle = document.getElementById("comboSubtitle");
+  const stats   = document.getElementById("comboStats");
+
+  grid.style.display    = "none";
+  empty.style.display   = "none";
+  loading.style.display = "block";
+  subtitle.textContent  = "Fetching active assets from Garden API…";
+
+  try {
+    const r = await fetch("/api/combinations");
+    const d = await r.json();
+    allCombos = d.combinations || [];
+
+    const ready   = allCombos.filter(c => c.canTrade).length;
+    const partial = allCombos.filter(c => !c.canTrade && (c.fromWalletConnected || c.toWalletConnected)).length;
+
+    subtitle.textContent = `${allCombos.length} active asset pairs found`;
+    stats.textContent    = `${ready} ready · ${partial} partial`;
+
+    // Update badge
+    const badge = document.getElementById("comboBadge");
+    if (ready > 0) { badge.textContent = ready + " ready"; badge.style.display = "inline"; }
+    else badge.style.display = "none";
+
+    loading.style.display = "none";
+    renderCombos(currentFilter);
+  } catch (err) {
+    loading.innerHTML = `
+      <div style="color:var(--yellow);padding:20px;text-align:center">
+        <div style="font-size:24px;margin-bottom:10px">⚠️</div>
+        <div style="font-weight:600;margin-bottom:6px">Could not load combinations</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:14px">${err.message}</div>
+        <div style="font-size:12px;color:var(--muted)">Make sure the server is running and wallets are connected</div>
+        <button class="btn btn-ghost" onclick="loadCombinations()" style="margin-top:12px;font-size:12px">Try Again</button>
+      </div>`;
+  }
+}
+
+function assetLabel(a) {
+  // "Wrapped Bitcoin:WBTC" → "WBTC", "Bitcoin:BTC" → "BTC"
+  const parts = (a.name || a.assetId || "").split(":");
+  return parts.length > 1 ? parts[parts.length - 1] : parts[0];
+}
+
+function chainLabel(a) {
+  // "base_sepolia:wbtc" → "Base Sepolia", chain "evm:84532" → use assetId prefix
+  const prefix = (a.assetId || "").split(":")[0];
+  return prefix.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
+}
+
+function renderCombos(filter) {
+  const grid  = document.getElementById("combosGrid");
+  const empty = document.getElementById("combosEmpty");
+
+  let filtered = allCombos;
+  if (filter === "ready")   filtered = allCombos.filter(c => c.canTrade);
+  if (filter === "partial") filtered = allCombos.filter(c => !c.canTrade && (c.fromWalletConnected || c.toWalletConnected));
+  if (filter === "no")      filtered = allCombos.filter(c => !c.fromWalletConnected && !c.toWalletConnected);
+
+  if (filtered.length === 0) {
+    grid.style.display  = "none";
+    empty.style.display = "block";
+    return;
+  }
+
+  grid.style.display  = "grid";
+  empty.style.display = "none";
+
+  grid.innerHTML = filtered.map(c => {
+    const safeId = c.id.replace(/[^a-z0-9]/gi, '_');
+
+    // Status: distinguish "ready with confirmed balance" vs "ready but EVM balance unknown"
+    const bothConnected = c.fromWalletConnected && c.toWalletConnected;
+    const eitherConnected = c.fromWalletConnected || c.toWalletConnected;
+    const balanceOk = c.canAfford === true;
+    const balanceLow = c.canAfford === false;
+    const balanceUnknown = c.canAfford === null && bothConnected; // EVM
+
+    let statusClass, badgeClass, badgeText;
+    if (balanceLow) {
+      statusClass = "partial"; badgeClass = "partial"; badgeText = "❌ Low Balance";
+    } else if (bothConnected && balanceOk) {
+      statusClass = "can-trade"; badgeClass = "ready"; badgeText = "✅ Ready";
+    } else if (bothConnected && balanceUnknown) {
+      statusClass = "can-trade"; badgeClass = "ready"; badgeText = "⚠️ Check Balance";
+    } else if (eitherConnected) {
+      statusClass = "partial"; badgeClass = "partial"; badgeText = "⚠️ Partial";
+    } else {
+      statusClass = "no-wallet"; badgeClass = "no"; badgeText = "❌ Not Connected";
+    }
+
+    const fromTicker = assetLabel(c.from);
+    const toTicker   = assetLabel(c.to);
+    const fromChain  = chainLabel(c.from);
+    const toChain    = chainLabel(c.to);
+    const fromDot    = c.fromWalletConnected ? `<span style="color:var(--green)">●</span>` : `<span style="color:var(--muted)">○</span>`;
+    const toDot      = c.toWalletConnected   ? `<span style="color:var(--green)">●</span>` : `<span style="color:var(--muted)">○</span>`;
+    const fromIcon   = c.from.icon ? `<img src="${c.from.icon}" style="width:18px;height:18px;border-radius:50%;margin-right:5px;vertical-align:middle" onerror="this.style.display='none'">` : '';
+    const toIcon     = c.to.icon   ? `<img src="${c.to.icon}"   style="width:18px;height:18px;border-radius:50%;margin-right:5px;vertical-align:middle" onerror="this.style.display='none'">` : '';
+
+    // Balance info line
+    let balanceLine = "";
+    if (c.walletBalance !== null) {
+      const balColor = balanceLow ? "var(--red)" : "var(--green)";
+      balanceLine = `· Balance: <span style="color:${balColor}">${Number(c.walletBalance).toLocaleString()}</span>`;
+    } else if (c.from.walletType === "evm") {
+      balanceLine = `· <span style="color:var(--yellow)">Balance: check in wallet</span>`;
+    }
+
+    // Amount input — use minAmount from policy (correct per asset decimals)
+    const suggested = c.suggestedAmount || c.minAmount;
+
+    return `
+    <div class="combo-card ${statusClass}" id="combo-${safeId}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
+        <div style="display:flex;align-items:center;gap:6px">
+          <div style="text-align:center">
+            <div class="combo-asset">${fromIcon}${fromDot} ${fromTicker}</div>
+            <div class="combo-chain">${fromChain}</div>
+          </div>
+          <span class="combo-arrow">→</span>
+          <div style="text-align:center">
+            <div class="combo-asset">${toIcon}${toDot} ${toTicker}</div>
+            <div class="combo-chain">${toChain}</div>
+          </div>
+        </div>
+        <span class="combo-badge ${badgeClass}">${badgeText}</span>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:8px">
+        Min: ${Number(c.minAmount).toLocaleString()} – Max: ${Number(c.maxAmount).toLocaleString()} ${balanceLine}
+      </div>
+      ${c.canTrade ? `
+      <div class="combo-amount-row">
+        <input class="combo-amount-input" id="amt-${safeId}"
+          type="number" value="${suggested}" min="${c.minAmount}" max="${c.maxAmount}" step="1">
+        <span style="font-size:11px;color:var(--muted);flex:1">${fromTicker} (atomic units)</span>
+        <button class="btn btn-green" onclick="confirmTrade('${safeId}','${c.from.assetId}','${c.to.assetId}','${c.from.walletType}','${c.to.walletType}','${fromTicker}','${toTicker}')"
+          style="font-size:11px;padding:5px 12px">▶ Run</button>
+      </div>` : `
+      <div style="font-size:11px;color:var(--muted)">
+        ${balanceLow ? `Insufficient balance — need ${Number(c.minAmount).toLocaleString()} ${fromTicker}` :
+          !c.fromWalletConnected ? `Connect ${c.from.walletType} wallet to send` :
+          `Connect ${c.to.walletType} wallet to receive`}
+        ${!balanceLow ? `<a onclick="showPanel('wallets')" style="color:var(--accent);cursor:pointer;margin-left:4px">→ Connect</a>` : ""}
+      </div>`}
+    </div>`;
+  }).join("");
+}
+
+function filterCombos(filter) {
+  currentFilter = filter;
+  document.querySelectorAll(".combo-filter").forEach(b => b.classList.toggle("active", b.dataset.filter === filter));
+  renderCombos(filter);
+}
+
+async function confirmTrade(safeId, fromAssetId, toAssetId, fromWalletType, toWalletType, fromTicker, toTicker) {
+  const input  = document.getElementById(`amt-${safeId}`);
+  const amount = parseInt(input?.value || 50000);
+
+  if (!confirm(`Confirm trade:\n\n${fromTicker} → ${toTicker}\nFrom: ${fromAssetId}\nTo:   ${toAssetId}\nAmount: ${amount.toLocaleString()}\n\nThis will initiate a real transaction.`)) return;
+
+  try {
+    const r = await fetch("/api/run/combination", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fromAssetId, toAssetId, fromWalletType, toWalletType, amount })
+    });
+    const d = await r.json();
+    if (d.started) {
+      showPanel("dashboard");
+      logEvent('info', { label: `🚀 Trade started: ${fromTicker} → ${toTicker}` });
+    }
+  } catch (err) {
+    alert("Failed to start trade: " + err.message);
+  }
+}
+
+// ── TRADE SIZE MODAL ─────────────────────────────────────────
+let _pendingTradeableRun = null;
+
+function isSyntheticBtc(assetId) {
+  const name = (assetId || "").toLowerCase();
+  return /cbtc|wbtc|cbbtc|wcbtc|sbtc|cbltc|cbxrp/.test(name.split(":").pop());
+}
+
+function showTradeSizeModal(tradeable) {
+  // Categorise: synth BTC, USDC/USDT (stablecoins), other
+  const synthBtcAssets = [...new Set(tradeable.filter(c => isSyntheticBtc(c.from.assetId)).map(c => c.from.assetId))];
+  const stableAssets   = [...new Set(tradeable.filter(c => /usdc|usdt/.test((c.from.assetId||"").toLowerCase()) && !isSyntheticBtc(c.from.assetId)).map(c => c.from.assetId))];
+  const btcAssets      = [...new Set(tradeable.filter(c => c.from.walletType === "bitcoin").map(c => c.from.assetId))];
+  const otherAssets    = [...new Set(tradeable.map(c => c.from.assetId).filter(id => !synthBtcAssets.includes(id) && !stableAssets.includes(id) && !btcAssets.includes(id)))];
+
+  let html = `
+    <div style="position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;z-index:200" id="tradeSizeOverlay">
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:16px;padding:28px;width:540px;max-width:95vw;max-height:90vh;overflow-y:auto">
+        <div style="font-size:17px;font-weight:700;margin-bottom:4px">⚡ Configure Trade Sizes</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:20px">${tradeable.length} tradeable pairs found. Set amounts per asset group.</div>`;
+
+  // BTC source group
+  if (btcAssets.length) {
+    const c = tradeable.find(x => btcAssets.includes(x.from.assetId));
+    const bal = c ? Number(c.walletBalance || 0) : 0;
+    html += _groupRow("₿ Bitcoin Source (sats)", "btc_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance");
+  }
+
+  // Synthetic BTC group — one value for all
+  if (synthBtcAssets.length) {
+    const c = tradeable.find(x => synthBtcAssets.includes(x.from.assetId));
+    const bal = c ? Number(c.walletBalance || 0) : 0;
+    html += _groupRow("🔵 Synthetic BTC (cBTC, wBTC, sBTC…)", "synthbtc_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance — applied to all synthetic BTC assets");
+  }
+
+  // Stablecoins group
+  if (stableAssets.length) {
+    const c = tradeable.find(x => stableAssets.includes(x.from.assetId));
+    const bal = c ? Number(c.walletBalance || 0) : 0;
+    html += _groupRow("💵 Stablecoins (USDC / USDT)", "stable_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance — applied to all stablecoin assets");
+  }
+
+  // Other individual assets
+  if (otherAssets.length) {
+    html += `<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:16px 0 8px">Other Assets</div>`;
+    for (const assetId of otherAssets) {
+      const c = tradeable.find(x => x.from.assetId === assetId);
+      const label = assetId.split(":").pop().toUpperCase() + " (" + assetId.split(":")[0].replace(/_/g," ") + ")";
+      const bal = c ? Number(c.walletBalance || 0) : 0;
+      html += _groupRow(label, "asset_" + assetId.replace(/[^a-z0-9]/gi,"_"), bal, c?.minAmount, c?.maxAmount, "%", "% of balance");
+    }
+  }
+
+  html += `
+        <div style="display:flex;gap:10px;margin-top:20px">
+          <button class="btn btn-green" style="flex:1" onclick="confirmTradeSizeModal()">▶ Run All</button>
+          <button class="btn btn-ghost" style="flex:1" onclick="document.getElementById('tradeSizeOverlay').remove()">Cancel</button>
+        </div>
+      </div>
+    </div>`;
+
+  // Store for later
+  _pendingTradeableRun = { tradeable, btcAssets, synthBtcAssets, stableAssets, otherAssets };
+  document.body.insertAdjacentHTML("beforeend", html);
+}
+
+function _groupRow(label, key, balance, minAmt, maxAmt, unit, hint) {
+  const defaultPct = 50;
+  const suggestedAmt = balance > 0 ? Math.max(Number(minAmt||0), Math.floor(balance * defaultPct / 100)) : (minAmt || 50000);
+  return `
+    <div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px">
+      <div style="font-size:12px;font-weight:600;margin-bottom:8px">${label}</div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <div style="display:flex;align-items:center;gap:6px">
+          <label style="font-size:11px;color:var(--muted)">%&nbsp;of&nbsp;balance</label>
+          <input id="pct_${key}" type="number" min="1" max="100" value="${defaultPct}"
+            style="width:60px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-size:12px;font-family:inherit"
+            oninput="updateAmtFromPct('${key}', ${balance}, ${minAmt||0}, ${maxAmt||999999999})">
+          <span style="font-size:11px;color:var(--muted)">%</span>
+        </div>
+        <span style="color:var(--muted);font-size:13px">=</span>
+        <div style="display:flex;align-items:center;gap:6px">
+          <input id="amt_${key}" type="number" value="${suggestedAmt}" min="${minAmt||1}" max="${maxAmt||999999999}" step="1"
+            style="width:130px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-size:12px;font-family:'JetBrains Mono',monospace"
+            oninput="updatePctFromAmt('${key}', ${balance})">
+          <span style="font-size:11px;color:var(--muted)">atomic units</span>
+        </div>
+        ${balance > 0 ? `<span style="font-size:11px;color:var(--muted)">bal: ${Number(balance).toLocaleString()}</span>` : ""}
+      </div>
+      ${minAmt ? `<div style="font-size:10px;color:var(--muted);margin-top:5px">Min: ${Number(minAmt).toLocaleString()} · Max: ${Number(maxAmt).toLocaleString()} · ${hint}</div>` : ""}
+    </div>`;
+}
+
+function updateAmtFromPct(key, balance, minAmt, maxAmt) {
+  const pct = parseFloat(document.getElementById("pct_"+key)?.value || 50);
+  if (!balance) return;
+  const amt = Math.max(minAmt, Math.min(maxAmt, Math.floor(balance * pct / 100)));
+  const el = document.getElementById("amt_"+key);
+  if (el) el.value = amt;
+}
+
+function updatePctFromAmt(key, balance) {
+  if (!balance) return;
+  const amt = parseFloat(document.getElementById("amt_"+key)?.value || 0);
+  const pct = Math.min(100, Math.max(0, Math.round(amt / balance * 100)));
+  const el = document.getElementById("pct_"+key);
+  if (el) el.value = pct;
+}
+
+async function confirmTradeSizeModal() {
+  if (!_pendingTradeableRun) return;
+  const { tradeable, btcAssets, synthBtcAssets, stableAssets, otherAssets } = _pendingTradeableRun;
+
+  // Read amounts from modal inputs
+  function getAmt(key, fallback) {
+    const el = document.getElementById("amt_"+key);
+    return el ? parseInt(el.value) || fallback : fallback;
+  }
+
+  const btcAmt      = getAmt("btc_group",     50000);
+  const synthBtcAmt = getAmt("synthbtc_group", 500000000000000);
+  const stableAmt   = getAmt("stable_group",   34000000);
+
+  // Build per-asset amounts
+  function amtForCombo(c) {
+    if (btcAssets.includes(c.from.assetId))      return btcAmt;
+    if (synthBtcAssets.includes(c.from.assetId)) return synthBtcAmt;
+    if (stableAssets.includes(c.from.assetId))   return stableAmt;
+    const key = "asset_" + c.from.assetId.replace(/[^a-z0-9]/gi,"_");
+    return getAmt(key, c.suggestedAmount || c.minAmount);
+  }
+
+  document.getElementById("tradeSizeOverlay").remove();
+  _pendingTradeableRun = null;
+
+  // Show stop button, go to dashboard
+  document.getElementById("btnStopTradeable").style.display = "inline-flex";
+  document.getElementById("btnRunTradeable").disabled = true;
+  showPanel("dashboard");
+  document.getElementById("lastRunLabel").textContent = `⏳ Running ${tradeable.length} tradeable pairs…`;
+
+  let ran = 0;
+  for (const c of tradeable) {
+    const amount = amtForCombo(c);
+    await fetch("/api/run/combination", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fromAssetId:    c.from.assetId,
+        toAssetId:      c.to.assetId,
+        fromWalletType: c.from.walletType,
+        toWalletType:   c.to.walletType,
+        amount
+      })
+    });
+    ran++;
+    document.getElementById("lastRunLabel").textContent = `⏳ Queued ${ran}/${tradeable.length}…`;
+    await new Promise(r => setTimeout(r, 400));
+  }
+
+  document.getElementById("lastRunLabel").textContent = `▶ ${tradeable.length} trades queued — watch Active Test`;
+  document.getElementById("btnStopTradeable").style.display = "none";
+  document.getElementById("btnRunTradeable").disabled = false;
+}
+
+async function runAllTradeable() {
+  const tradeable = allCombos.filter(c => c.canTrade);
+  if (!tradeable.length) { alert("No tradeable combinations. Connect wallets first."); return; }
+  showTradeSizeModal(tradeable);
+}
+
+// Load combinations when panel opens
+const _origShowPanel = window.showPanel;
 
 // ── WALLET CONNECTION ─────────────────────────────────────────
 
@@ -964,6 +1470,8 @@ async function connectMetaMask() {
     document.getElementById('evm-btn').onclick = disconnectEvm;
     renderEvmChains(true, evmAddress);
     updateWalletCount();
+    // Fetch EVM balances from free public RPCs in background
+    fetchEvmBalances(evmAddress);
 
     // Listen for account changes
     window.ethereum.on('accountsChanged', (accs) => {
@@ -1230,6 +1738,72 @@ async function loadWalletStates() {
 function shortenAddr(addr) {
   if (!addr) return '';
   return addr.length > 12 ? addr.slice(0, 6) + '...' + addr.slice(-4) : addr;
+}
+
+// ── EVM BALANCE FETCH ─────────────────────────────────────────
+async function fetchEvmBalances(address) {
+  const statusEl = document.getElementById('evm-rpc-status');
+  if (statusEl) { statusEl.textContent = '⏳ Checking balances…'; statusEl.style.color = 'var(--yellow)'; }
+  try {
+    const r = await fetch('/api/wallet/evm/balances', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ address })
+    });
+    const d = await r.json();
+    if (d.error) throw new Error(d.error);
+    const chains = Object.keys(d.balances || {});
+    const nonZero = Object.entries(d.balances || {}).filter(([,wei]) => wei > 0);
+    if (statusEl) {
+      statusEl.textContent = `✅ ${chains.length} chains checked · ${nonZero.length} with balance`;
+      statusEl.style.color = 'var(--green)';
+    }
+    // Expose balances globally for combinations
+    window._evmBalances = d.balances || {};
+    if (d.rpcErrors?.length) {
+      d.rpcErrors.forEach(e => addIssue('rpc', 'warning', `RPC Error: ${e.chain}`, e.message));
+    }
+  } catch(err) {
+    if (statusEl) { statusEl.textContent = `⚠️ Balance check failed: ${err.message}`; statusEl.style.color = 'var(--yellow)'; }
+    addIssue('rpc', 'warning', 'EVM Balance RPC Failed', err.message);
+  }
+}
+
+// ── STUCK ORDERS ──────────────────────────────────────────────
+async function checkStuckOrders() {
+  try {
+    const r = await fetch('/api/orders/stuck');
+    const d = await r.json();
+    if (d.stuck > 0) {
+      const list = d.orders.map(o => `
+        <div style="background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);border-radius:8px;padding:12px;margin-bottom:8px;font-size:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <div style="font-weight:600;color:var(--yellow)">${o.id?.slice(0,16)}…</div>
+              <div style="color:var(--muted);margin-top:2px">${o.source?.asset || ''} → ${o.destination?.asset || ''} · Status: ${o.status}</div>
+              <div style="color:var(--muted)">${o.created_at ? new Date(o.created_at).toLocaleString() : ''}</div>
+            </div>
+            <button onclick="cancelOrder('${o.id}')" class="btn" style="font-size:11px;padding:4px 10px;background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)">
+              Request Refund
+            </button>
+          </div>
+        </div>`).join('');
+      const container = document.getElementById('stuckOrdersContainer');
+      if (container) {
+        container.innerHTML = `<div style="color:var(--yellow);font-weight:600;margin-bottom:8px">⚠️ ${d.stuck} stuck order${d.stuck>1?'s':''} found</div>` + list;
+        container.style.display = 'block';
+      }
+    }
+  } catch (_) {}
+}
+
+async function cancelOrder(id) {
+  if (!confirm(`Request refund for order ${id}?`)) return;
+  try {
+    const r = await fetch(`/api/orders/cancel/${id}`, { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) { alert('Refund requested!'); checkStuckOrders(); }
+    else alert('Failed: ' + (d.error || 'Unknown error'));
+  } catch (err) { alert('Error: ' + err.message); }
 }
 
 // ── INIT ──
