@@ -156,7 +156,7 @@
   .sev-info     { color: var(--blue); }
 
   /* ── LIVE LOG ── */
-  .live-log { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; line-height: 1.8; padding: 16px; background: var(--bg3); border-radius: 10px; height: 300px; overflow-y: auto; border: 1px solid var(--border); }
+  .live-log { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; line-height: 1.8; padding: 16px; background: var(--bg3); border-radius: 10px; height: calc(100vh - 160px); overflow-y: auto; border: 1px solid var(--border); }
   .log-line { padding: 1px 0; }
   .log-ts { color: var(--muted); margin-right: 10px; }
   .log-pass { color: var(--green); }
@@ -321,6 +321,8 @@
         <div style="display:flex;gap:10px;align-items:center">
           <span id="comboStats" style="font-size:12px;color:var(--muted)"></span>
           <button class="btn btn-ghost" onclick="loadCombinations()" style="font-size:12px">🔄 Refresh</button>
+          <button class="btn btn-ghost" id="btnValidatePairs" onclick="validatePairs()" style="font-size:12px" title="Test all pairs via Garden /quote — filters out unsupported routes">🔍 Validate Pairs</button>
+          <span id="validationStatus" style="font-size:11px;color:var(--muted)"></span>
           <button class="btn btn-green" id="btnRunTradeable" onclick="runAllTradeable()" style="font-size:12px">▶ Run All Tradeable</button>
           <button class="btn" id="btnStopTradeable" onclick="stopAll()" style="display:none;font-size:12px;background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.3)">⏹ Stop</button>
         </div>
@@ -364,9 +366,10 @@
       <div style="display:flex;gap:10px;margin-bottom:20px">
         <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('all')">All</button>
         <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('tech')">🔧 Tech</button>
-        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('ux')">🎨 UX/UI</button>
-        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('critical')">🔴 Critical</button>
         <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('rpc')">📡 RPC</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('route')">🚫 Routes</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('liquidity')">💧 Liquidity</button>
+        <button class="btn btn-ghost" style="font-size:11px;padding:5px 10px" onclick="filterIssues('balance')">💰 Balance</button>
       </div>
       <div class="issue-list" id="issueList">
         <div class="empty-state">No issues detected yet — run tests first</div>
@@ -405,7 +408,20 @@
         <h1 class="section-title" style="margin:0">💳 Connected Wallets</h1>
         <span id="walletSummary" style="font-size:12px;color:var(--muted)">0/7 wallets connected</span>
       </div>
-      <p style="font-size:13px;color:var(--muted);margin-bottom:24px">Connect your wallets to enable test execution across all Garden Finance chains.</p>
+      <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Connect your wallets to enable test execution across all Garden Finance chains.</p>
+
+      <!-- Priority info box -->
+      <div style="background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.25);border-radius:10px;padding:12px 16px;margin-bottom:20px;font-size:12px">
+        <div style="font-weight:700;color:var(--yellow);margin-bottom:6px">&#x1F510; .env Key Priority</div>
+        <div style="color:var(--muted);line-height:1.7">
+          Wallet connections use this priority order:<br>
+          <span style="color:var(--green)">3. Browser extension</span> (MetaMask, Phantom…) — <b>highest — overrides everything</b><br>
+          <span style="color:var(--cyan)">2. Privy server wallet</span> — overrides .env keys<br>
+          <span style="color:var(--yellow)">1. .env private key</span> — auto-connects on startup, lowest priority<br>
+          <br>
+          Set <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">EVM_PRIVATE_KEY</code>, <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">BTC_PRIVATE_KEY_WIF</code>, <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">SOLANA_PRIVATE_KEY</code> etc in your <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">.env</code> for automated signing.
+        </div>
+      </div>
 
       <!-- EVM GROUP -->
       <div class="wallet-group" id="wg-evm">
@@ -474,48 +490,6 @@
         </div>
       </div>
 
-      <!-- PRIVY GROUP -->
-      <div class="wallet-group">
-        <div class="wallet-group-header">
-          <div style="display:flex;align-items:center;gap:10px">
-            <span style="font-size:18px">🔐</span>
-            <div>
-              <div style="font-weight:700;font-size:14px">Privy — Manual Task Execution</div>
-              <div style="font-size:11px;color:var(--muted)">Server-side wallet for automated E2E tests</div>
-            </div>
-          </div>
-          <div style="display:flex;align-items:center;gap:10px">
-            <span id="privy-status-badge" style="font-size:11px;color:var(--muted)">Not configured</span>
-            <button class="btn btn-ghost" onclick="togglePrivyForm()" style="font-size:12px;padding:6px 14px">Configure Privy</button>
-          </div>
-        </div>
-        <div id="privy-form" style="display:none;padding-top:14px;display:none">
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
-            <div>
-              <div class="field-label" style="margin-bottom:5px">Privy App ID</div>
-              <input class="field-input" id="privy-app-id" placeholder="your-privy-app-id">
-            </div>
-            <div>
-              <div class="field-label" style="margin-bottom:5px">Privy App Secret</div>
-              <input class="field-input" id="privy-app-secret" type="password" placeholder="••••••••">
-            </div>
-            <div>
-              <div class="field-label" style="margin-bottom:5px">EVM Wallet ID</div>
-              <input class="field-input" id="privy-evm-id" placeholder="wallet-id-from-privy-dashboard">
-            </div>
-            <div>
-              <div class="field-label" style="margin-bottom:5px">Solana Wallet ID (optional)</div>
-              <input class="field-input" id="privy-sol-id" placeholder="wallet-id-from-privy-dashboard">
-            </div>
-          </div>
-          <div style="display:flex;gap:10px">
-            <button class="btn btn-green" onclick="connectPrivy()" style="font-size:12px">🔐 Connect Privy</button>
-            <button class="btn btn-red" onclick="disconnectPrivy()" style="font-size:12px">Disconnect</button>
-          </div>
-          <div id="privy-result" style="font-size:12px;margin-top:10px;color:var(--muted)"></div>
-        </div>
-      </div>
-
       <!-- STARKNET GROUP -->
       <div class="wallet-group">
         <div class="wallet-group-header">
@@ -564,6 +538,48 @@
             <span id="tron-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
             <button class="btn btn-green" id="tron-btn" onclick="connectTron()" style="font-size:12px;padding:6px 14px">Connect TronLink</button>
           </div>
+        </div>
+      </div>
+
+      <!-- PRIVY GROUP -->
+      <div class="wallet-group">
+        <div class="wallet-group-header">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span style="font-size:18px">🔐</span>
+            <div>
+              <div style="font-weight:700;font-size:14px">Privy — Manual Task Execution</div>
+              <div style="font-size:11px;color:var(--muted)">Server-side wallet for automated E2E tests</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="privy-status-badge" style="font-size:11px;color:var(--muted)">Not configured</span>
+            <button class="btn btn-ghost" onclick="togglePrivyForm()" style="font-size:12px;padding:6px 14px">Configure Privy</button>
+          </div>
+        </div>
+        <div id="privy-form" style="display:none;padding-top:14px;display:none">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">
+            <div>
+              <div class="field-label" style="margin-bottom:5px">Privy App ID</div>
+              <input class="field-input" id="privy-app-id" placeholder="your-privy-app-id">
+            </div>
+            <div>
+              <div class="field-label" style="margin-bottom:5px">Privy App Secret</div>
+              <input class="field-input" id="privy-app-secret" type="password" placeholder="••••••••">
+            </div>
+            <div>
+              <div class="field-label" style="margin-bottom:5px">EVM Wallet ID</div>
+              <input class="field-input" id="privy-evm-id" placeholder="wallet-id-from-privy-dashboard">
+            </div>
+            <div>
+              <div class="field-label" style="margin-bottom:5px">Solana Wallet ID (optional)</div>
+              <input class="field-input" id="privy-sol-id" placeholder="wallet-id-from-privy-dashboard">
+            </div>
+          </div>
+          <div style="display:flex;gap:10px">
+            <button class="btn btn-green" onclick="connectPrivy()" style="font-size:12px">🔐 Connect Privy</button>
+            <button class="btn btn-red" onclick="disconnectPrivy()" style="font-size:12px">Disconnect</button>
+          </div>
+          <div id="privy-result" style="font-size:12px;margin-top:10px;color:var(--muted)"></div>
         </div>
       </div>
 
@@ -641,8 +657,12 @@ function handleWsMessage({ event, data }) {
   if (event === 'test_end')        handleTestEnd(data);
   if (event === 'suite_end')       handleSuiteEnd(data);
   if (event === 'approval_request') handleApprovalRequest(data);
-  if (event === 'api_tests_done')  handleApiTestsDone(data);
-  if (event === 'evm_tx_request')  handleEvmTxRequest(data);
+  if (event === 'api_tests_done')   handleApiTestsDone(data);
+  if (event === 'evm_tx_request')   handleEvmTxRequest(data);
+  if (event === 'evm_sign_request') handleEvmSignRequest(data);
+  if (event === 'validate_progress') handleValidateProgress(data);
+  if (event === 'validate_done')    handleValidateDone(data);
+  if (event === 'suite_aborted')    handleSuiteAborted(data);
   if (event === 'error')           addIssue('tech', 'critical', 'Server Error', data.message);
 }
 
@@ -670,12 +690,37 @@ function handleTestStep({ label, step }) {
 function handleTestEnd({ label, status, error, steps }) {
   if (routeStates[label]) routeStates[label].status = status;
   suiteStats.total++;
-  if (status === 'pass') suiteStats.passed++;
-  else if (status === 'fail') { suiteStats.failed++; addIssue('tech','critical', `${label} failed`, error || 'See step log'); }
-  else suiteStats.skipped++;
+  if (status === 'pass') {
+    suiteStats.passed++;
+  } else if (status === 'fail') {
+    suiteStats.failed++;
+    addIssue('tech', 'critical', `Failed: ${label}`, error || 'See step log');
+  } else {
+    suiteStats.skipped++;
+    // Log meaningful skips to issues (not wallet-not-connected noise)
+    if (error) {
+      const e = error.toLowerCase();
+      if (e.includes('no order pair') || e.includes('order pair found')) {
+        addIssue('route', 'info', `Unsupported pair: ${label}`, 'Garden has no solver for this route');
+      } else if (e.includes('insufficient liquidity') || e.includes('liquidity')) {
+        addIssue('liquidity', 'warning', `No liquidity: ${label}`, error);
+      } else if (e.includes('insufficient balance') || e.includes('have ') && e.includes('need ')) {
+        addIssue('balance', 'warning', `Low balance: ${label}`, error);
+      } else if (e.includes('400') || e.includes('order')) {
+        addIssue('tech', 'warning', `Order skipped: ${label}`, error);
+      }
+    }
+  }
   updateStats();
   refreshRouteGrid();
   document.getElementById('activeTestBadge').innerHTML = `<span class="badge ${status}">${status.toUpperCase()}: ${label}</span>`;
+  // If this was a single trade from combinations panel, hide stop button
+  if (_singleTradeRunning) {
+    _singleTradeRunning = false;
+    document.getElementById('btnStop').style.display = 'none';
+    document.getElementById('lastRunLabel').textContent =
+      `${status === 'pass' ? '✅' : status === 'fail' ? '❌' : '⏭'} ${label} — ${status.toUpperCase()}`;
+  }
 }
 
 function handleSuiteEnd(d) {
@@ -691,12 +736,19 @@ function handleSuiteEnd(d) {
   }
 }
 
+let _tradeableAbort = false;
+
 async function stopAll() {
+  _tradeableAbort = true; // stop the client-side tradeable loop
   await fetch('/api/abort', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({}) });
   document.getElementById('btnStop').style.display = 'none';
   document.getElementById('btnRunAll').disabled = false;
   document.getElementById('btnRunAll').innerHTML = '▶ Run All Tests';
-  document.getElementById('lastRunLabel').textContent = 'Stopped by user';
+  const btnStopT = document.getElementById('btnStopTradeable');
+  if (btnStopT) btnStopT.style.display = 'none';
+  const btnRunT = document.getElementById('btnRunTradeable');
+  if (btnRunT) { btnRunT.disabled = false; }
+  document.getElementById('lastRunLabel').textContent = '⏹ Stopped by user';
 }
 
 function handleApprovalRequest(data) {
@@ -754,6 +806,39 @@ async function handleEvmTxRequest({ id, orderId, label, to, data, value, chainId
   }
 }
 
+async function handleEvmSignRequest({ id, orderId, label, signData, chainId }) {
+  if (!window.ethereum) {
+    addIssue('tech', 'critical', 'MetaMask required', 'EIP-712 signing needs MetaMask.');
+    await fetch('/api/evm-sign-response', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ id, signature: false }) });
+    return;
+  }
+  try {
+    // Switch to correct chain
+    const chainHex = '0x' + parseInt(chainId).toString(16);
+    try { await window.ethereum.request({ method:'wallet_switchEthereumChain', params:[{chainId: chainHex}] }); }
+    catch(e) { console.warn('Chain switch:', e.message); }
+
+    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    logEvent('info', { label: `✍️ MetaMask: sign EIP-712 for ${label} (gasless)` });
+
+    // eth_signTypedData_v4 expects (address, JSON string of typed data)
+    const typedDataStr = typeof signData === 'string' ? signData : JSON.stringify(signData);
+    const signature = await window.ethereum.request({
+      method: 'eth_signTypedData_v4',
+      params: [accounts[0], typedDataStr],
+    });
+
+    await fetch('/api/evm-sign-response', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ id, signature }) });
+    logEvent('info', { label: `✅ EIP-712 signed — relayer will submit for ${label}` });
+  } catch(err) {
+    addIssue('tech', 'warning', `EIP-712 sign rejected: ${label}`, err.message);
+    await fetch('/api/evm-sign-response', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ id, signature: false }) });
+  }
+}
+
 // ── APPROVAL ──
 function sendApproval(approved) {
   if (!pendingApproval) return;
@@ -803,8 +888,13 @@ function renderRouteGrid(filter) {
       const state      = routeStates[label] || routeStates[`${from.name} → ${to.name}`] || { status: 'pending' };
 
       if (filter === 'fail' && state.status !== 'fail') continue;
+      if (filter === 'unsupported' && state.status !== 'unsupported') continue;
+      if (filter === 'supported' && (state.status === 'unsupported' || state.status === 'pending')) continue;
 
-      const statusIcon = { pass:'✅', fail:'❌', running:'⏳', skipped:'⏭', pending:'○' }[state.status] || '○';
+      // Mark routes that returned "No order pair found" as unsupported
+      const noQuote = state.status === 'skipped' && state.steps?.some?.(s => s.detail?.includes('No order pair'));
+      if (noQuote) state.status = 'unsupported';
+      const statusIcon = { pass:'✅', fail:'❌', running:'⏳', skipped:'⏭', pending:'○', unsupported:'🚫' }[state.status] || '○';
       const fromIcon = from.icon ? `<img src="${from.icon}" style="width:14px;height:14px;border-radius:50%;vertical-align:middle;margin-right:3px" onerror="this.style.display='none'">` : '';
       const toIcon   = to.icon   ? `<img src="${to.icon}"   style="width:14px;height:14px;border-radius:50%;vertical-align:middle;margin-right:3px" onerror="this.style.display='none'">` : '';
 
@@ -843,8 +933,8 @@ function appendStep(step, container) {
 }
 
 // ── ISSUES ──
-function addIssue(type, severity, title, detail) {
-  issues.push({ type, severity, title, detail, ts: new Date().toLocaleTimeString() });
+function addIssue(type, severity, title, detail, meta = {}) {
+  issues.push({ type, severity, title, detail, meta, ts: new Date().toLocaleTimeString() });
   renderIssues();
   const badge = document.getElementById('issueCount');
   badge.textContent = issues.length;
@@ -859,7 +949,11 @@ function renderIssues(filter = 'all') {
     <div class="issue-item">
       <div class="issue-header">
         <span class="issue-title">${i.title}</span>
-        <span class="badge sev-${i.severity}">${i.severity.toUpperCase()}</span>
+        <div style="display:flex;align-items:center;gap:8px">
+          ${i.type === 'rpc' && i.meta?.chain ? `<button class="btn btn-ghost" onclick="openRpcModal('${i.meta.chain}')"
+            style="font-size:10px;padding:2px 8px;border-color:var(--cyan);color:var(--cyan)">🔧 Fix RPC</button>` : ''}
+          <span class="badge sev-${i.severity}">${i.severity.toUpperCase()}</span>
+        </div>
       </div>
       <div class="issue-detail">${i.detail}</div>
       <div style="font-size:11px;color:var(--muted);margin-top:4px">${i.type.toUpperCase()} · ${i.ts}</div>
@@ -880,9 +974,46 @@ function updateStats() {
 
 // ── ACTIONS ──
 async function runAll() {
+  // First load combinations to build the trade size modal
   const btn  = document.getElementById('btnRunAll');
   const stop = document.getElementById('btnStop');
-  // Show stop button IMMEDIATELY
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Loading…';
+
+  try {
+    // Load combinations if not already loaded
+    if (!allCombos.length) {
+      const r = await fetch('/api/combinations');
+      const d = await r.json();
+      allCombos = d.combinations || [];
+    }
+    const tradeable = allCombos.filter(c => c.canTrade);
+
+    if (!tradeable.length) {
+      // No tradeable combos — launch directly, runner will skip non-wallet routes
+      btn.disabled = false;
+      btn.innerHTML = '▶ Run All Tests';
+      _launchRunAll();
+      return;
+    }
+
+    // Show modal for trade sizes, then launch
+    btn.disabled = false;
+    btn.innerHTML = '▶ Run All Tests';
+    _runAllAfterModal = true;  // flag so modal knows to call _launchRunAll
+    showTradeSizeModal(tradeable);
+  } catch(e) {
+    btn.disabled = false;
+    btn.innerHTML = '▶ Run All Tests';
+    _launchRunAll(); // if combinations fail to load, just run with defaults
+  }
+}
+
+let _runAllAfterModal = false;
+
+function _launchRunAll() {
+  const btn  = document.getElementById('btnRunAll');
+  const stop = document.getElementById('btnStop');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Running…';
   stop.style.display = 'inline-flex';
@@ -1016,7 +1147,7 @@ function logEvent(event, data) {
   const detail = typeof data === 'object' ? (data.label || data.message || data.event || '') : '';
   log.innerHTML += `<div class="log-line ${cls}"><span class="log-ts">[${ts}]</span> ${event}${detail ? ' — ' + detail : ''}</div>`;
   log.scrollTop = log.scrollHeight;
-  if (log.children.length > 500) log.removeChild(log.firstChild);
+  if (log.children.length > 2000) log.removeChild(log.firstChild);
 }
 
 function clearLog() { document.getElementById('liveLog').innerHTML = ''; }
@@ -1083,6 +1214,14 @@ async function loadCombinations() {
     const partial = allCombos.filter(c => !c.canTrade && (c.fromWalletConnected || c.toWalletConnected)).length;
 
     subtitle.textContent = `${allCombos.length} active asset pairs found`;
+    // Show validation hint if pairs haven't been validated yet
+    if (!d.pairsValidated) {
+      const hint = document.getElementById('validationStatus');
+      if (hint && !hint.textContent) {
+        hint.textContent = '⚠️ Click "Validate Pairs" to filter out unsupported routes';
+        hint.style.color = 'var(--yellow)';
+      }
+    }
     stats.textContent    = `${ready} ready · ${partial} partial`;
 
     // Update badge
@@ -1102,6 +1241,63 @@ async function loadCombinations() {
         <button class="btn btn-ghost" onclick="loadCombinations()" style="margin-top:12px;font-size:12px">Try Again</button>
       </div>`;
   }
+}
+
+// Validate all pairs via Garden /quote — updates combinations view
+async function validatePairs() {
+  const btn    = document.getElementById('btnValidatePairs');
+  const status = document.getElementById('validationStatus');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Starting…';
+  status.textContent = 'Contacting Garden API…';
+  status.style.color = 'var(--muted)';
+
+  try {
+    const r = await fetch('/api/valid-pairs');
+    const d = await r.json();
+    if (d.cached) {
+      status.textContent = `✅ ${d.pairs.length} valid pairs (cached ${d.age}s ago)`;
+      status.style.color = 'var(--green)';
+      btn.disabled = false;
+      btn.innerHTML = '🔍 Validate Pairs';
+      await loadCombinations();
+    } else if (d.inProgress) {
+      status.textContent = '⏳ Validation already running…';
+      status.style.color = 'var(--yellow)';
+      btn.disabled = false;
+      btn.innerHTML = '🔍 Validate Pairs';
+    } else if (d.started) {
+      // Progress will come via WS events — button stays disabled until validate_done
+      status.textContent = '⏳ Checking pairs… 0%';
+      status.style.color = 'var(--cyan)';
+    }
+  } catch(err) {
+    status.textContent = `❌ ${err.message}`;
+    status.style.color = 'var(--red)';
+    btn.disabled = false;
+    btn.innerHTML = '🔍 Validate Pairs';
+  }
+}
+
+function handleValidateProgress({ done, total, valid }) {
+  const pct = total > 0 ? Math.round(done / total * 100) : 0;
+  const status = document.getElementById('validationStatus');
+  const btn    = document.getElementById('btnValidatePairs');
+  if (status) { status.textContent = `⏳ ${pct}% — ${done}/${total} checked, ${valid} valid`; status.style.color = 'var(--cyan)'; }
+  if (btn) btn.innerHTML = `<span class="spinner"></span> ${pct}%`;
+}
+
+async function handleValidateDone({ total, valid, error }) {
+  const btn    = document.getElementById('btnValidatePairs');
+  const status = document.getElementById('validationStatus');
+  if (error) {
+    if (status) { status.textContent = `❌ Validation failed: ${error}`; status.style.color = 'var(--red)'; }
+  } else {
+    if (status) { status.textContent = `✅ ${valid} valid pairs out of ${total}`; status.style.color = 'var(--green)'; }
+    // Reload combinations to apply the new filter
+    await loadCombinations();
+  }
+  if (btn) { btn.disabled = false; btn.innerHTML = '🔍 Validate Pairs'; }
 }
 
 function assetLabel(a) {
@@ -1202,14 +1398,16 @@ function renderCombos(filter) {
         <input class="combo-amount-input" id="amt-${safeId}"
           type="number" value="${suggested}" min="${c.minAmount}" max="${c.maxAmount}" step="1">
         <span style="font-size:11px;color:var(--muted);flex:1">${fromTicker} (atomic units)</span>
-        <button class="btn btn-green" onclick="confirmTrade('${safeId}','${c.from.assetId}','${c.to.assetId}','${c.from.walletType}','${c.to.walletType}','${fromTicker}','${toTicker}')"
+        <button class="btn btn-green"
+          onclick="confirmTrade('${safeId}','${c.from.assetId}','${c.to.assetId}','${c.from.walletType}','${c.to.walletType}','${fromTicker}','${toTicker}')"
           style="font-size:11px;padding:5px 12px">▶ Run</button>
       </div>` : `
       <div style="font-size:11px;color:var(--muted)">
         ${balanceLow ? `Insufficient balance — need ${Number(c.minAmount).toLocaleString()} ${fromTicker}` :
+          balanceUnknown ? `Balance unverified — <a onclick="fetchEvmBalances('${evmAddress||''}')" style="color:var(--accent);cursor:pointer">refresh balances</a>` :
           !c.fromWalletConnected ? `Connect ${c.from.walletType} wallet to send` :
           `Connect ${c.to.walletType} wallet to receive`}
-        ${!balanceLow ? `<a onclick="showPanel('wallets')" style="color:var(--accent);cursor:pointer;margin-left:4px">→ Connect</a>` : ""}
+        ${!balanceLow && !balanceUnknown ? `<a onclick="showPanel('wallets')" style="color:var(--accent);cursor:pointer;margin-left:4px">→ Connect</a>` : ""}
       </div>`}
     </div>`;
   }).join("");
@@ -1220,6 +1418,8 @@ function filterCombos(filter) {
   document.querySelectorAll(".combo-filter").forEach(b => b.classList.toggle("active", b.dataset.filter === filter));
   renderCombos(filter);
 }
+
+let _singleTradeRunning = false;
 
 async function confirmTrade(safeId, fromAssetId, toAssetId, fromWalletType, toWalletType, fromTicker, toTicker) {
   const input  = document.getElementById(`amt-${safeId}`);
@@ -1235,7 +1435,11 @@ async function confirmTrade(safeId, fromAssetId, toAssetId, fromWalletType, toWa
     });
     const d = await r.json();
     if (d.started) {
+      _singleTradeRunning = true;
       showPanel("dashboard");
+      // Show stop button
+      document.getElementById('btnStop').style.display = 'inline-flex';
+      document.getElementById('lastRunLabel').textContent = `⏳ Running: ${fromTicker} → ${toTicker}`;
       logEvent('info', { label: `🚀 Trade started: ${fromTicker} → ${toTicker}` });
     }
   } catch (err) {
@@ -1247,14 +1451,22 @@ async function confirmTrade(safeId, fromAssetId, toAssetId, fromWalletType, toWa
 let _pendingTradeableRun = null;
 
 function isSyntheticBtc(assetId) {
-  const name = (assetId || "").toLowerCase();
-  return /cbtc|wbtc|cbbtc|wcbtc|sbtc|cbltc|cbxrp/.test(name.split(":").pop());
+  // Matches any wrapped/synthetic BTC-family token by ticker suffix
+  const ticker = (assetId || "").toLowerCase().split(":").pop();
+  return /^(cbtc|wbtc|cbbtc|wcbtc|sbtc|hbtc|btcn|lbtc|wltc|cbltc|cbxrp|xbtc|tbtc|pbtc|rbtc|anybtc)$/.test(ticker)
+      || /btc$/.test(ticker);  // catches alpen:cbtc, monad:wbtc etc
+}
+
+function isStablecoin(assetId) {
+  const ticker = (assetId || "").toLowerCase().split(":").pop();
+  return /^(usdc|usdt|dai|busd|tusd|usdce|usdcn|cbbtc)$/.test(ticker)
+      || ticker.startsWith("usdc") || ticker.startsWith("usdt");
 }
 
 function showTradeSizeModal(tradeable) {
   // Categorise: synth BTC, USDC/USDT (stablecoins), other
   const synthBtcAssets = [...new Set(tradeable.filter(c => isSyntheticBtc(c.from.assetId)).map(c => c.from.assetId))];
-  const stableAssets   = [...new Set(tradeable.filter(c => /usdc|usdt/.test((c.from.assetId||"").toLowerCase()) && !isSyntheticBtc(c.from.assetId)).map(c => c.from.assetId))];
+  const stableAssets   = [...new Set(tradeable.filter(c => isStablecoin(c.from.assetId) && !isSyntheticBtc(c.from.assetId)).map(c => c.from.assetId))];
   const btcAssets      = [...new Set(tradeable.filter(c => c.from.walletType === "bitcoin").map(c => c.from.assetId))];
   const otherAssets    = [...new Set(tradeable.map(c => c.from.assetId).filter(id => !synthBtcAssets.includes(id) && !stableAssets.includes(id) && !btcAssets.includes(id)))];
 
@@ -1285,14 +1497,22 @@ function showTradeSizeModal(tradeable) {
     html += _groupRow("💵 Stablecoins (USDC / USDT)", "stable_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance — applied to all stablecoin assets");
   }
 
-  // Other individual assets
+  // Other assets — group by ticker so all WETH chains share one row
   if (otherAssets.length) {
-    html += `<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:16px 0 8px">Other Assets</div>`;
+    // Group by ticker suffix
+    const byTicker = {};
     for (const assetId of otherAssets) {
-      const c = tradeable.find(x => x.from.assetId === assetId);
-      const label = assetId.split(":").pop().toUpperCase() + " (" + assetId.split(":")[0].replace(/_/g," ") + ")";
+      const ticker = assetId.split(":").pop().toUpperCase();
+      if (!byTicker[ticker]) byTicker[ticker] = [];
+      byTicker[ticker].push(assetId);
+    }
+    html += `<div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:16px 0 8px">Other Assets</div>`;
+    for (const [ticker, assetIds] of Object.entries(byTicker)) {
+      const c = tradeable.find(x => assetIds.includes(x.from.assetId));
+      const chainsLabel = assetIds.length > 1 ? `${ticker} (${assetIds.length} chains)` : `${ticker} (${assetIds[0].split(":")[0].replace(/_/g," ")})`;
       const bal = c ? Number(c.walletBalance || 0) : 0;
-      html += _groupRow(label, "asset_" + assetId.replace(/[^a-z0-9]/gi,"_"), bal, c?.minAmount, c?.maxAmount, "%", "% of balance");
+      // Use ticker as key so all assetIds with same ticker share one amount
+      html += _groupRow(chainsLabel, "ticker_" + ticker.toLowerCase(), bal, c?.minAmount, c?.maxAmount, "%", `% of balance — applied to all ${ticker} assets`);
     }
   }
 
@@ -1371,12 +1591,30 @@ async function confirmTradeSizeModal() {
     if (btcAssets.includes(c.from.assetId))      return btcAmt;
     if (synthBtcAssets.includes(c.from.assetId)) return synthBtcAmt;
     if (stableAssets.includes(c.from.assetId))   return stableAmt;
-    const key = "asset_" + c.from.assetId.replace(/[^a-z0-9]/gi,"_");
-    return getAmt(key, c.suggestedAmount || c.minAmount);
+    const ticker = c.from.assetId.split(":").pop().toLowerCase();
+    return getAmt("ticker_" + ticker, c.suggestedAmount || c.minAmount);
   }
 
   document.getElementById("tradeSizeOverlay").remove();
   _pendingTradeableRun = null;
+
+  // Build amount overrides map: assetId → amount
+  const amountOverrides = {};
+  for (const c of tradeable) {
+    amountOverrides[c.from.assetId] = amtForCombo(c);
+  }
+
+  // If triggered from runAll(), store overrides and launch the server-side full run
+  if (_runAllAfterModal) {
+    _runAllAfterModal = false;
+    // Store overrides so server can use them — post to a new endpoint
+    await fetch('/api/run/set-amounts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amounts: amountOverrides })
+    }).catch(() => {});
+    _launchRunAll();
+    return;
+  }
 
   // Show stop button, go to dashboard
   document.getElementById("btnStopTradeable").style.display = "inline-flex";
@@ -1384,8 +1622,10 @@ async function confirmTradeSizeModal() {
   showPanel("dashboard");
   document.getElementById("lastRunLabel").textContent = `⏳ Running ${tradeable.length} tradeable pairs…`;
 
+  _tradeableAbort = false; // reset before starting
   let ran = 0;
   for (const c of tradeable) {
+    if (_tradeableAbort) break;
     const amount = amtForCombo(c);
     await fetch("/api/run/combination", {
       method: "POST", headers: { "Content-Type": "application/json" },
@@ -1399,10 +1639,12 @@ async function confirmTradeSizeModal() {
     });
     ran++;
     document.getElementById("lastRunLabel").textContent = `⏳ Queued ${ran}/${tradeable.length}…`;
-    await new Promise(r => setTimeout(r, 400));
+    if (!_tradeableAbort) await new Promise(r => setTimeout(r, 400));
   }
 
-  document.getElementById("lastRunLabel").textContent = `▶ ${tradeable.length} trades queued — watch Active Test`;
+  if (!_tradeableAbort) {
+    document.getElementById("lastRunLabel").textContent = `▶ ${tradeable.length} trades queued — watch Active Test`;
+  }
   document.getElementById("btnStopTradeable").style.display = "none";
   document.getElementById("btnRunTradeable").disabled = false;
 }
@@ -1475,8 +1717,13 @@ async function connectMetaMask() {
 
     // Listen for account changes
     window.ethereum.on('accountsChanged', (accs) => {
-      if (accs.length === 0) disconnectEvm();
-      else { evmAddress = accs[0]; document.getElementById('evm-addr').textContent = shortenAddr(evmAddress); renderEvmChains(true, evmAddress); }
+      if (accs.length === 0) disconnectEvm(); // will fall back to envkey if available
+      else {
+        evmAddress = accs[0];
+        document.getElementById('evm-addr').textContent = shortenAddr(evmAddress) + ' 🦊';
+        renderEvmChains(true, evmAddress);
+        fetch('/api/wallet/evm', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ address: evmAddress }) });
+      }
     });
   } catch (err) {
     alert('MetaMask connection failed: ' + err.message);
@@ -1486,6 +1733,25 @@ async function connectMetaMask() {
 async function disconnectEvm() {
   connectedWallets.evm = false; evmAddress = null;
   await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'evm' }) });
+
+  // Server re-activates envkey after disconnect — check if it did
+  try {
+    const r = await fetch('/api/wallet/balances');
+    const d = await r.json();
+    if (d.evm && d.evm.source === 'envkey') {
+      evmAddress = d.evm.address;
+      connectedWallets.evm = true;
+      document.getElementById('evm-addr').textContent = shortenAddr(d.evm.address) + ' 🔐 .env key';
+      document.getElementById('evm-addr').style.color = 'var(--yellow)';
+      document.getElementById('evm-btn').textContent = 'Override with MetaMask';
+      document.getElementById('evm-btn').className = 'btn btn-ghost';
+      document.getElementById('evm-btn').onclick = connectMetaMask;
+      updateWalletCount();
+      return;
+    }
+  } catch(_) {}
+
+  // No envkey fallback — fully disconnected
   document.getElementById('evm-addr').textContent = 'Not connected';
   document.getElementById('evm-addr').style.color = 'var(--muted)';
   document.getElementById('evm-btn').textContent = 'Connect MetaMask';
@@ -1494,6 +1760,7 @@ async function disconnectEvm() {
   renderEvmChains(false, null);
   updateWalletCount();
 }
+
 
 async function switchToChain(chainId) {
   if (!window.ethereum) return;
@@ -1570,6 +1837,23 @@ async function disconnectSolana() {
   if (window.solana) await window.solana.disconnect().catch(() => {});
   connectedWallets.solana = false;
   await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'solana' }) });
+
+  // Check if server fell back to envkey
+  try {
+    const r = await fetch('/api/wallet/balances');
+    const d = await r.json();
+    if (d.solana?.source === 'envkey') {
+      connectedWallets.solana = true;
+      document.getElementById('sol-addr').textContent = shortenAddr(d.solana.address) + ' 🔐 .env key';
+      document.getElementById('sol-addr').style.color = 'var(--yellow)';
+      document.getElementById('sol-btn').textContent = 'Override with Phantom';
+      document.getElementById('sol-btn').className = 'btn btn-ghost';
+      document.getElementById('sol-btn').onclick = connectPhantom;
+      updateWalletCount();
+      return;
+    }
+  } catch(_) {}
+
   document.getElementById('sol-addr').textContent = 'Not connected';
   document.getElementById('sol-addr').style.color = 'var(--muted)';
   document.getElementById('sol-balance').textContent = '';
@@ -1637,7 +1921,7 @@ async function connectStarknet() {
     document.getElementById('stark-addr').style.color = 'var(--green)';
     document.getElementById('stark-btn').textContent = 'Disconnect';
     document.getElementById('stark-btn').className = 'btn btn-red';
-    document.getElementById('stark-btn').onclick = () => disconnectWallet('starknet', 'stark-addr', 'stark-btn', connectStarknet);
+    document.getElementById('stark-btn').onclick = () => disconnectWallet('starknet', 'stark-addr', 'stark-btn', connectStarknet, 'ArgentX');
     updateWalletCount();
   } catch (err) { alert('Starknet connection failed: ' + err.message); }
 }
@@ -1657,7 +1941,7 @@ async function connectSui() {
     document.getElementById('sui-addr').style.color = 'var(--green)';
     document.getElementById('sui-btn').textContent = 'Disconnect';
     document.getElementById('sui-btn').className = 'btn btn-red';
-    document.getElementById('sui-btn').onclick = () => disconnectWallet('sui', 'sui-addr', 'sui-btn', connectSui);
+    document.getElementById('sui-btn').onclick = () => disconnectWallet('sui', 'sui-addr', 'sui-btn', connectSui, 'Sui Wallet');
     updateWalletCount();
   } catch (err) { alert('Sui connection failed: ' + err.message); }
 }
@@ -1676,15 +1960,33 @@ async function connectTron() {
     document.getElementById('tron-addr').style.color = 'var(--green)';
     document.getElementById('tron-btn').textContent = 'Disconnect';
     document.getElementById('tron-btn').className = 'btn btn-red';
-    document.getElementById('tron-btn').onclick = () => disconnectWallet('tron', 'tron-addr', 'tron-btn', connectTron);
+    document.getElementById('tron-btn').onclick = () => disconnectWallet('tron', 'tron-addr', 'tron-btn', connectTron, 'TronLink');
     updateWalletCount();
   } catch (err) { alert('TronLink connection failed: ' + err.message); }
 }
 
 // Generic disconnect helper
-async function disconnectWallet(type, addrId, btnId, reconnectFn) {
+async function disconnectWallet(type, addrId, btnId, reconnectFn, reconnectLabel) {
   await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type }) });
   connectedWallets[type] = false;
+
+  // Check if server fell back to envkey
+  try {
+    const r = await fetch('/api/wallet/balances');
+    const d = await r.json();
+    const chain = d[type === 'starknet' ? 'starknet' : type === 'sui' ? 'sui' : type === 'tron' ? 'tron' : type];
+    if (chain?.source === 'envkey') {
+      connectedWallets[type] = true;
+      document.getElementById(addrId).textContent = shortenAddr(chain.address) + ' 🔐 .env key';
+      document.getElementById(addrId).style.color = 'var(--yellow)';
+      document.getElementById(btnId).textContent = 'Override with ' + (reconnectLabel || 'Wallet');
+      document.getElementById(btnId).className = 'btn btn-ghost';
+      document.getElementById(btnId).onclick = reconnectFn;
+      updateWalletCount();
+      return;
+    }
+  } catch(_) {}
+
   document.getElementById(addrId).textContent = 'Not connected';
   document.getElementById(addrId).style.color = 'var(--muted)';
   document.getElementById(btnId).textContent = 'Connect';
@@ -1705,33 +2007,102 @@ function updateWalletCount() {
 }
 
 // Load existing wallet states on page load
+function srcBadge(source, walletName) {
+  if (source === 'envkey')   return ' 🔐 .env key';
+  if (source === 'privy')    return ' 🔑 Privy';
+  if (source === walletName) return '';
+  return source ? ' (' + source + ')' : '';
+}
+function srcColor(source) {
+  return source === 'envkey' ? 'var(--yellow)' : source === 'privy' ? 'var(--cyan)' : 'var(--green)';
+}
+function setEnvkeyBtn(btnId, connectFn, label) {
+  const btn = document.getElementById(btnId);
+  if (!btn) return;
+  btn.textContent = 'Override with ' + label;
+  btn.className = 'btn btn-ghost';
+  btn.onclick = connectFn;
+}
+
 async function loadWalletStates() {
   try {
     const r = await fetch('/api/wallet/balances');
     const d = await r.json();
+
+    // EVM
     if (d.evm) {
       connectedWallets.evm = true; evmAddress = d.evm.address;
-      document.getElementById('evm-addr').textContent = shortenAddr(d.evm.address);
-      document.getElementById('evm-addr').style.color = 'var(--green)';
-      renderEvmChains(true, d.evm.address);
+      document.getElementById('evm-addr').textContent = shortenAddr(d.evm.address) + srcBadge(d.evm.source, 'metamask');
+      document.getElementById('evm-addr').style.color = srcColor(d.evm.source);
+      if (d.evm.source === 'envkey') {
+        setEnvkeyBtn('evm-btn', connectMetaMask, 'MetaMask');
+      } else {
+        const btn = document.getElementById('evm-btn');
+        if (btn) { btn.textContent = 'Disconnect'; btn.className = 'btn btn-red'; btn.onclick = disconnectEvm; }
+        renderEvmChains(true, d.evm.address);
+      }
     }
+
+    // BTC
     if (d.btc) {
       connectedWallets.btc = true;
-      document.getElementById('btc-status').textContent = `✅ ${d.btc.address} — ${d.btc.balance} BTC`;
-      document.getElementById('btc-status').style.color = 'var(--green)';
+      const btcSrc = d.btc.source === 'envkey' ? ' 🔐 .env key' : '';
+      document.getElementById('btc-status').textContent = '✅ ' + d.btc.address + ' — ' + d.btc.balance + ' BTC' + btcSrc;
+      document.getElementById('btc-status').style.color = srcColor(d.btc.source);
       document.getElementById('btc-balance').textContent = d.btc.balance + ' BTC';
+      if (d.btc.source === 'envkey') {
+        document.getElementById('btc-address-input').value = d.btc.address;
+        document.getElementById('btc-address-input').placeholder = 'From .env key (override by saving new address)';
+      }
     }
+
+    // Solana
     if (d.solana) {
       connectedWallets.solana = true;
-      document.getElementById('sol-addr').textContent = shortenAddr(d.solana.address);
-      document.getElementById('sol-addr').style.color = 'var(--green)';
+      document.getElementById('sol-addr').textContent = shortenAddr(d.solana.address) + srcBadge(d.solana.source, 'phantom');
+      document.getElementById('sol-addr').style.color = srcColor(d.solana.source);
+      if (d.solana.source === 'envkey') {
+        setEnvkeyBtn('sol-btn', connectPhantom, 'Phantom');
+      } else {
+        const btn = document.getElementById('sol-btn');
+        if (btn) { btn.textContent = 'Disconnect'; btn.className = 'btn btn-red'; btn.onclick = disconnectSolana; }
+      }
     }
+
+    // Starknet
+    if (d.starknet) {
+      connectedWallets.starknet = true;
+      document.getElementById('stark-addr').textContent = shortenAddr(d.starknet.address) + srcBadge(d.starknet.source, 'argent');
+      document.getElementById('stark-addr').style.color = srcColor(d.starknet.source);
+      if (d.starknet.source === 'envkey') setEnvkeyBtn('stark-btn', connectStarknet, 'ArgentX');
+    }
+
+    // Sui
+    if (d.sui) {
+      connectedWallets.sui = true;
+      document.getElementById('sui-addr').textContent = shortenAddr(d.sui.address) + srcBadge(d.sui.source, 'sui');
+      document.getElementById('sui-addr').style.color = srcColor(d.sui.source);
+      if (d.sui.source === 'envkey') setEnvkeyBtn('sui-btn', connectSui, 'Sui Wallet');
+    }
+
+    // Tron
+    if (d.tron) {
+      connectedWallets.tron = true;
+      document.getElementById('tron-addr').textContent = shortenAddr(d.tron.address) + srcBadge(d.tron.source, 'tronlink');
+      document.getElementById('tron-addr').style.color = srcColor(d.tron.source);
+      if (d.tron.source === 'envkey') setEnvkeyBtn('tron-btn', connectTron, 'TronLink');
+    }
+
+    // Privy
     if (d.privy?.connected) {
       connectedWallets.privy = true;
-      document.getElementById('privy-status-badge').textContent = `✅ Connected — ${shortenAddr(d.privy.evmAddress)}`;
+      document.getElementById('privy-status-badge').textContent = '✅ Connected — ' + shortenAddr(d.privy.evmAddress);
       document.getElementById('privy-status-badge').style.color = 'var(--green)';
     }
+
     updateWalletCount();
+    // Auto-fetch EVM balances for envkey/privy (no MetaMask event to trigger it)
+    if (d.evm && (d.evm.source === 'envkey' || d.evm.source === 'privy')) fetchEvmBalances(d.evm.address);
   } catch (_) {}
 }
 
@@ -1760,11 +2131,11 @@ async function fetchEvmBalances(address) {
     // Expose balances globally for combinations
     window._evmBalances = d.balances || {};
     if (d.rpcErrors?.length) {
-      d.rpcErrors.forEach(e => addIssue('rpc', 'warning', `RPC Error: ${e.chain}`, e.message));
+      d.rpcErrors.forEach(e => addIssue('rpc', 'warning', `RPC Error: ${e.chain}`, e.message, { chain: e.chain }));
     }
   } catch(err) {
     if (statusEl) { statusEl.textContent = `⚠️ Balance check failed: ${err.message}`; statusEl.style.color = 'var(--yellow)'; }
-    addIssue('rpc', 'warning', 'EVM Balance RPC Failed', err.message);
+    addIssue('rpc', 'warning', 'EVM Balance RPC Failed', err.message, {});
   }
 }
 
@@ -1782,9 +2153,16 @@ async function checkStuckOrders() {
               <div style="color:var(--muted);margin-top:2px">${o.source?.asset || ''} → ${o.destination?.asset || ''} · Status: ${o.status}</div>
               <div style="color:var(--muted)">${o.created_at ? new Date(o.created_at).toLocaleString() : ''}</div>
             </div>
-            <button onclick="cancelOrder('${o.id}')" class="btn" style="font-size:11px;padding:4px 10px;background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)">
-              Request Refund
-            </button>
+            <div style="display:flex;flex-direction:column;gap:5px">
+              <button onclick="instantRefundOrder('${o.id}')" class="btn" style="font-size:11px;padding:4px 10px;background:rgba(59,130,246,.15);color:#3b82f6;border:1px solid rgba(59,130,246,.3)"
+                title="Request solver signature for immediate refund (works before timelock)">
+                ⚡ Instant Refund
+              </button>
+              <button onclick="cancelOrder('${o.id}')" class="btn" style="font-size:11px;padding:4px 10px;background:rgba(239,68,68,.08);color:var(--red);border:1px solid rgba(239,68,68,.2)"
+                title="Standard refund after timelock expires">
+                🔒 Timelock Refund
+              </button>
+            </div>
           </div>
         </div>`).join('');
       const container = document.getElementById('stuckOrdersContainer');
@@ -1797,18 +2175,175 @@ async function checkStuckOrders() {
 }
 
 async function cancelOrder(id) {
-  if (!confirm(`Request refund for order ${id}?`)) return;
+  if (!confirm(`Request timelock refund for order ${id}?\n\nThis only works after the timelock has expired. For immediate refund, use Instant Refund.`)) return;
   try {
     const r = await fetch(`/api/orders/cancel/${id}`, { method: 'POST' });
     const d = await r.json();
-    if (d.ok) { alert('Refund requested!'); checkStuckOrders(); }
-    else alert('Failed: ' + (d.error || 'Unknown error'));
+    if (d.ok) {
+      alert(`✅ ${d.method === 'instant-refund' ? 'Instant refund' : 'Refund'} requested! Order ID: ${id.slice(0,16)}…`);
+      checkStuckOrders();
+    } else alert('Failed: ' + (d.error || 'Unknown error'));
   } catch (err) { alert('Error: ' + err.message); }
+}
+
+async function instantRefundOrder(id) {
+  if (!confirm(`Request instant refund for order ${id}?\n\nThis requires the solver to countersign. If solver is offline, use Timelock Refund instead.`)) return;
+  try {
+    // Step 1: get refund hash from Garden
+    const hashRes = await fetch(`/api/orders/${id}/refund-hash`);
+    const hashData = await hashRes.json();
+    const refundHash = hashData.result?.refund_hash || hashData.result;
+
+    if (!refundHash) {
+      alert('Instant refund not available yet — solver has not signed.\n\nTry Timelock Refund after the timelock expires.');
+      return;
+    }
+
+    // Step 2: submit instant-refund
+    const r = await fetch(`/api/orders/cancel/${id}`, { method: 'POST' });
+    const d = await r.json();
+    if (d.ok) {
+      alert(`✅ Instant refund submitted! Method: ${d.method}\n\nFunds will be returned to your source wallet.`);
+      checkStuckOrders();
+    } else {
+      alert('Instant refund failed: ' + (d.error || 'Unknown'));
+    }
+  } catch (err) { alert('Error: ' + err.message); }
+}
+
+// ── RPC MODAL ────────────────────────────────────────────────
+let _rpcModal = null;
+
+async function openRpcModal(chain) {
+  // Get current RPCs from server
+  let currentRpcs = {};
+  try {
+    const r = await fetch('/api/rpc/list');
+    const d = await r.json();
+    currentRpcs = d.rpcs || {};
+  } catch(_) {}
+
+  const currentUrl = currentRpcs[chain] || '';
+  const chainLabel = chain.replace(/_/g,' ').replace(/\w/g, l => l.toUpperCase());
+
+  // Known good public RPCs per chain
+  const knownRpcs = {
+    ethereum_sepolia:  ['https://rpc.sepolia.org', 'https://ethereum-sepolia.publicnode.com', 'https://sepolia.gateway.tenderly.co'],
+    arbitrum_sepolia:  ['https://sepolia-rollup.arbitrum.io/rpc', 'https://arbitrum-sepolia.publicnode.com'],
+    base_sepolia:      ['https://sepolia.base.org', 'https://base-sepolia.publicnode.com'],
+    bnbchain_testnet:  ['https://data-seed-prebsc-1-s1.binance.org:8545', 'https://data-seed-prebsc-2-s1.binance.org:8545'],
+    hyperevm_testnet:  ['https://rpc.hyperliquid-testnet.xyz/evm'],
+    monad_testnet:     ['https://testnet-rpc.monad.xyz'],
+    citrea_testnet:    ['https://rpc.testnet.citrea.xyz'],
+    alpen_testnet:     ['https://rpc.testnet.alpen.xyz'],
+  };
+
+  const suggestions = (knownRpcs[chain] || []).filter(u => u !== currentUrl);
+
+  const suggestHtml = suggestions.length
+    ? `<div style="margin-top:8px"><div style="font-size:10px;color:var(--muted);margin-bottom:4px">Known working RPCs:</div>
+       ${suggestions.map(u => `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+         <code style="font-size:10px;color:var(--cyan);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${u}</code>
+         <button onclick="document.getElementById('rpcUrlInput').value='${u}'" class="btn btn-ghost" style="font-size:10px;padding:2px 6px;flex-shrink:0">Use</button>
+       </div>`).join('')}</div>` : '';
+
+  const html = `
+  <div id="rpcModalOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;z-index:300">
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:14px;padding:24px;width:480px;max-width:95vw">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <div style="font-size:15px;font-weight:700">🔧 Fix RPC — ${chainLabel}</div>
+        <button onclick="document.getElementById('rpcModalOverlay').remove()" style="background:none;border:none;color:var(--muted);font-size:18px;cursor:pointer">✕</button>
+      </div>
+
+      <div style="background:var(--bg3);border-radius:8px;padding:12px;margin-bottom:14px;font-size:12px">
+        <div style="color:var(--muted);margin-bottom:4px">Current RPC</div>
+        <code style="color:${currentUrl ? 'var(--cyan)' : 'var(--red)'};word-break:break-all">${currentUrl || '⚠️ Not configured'}</code>
+      </div>
+
+      <div style="margin-bottom:14px">
+        <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:6px">New RPC URL</div>
+        <input id="rpcUrlInput" class="field-input" placeholder="https://rpc.example.com" value="${currentUrl}" style="width:100%;font-family:'JetBrains Mono',monospace;font-size:12px">
+      </div>
+
+      ${suggestHtml}
+
+      <div id="rpcTestResult" style="min-height:20px;font-size:12px;margin:10px 0"></div>
+
+      <div style="display:flex;gap:8px;margin-top:14px">
+        <button class="btn btn-ghost" onclick="testRpc('${chain}')" style="font-size:12px">🔌 Test</button>
+        <button class="btn btn-green" onclick="saveRpc('${chain}')" style="font-size:12px;flex:1">💾 Save & Re-fetch Balances</button>
+      </div>
+    </div>
+  </div>`;
+
+  document.body.insertAdjacentHTML('beforeend', html);
+}
+
+async function testRpc(chain) {
+  const url = document.getElementById('rpcUrlInput').value.trim();
+  const result = document.getElementById('rpcTestResult');
+  if (!url) { result.textContent = '❌ Enter a URL first'; result.style.color = 'var(--red)'; return; }
+  result.textContent = '⏳ Testing…'; result.style.color = 'var(--yellow)';
+  try {
+    const r = await fetch('/api/rpc/update', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chain, url, testOnly: true })
+    });
+    const d = await r.json();
+    if (d.ok) { result.textContent = `✅ Works — block #${d.blockNumber.toLocaleString()}`; result.style.color = 'var(--green)'; }
+    else { result.textContent = `❌ ${d.error}`; result.style.color = 'var(--red)'; }
+  } catch(e) { result.textContent = `❌ ${e.message}`; result.style.color = 'var(--red)'; }
+}
+
+async function saveRpc(chain) {
+  const url = document.getElementById('rpcUrlInput').value.trim();
+  const result = document.getElementById('rpcTestResult');
+  if (!url) { result.textContent = '❌ Enter a URL first'; result.style.color = 'var(--red)'; return; }
+  result.textContent = '⏳ Saving & testing…'; result.style.color = 'var(--yellow)';
+  try {
+    const r = await fetch('/api/rpc/update', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chain, url })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      result.textContent = `✅ Saved — block #${d.blockNumber.toLocaleString()}. Re-fetching balances…`; result.style.color = 'var(--green)';
+      document.getElementById('rpcModalOverlay').remove();
+      // Remove the old RPC issue for this chain from issues list
+      issues = issues.filter(i => !(i.type === 'rpc' && i.meta?.chain === chain));
+      renderIssues();
+      // Re-fetch balances with the updated RPC
+      if (evmAddress) await fetchEvmBalances(evmAddress);
+    } else { result.textContent = `❌ ${d.error}`; result.style.color = 'var(--red)'; }
+  } catch(e) { result.textContent = `❌ ${e.message}`; result.style.color = 'var(--red)'; }
 }
 
 // ── INIT ──
 connectWS();
-loadWalletStates();
+// Re-announce any already-connected browser wallets BEFORE loading states.
+// Fixes the refresh bug: MetaMask was connected before reload, server lost state
+// (restarted/envkey took over), browser silently re-registers with no popup.
+(async function reannounceWallets() {
+  try {
+    if (window.ethereum) {
+      const accounts = await window.ethereum.request({ method: 'eth_accounts' }); // no popup
+      if (accounts && accounts[0]) {
+        await fetch('/api/wallet/evm', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ address: accounts[0] }) });
+        evmAddress = accounts[0];
+      }
+    }
+  } catch(_) {}
+  try {
+    if (window.solana && window.solana.isPhantom) {
+      const resp = await window.solana.connect({ onlyIfTrusted: true }); // no popup
+      const addr = resp.publicKey.toString();
+      await fetch('/api/wallet/solana', { method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ address: addr }) });
+    }
+  } catch(_) {} // not previously trusted
+  loadWalletStates();
+})();
 </script>
 </body>
 </html>

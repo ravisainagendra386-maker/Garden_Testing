@@ -1,7 +1,6 @@
 // src/config.js
 require("dotenv").config();
 
-// Only GARDEN_API_KEY is required — wallets connect via dashboard
 function validate() {
   if (process.env.SKIP_ENV_VALIDATE === "true") return;
   if (!process.env.GARDEN_API_KEY) {
@@ -24,7 +23,6 @@ const config = {
       ? "https://api.garden.finance/v2"
       : "https://testnet.api.garden.finance/v2",
   },
-  // Privy — optional, can be set via dashboard Connect Wallets panel
   privy: {
     appId:     process.env.PRIVY_APP_ID     || null,
     appSecret: process.env.PRIVY_APP_SECRET || null,
@@ -36,12 +34,27 @@ const config = {
       tron:     process.env.PRIVY_TRON_WALLET_ID     || null,
     },
   },
-  // BTC — optional, can be set via dashboard
+
+  // ── .env private keys — lowest priority for every chain type ──
+  // Wallet extensions (MetaMask, Phantom…) or Privy always override these.
+  envKeys: {
+    evm:      process.env.EVM_PRIVATE_KEY      || null,  // hex, with or without 0x
+    btc:      process.env.BTC_PRIVATE_KEY_WIF  || null,  // WIF format
+    solana:   process.env.SOLANA_PRIVATE_KEY   || null,  // base58 secret key
+    starknet: process.env.STARKNET_PRIVATE_KEY || null,  // hex
+    sui:      process.env.SUI_PRIVATE_KEY      || null,  // base64 or hex
+    tron:     process.env.TRON_PRIVATE_KEY     || null,  // hex
+  },
+
+  // BTC node RPC
   btc: {
-    wif:     process.env.BTC_PRIVATE_KEY_WIF || null,
     address: process.env.OVERRIDE_BTC_ADDRESS || process.env.BTC_ADDRESS || null,
     rpc:     r("RPC_BITCOIN_MAINNET", "RPC_BITCOIN_TESTNET"),
   },
+
+  // Legacy alias kept for backward compat
+  get evmPrivateKey() { return this.envKeys.evm; },
+
   manualApprove: process.env.MANUAL_APPROVE === "true",
   chains: {
     bitcoin:   { id:"bitcoin",   name:"Bitcoin",   type:"bitcoin",   asset:"BTC",  rpc: r("RPC_BITCOIN_MAINNET","RPC_BITCOIN_TESTNET"),     explorer: isMainnet?"https://mempool.space/tx/":"https://mempool.space/testnet4/tx/" },

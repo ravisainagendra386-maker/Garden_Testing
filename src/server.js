@@ -9,6 +9,7 @@ const config     = require("./config");
 const runner     = require("./tests/runner");
 const garden     = require("./api/garden");
 const walletState = require("./wallet/state");
+const envkey      = require("./wallet/envkey");
 
 const app = express();
 app.use(cors());
@@ -28,9 +29,20 @@ runner.setEmitter(broadcast);
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
 // ── CORE TEST ROUTES ──────────────────────────────────────────
+// Amount overrides from trade-size modal (set before running)
+let _amountOverrides = {};
+
+app.post("/api/run/set-amounts", (req, res) => {
+  _amountOverrides = req.body.amounts || {};
+  console.log(`[set-amounts] ${Object.keys(_amountOverrides).length} overrides stored`);
+  res.json({ ok: true, count: Object.keys(_amountOverrides).length });
+});
+
 app.post("/api/run", async (req, res) => {
   res.json({ started: true, env: config.env });
-  runner.runAll().catch(err => broadcast("error", { message: err.message }));
+  const overrides = Object.assign({}, _amountOverrides);
+  _amountOverrides = {}; // clear after capture
+  runner.runAll(overrides).catch(err => broadcast("error", { message: err.message }));
 });
 
 app.post("/api/run/route", async (req, res) => {
@@ -59,11 +71,19 @@ app.post("/api/abort", (req, res) => {
 app.post("/api/approve", (req, res) => {
   runner.handleApproval(req.body.id, req.body.approved);
   res.json({ ok: true });
+});
+
+// Gasless: dashboard posts EIP-712 signature back after eth_signTypedData_v4
+app.post("/api/evm-sign-response", (req, res) => {
+  const { id, signature } = req.body;
+  if (!id) return res.status(400).json({ error: "id required" });
+  runner.handleEvmSignResponse(id, signature || false);
+  res.json({ ok: true });
+});
 
 app.post("/api/evm-tx-response", (req, res) => {
   runner.handleEvmTxResponse(req.body.id, req.body.txHash || false);
   res.json({ ok: true });
-});
 });
 
 app.get("/api/chains", (req, res) => {
@@ -140,9 +160,31 @@ app.get("/api/combinations", async (req, res) => {
     const combinations = [];
 
     // Build all pairs — use asset min/max directly, no policy call needed
+    // Pre-filter: skip obviously unsupported cross-family pairs to reduce noise
+    function assetFamily(asset) {
+      const t = (asset.name || asset.id || '').toLowerCase().split(':').pop();
+      if (/btc$|^btc|wbtc|cbtc|cbbtc|sbtc|hbtc|btcn|lbtc|tbtc|pbtc|rbtc/.test(t)) return 'btc';
+      if (/^eth$|^weth$/.test(t)) return 'eth';
+      if (/usdc|usdt|dai|busd/.test(t)) return 'stable';
+      return 'other_' + t;
+    }
+    function isPairPlausible(from, to) {
+      const ff = assetFamily(from), tf = assetFamily(to);
+      // Same family always plausible
+      if (ff === tf) return true;
+      // BTC ↔ wrapped-BTC is the core Garden use-case
+      if (ff === 'btc' && tf === 'btc') return true;
+      // BTC → stable or BTC → ETH: Garden currently has no solver for these
+      if (ff === 'btc' && tf !== 'btc') return false;
+      if (tf === 'btc' && ff !== 'btc') return false;
+      // Otherwise allow (ETH↔stable etc. may have solvers)
+      return true;
+    }
+
     for (const from of supported) {
       for (const to of supported) {
         if (from.id === to.id) continue;
+        if (!isPairPlausible(from, to)) continue; // skip cross-family
         const fromType      = getWalletType(from);
         const toType        = getWalletType(to);
         const fromConnected = isWalletConnected(fromType);
@@ -175,6 +217,8 @@ app.get("/api/combinations", async (req, res) => {
           : minAmount;
 
         const balanceKnown = walletBalance !== null;
+        // canTrade: both wallets connected AND balance not confirmed insufficient
+        // NOTE: balanceUnknown (EVM) is treated as runnable — runner does its own check
         const canTrade = fromConnected && toConnected && (canAfford !== false);
 
         combinations.push({
@@ -192,7 +236,16 @@ app.get("/api/combinations", async (req, res) => {
       }
     }
 
-    combinations.sort((a, b) => {
+    // Filter out known-invalid pairs using cache (if populated)
+    const validPairsSet = _validPairsCache.env === config.env
+      ? _validPairsCache.pairs
+      : null;
+
+    const finalCombos = validPairsSet
+      ? combinations.filter(c => validPairsSet.has(`${c.from.assetId}::${c.to.assetId}`))
+      : combinations;
+
+    finalCombos.sort((a, b) => {
       if (a.canTrade && !b.canTrade) return -1;
       if (!a.canTrade && b.canTrade) return 1;
       const ap = a.fromWalletConnected || a.toWalletConnected;
@@ -202,11 +255,84 @@ app.get("/api/combinations", async (req, res) => {
       return a.from.name.localeCompare(b.from.name);
     });
 
-    res.json({ ok: true, total: combinations.length, combinations });
+    res.json({ ok: true, total: finalCombos.length, combinations: finalCombos,
+      pairsValidated: validPairsSet !== null,
+      totalBeforeFilter: combinations.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+// ── VALID PAIR CACHE ─────────────────────────────────────────
+// Pre-validates pairs by calling /quote. Cached for 10min per env.
+let _validPairsCache = { env: null, ts: 0, pairs: new Set() };
+
+let _validatingInProgress = false;
+
+app.get("/api/valid-pairs", async (req, res) => {
+  const now = Date.now();
+  const CACHE_MS = 10 * 60 * 1000;
+
+  if (_validPairsCache.env === config.env && now - _validPairsCache.ts < CACHE_MS) {
+    return res.json({ ok: true, pairs: [..._validPairsCache.pairs], cached: true,
+      age: Math.round((now - _validPairsCache.ts) / 1000) });
+  }
+  if (_validatingInProgress) {
+    return res.json({ ok: true, pairs: [], inProgress: true });
+  }
+
+  // Respond immediately — validation runs async with WS progress updates
+  res.json({ ok: true, pairs: [], started: true });
+
+  _validatingInProgress = true;
+  try {
+    const ar     = await garden.getAssets();
+    const assets = ar.result || ar.assets || ar || [];
+    if (!assets.length) { _validatingInProgress = false; return; }
+
+    const validPairs = new Set();
+    const toCheck = [];
+    for (const from of assets) {
+      for (const to of assets) {
+        if (from.id === to.id) continue;
+        toCheck.push([from.id, to.id, parseInt(from.min_amount || 50000)]);
+      }
+    }
+
+    broadcast("validate_progress", { done: 0, total: toCheck.length, valid: 0 });
+
+    const BATCH = 8;
+    let done = 0;
+    for (let i = 0; i < toCheck.length; i += BATCH) {
+      const batch = toCheck.slice(i, i + BATCH);
+      await Promise.all(batch.map(async ([from, to, amt]) => {
+        try {
+          const q = await garden.getQuote(from, to, amt);
+          if (q.result?.length > 0) validPairs.add(`${from}::${to}`);
+        } catch (_) {}
+        done++;
+      }));
+      broadcast("validate_progress", { done, total: toCheck.length, valid: validPairs.size });
+      if (i + BATCH < toCheck.length) await new Promise(r => setTimeout(r, 100));
+    }
+
+    _validPairsCache = { env: config.env, ts: Date.now(), pairs: validPairs };
+    // Also share with runner
+    runner.setValidPairsCache(validPairs);
+    broadcast("validate_done", { total: toCheck.length, valid: validPairs.size });
+    console.log(`[valid-pairs] ${validPairs.size} / ${toCheck.length} valid`);
+  } catch (err) {
+    broadcast("validate_done", { error: err.message });
+  } finally {
+    _validatingInProgress = false;
+  }
+});
+
+// Invalidate valid-pairs cache (call after switching env)
+app.post("/api/valid-pairs/clear", (req, res) => {
+  _validPairsCache = { env: null, ts: 0, pairs: new Set() };
+  res.json({ ok: true });
+});
+
 // Run a confirmed trade from the combinations panel
 // fromWalletType and toWalletType are the wallet types (evm/bitcoin/solana etc)
 app.post("/api/run/combination", async (req, res) => {
@@ -287,10 +413,33 @@ app.post("/api/wallet/evm/balances", async (req, res) => {
   res.json({ ok: true, address, balances: results, rpcErrors });
 });
 
+// ── RPC: update URL for a chain ──────────────────────────────
+app.post("/api/rpc/update", async (req, res) => {
+  const { chain, url, testOnly } = req.body;
+  if (!chain || !url) return res.status(400).json({ error: "chain and url required" });
+  try {
+    const test = await axios.post(url, {
+      jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: []
+    }, { timeout: 5000 });
+    if (!test.data?.result) throw new Error("No result from RPC");
+    const blockNumber = parseInt(test.data.result, 16);
+    if (!testOnly) { FREE_RPCS[chain] = url; envkey.setRpc(chain, url); } // only persist if not test-only
+    res.json({ ok: true, chain, url, blockNumber, saved: !testOnly });
+  } catch(err) {
+    res.status(400).json({ error: `RPC test failed: ${err.message}` });
+  }
+});
+
+// List current RPCs
+app.get("/api/rpc/list", (req, res) => {
+  res.json({ rpcs: FREE_RPCS });
+});
+
 // ── WALLET: BTC ───────────────────────────────────────────────
 app.post("/api/wallet/btc", async (req, res) => {
   const { address, wif } = req.body;
   if (!address) return res.status(400).json({ error: "address required" });
+  // Manual entry overrides envkey
   try {
     const net = config.isMainnet ? "" : "/testnet4";
     const r   = await axios.get(`https://mempool.space${net}/api/address/${address}`);
@@ -320,7 +469,43 @@ app.post("/api/wallet/tron",     (req, res) => { walletState.connectTron(req.bod
 
 // ── WALLET: DISCONNECT & STATUS ───────────────────────────────
 app.post("/api/wallet/disconnect", (req, res) => {
-  walletState.disconnect(req.body.type);
+  const type = req.body.type;
+  walletState.disconnect(type);
+
+  // After disconnect, fall back to envkey for that chain type (if available)
+  try {
+    if ((type === 'evm' || type === 'metamask' || type === 'privy') && envkey.isEvmAvailable()) {
+      const addr = envkey.getEvmAddress();
+      const ok = walletState.connectEnvKeyEvm(addr);
+      if (ok) console.log(`[disconnect] EVM fell back to envkey: ${addr}`);
+    }
+    if (type === 'btc' && envkey.isBtcAvailable()) {
+      const addr = envkey.getBtcAddress();
+      if (addr) { const ok = walletState.connectEnvKeyBtc(addr, envkey.getBtcWif()); if (ok) console.log(`[disconnect] BTC fell back to envkey: ${addr}`); }
+    }
+    if (type === 'solana' && envkey.isSolanaAvailable()) {
+      const addr = envkey.getSolanaAddress();
+      if (addr) { const ok = walletState.connectEnvKeySolana(addr); if (ok) console.log(`[disconnect] Solana fell back to envkey: ${addr}`); }
+    }
+    if (type === 'starknet' && envkey.isStarknetAvailable()) {
+      const addr = envkey.getStarknetAddress();
+      if (addr) { const ok = walletState.connectEnvKeyStarknet(addr); if (ok) console.log(`[disconnect] Starknet fell back to envkey: ${addr}`); }
+    }
+    if (type === 'sui' && envkey.isSuiAvailable()) {
+      const addr = envkey.getSuiAddress();
+      if (addr) { const ok = walletState.connectEnvKeySui(addr); if (ok) console.log(`[disconnect] Sui fell back to envkey: ${addr}`); }
+    }
+    if (type === 'tron' && envkey.isTronAvailable()) {
+      const addr = envkey.getTronAddress();
+      if (addr) { const ok = walletState.connectEnvKeyTron(addr); if (ok) console.log(`[disconnect] Tron fell back to envkey: ${addr}`); }
+    }
+    // Privy also affects Solana
+    if (type === 'privy' && envkey.isSolanaAvailable()) {
+      const addr = envkey.getSolanaAddress();
+      if (addr) walletState.connectEnvKeySolana(addr);
+    }
+  } catch(e) { console.error(`[disconnect] envkey fallback error: ${e.message}`); }
+
   res.json({ ok: true });
 });
 
@@ -344,10 +529,34 @@ server.listen(config.port, () => {
   console.log(`   Dashboard:   http://localhost:${config.port}`);
   console.log(`   Environment: ${config.env.toUpperCase()}`);
   console.log(`   Manual Approve: ${config.manualApprove ? "ON ✋" : "OFF 🤖"}`);
-  console.log(`   Chains: ${Object.keys(config.chains).length}\n`);
+  console.log(`   Chains: ${Object.keys(config.chains).length}`);
+
+  // Auto-connect .env private keys as lowest-priority signers for each chain type
+  function tryEnvKey(label, checker, addrFn, connectFn) {
+    if (!checker()) return;
+    try {
+      const addr = addrFn();
+      if (addr) { const ok = connectFn(addr); if (ok) console.log(`   ${label}: ${addr}`); }
+    } catch(e) { console.error(`   ⚠️  ${label} key invalid: ${e.message}`); }
+  }
+
+  tryEnvKey("EVM (.env)",      envkey.isEvmAvailable,      envkey.getEvmAddress,      walletState.connectEnvKeyEvm);
+  tryEnvKey("BTC (.env)",      envkey.isBtcAvailable,      envkey.getBtcAddress,      (addr) => walletState.connectEnvKeyBtc(addr, envkey.getBtcWif()));
+  tryEnvKey("Solana (.env)",   envkey.isSolanaAvailable,   envkey.getSolanaAddress,   walletState.connectEnvKeySolana);
+  tryEnvKey("Starknet (.env)", envkey.isStarknetAvailable, envkey.getStarknetAddress, walletState.connectEnvKeyStarknet);
+  tryEnvKey("Sui (.env)",      envkey.isSuiAvailable,      envkey.getSuiAddress,      walletState.connectEnvKeySui);
+  tryEnvKey("Tron (.env)",     envkey.isTronAvailable,     envkey.getTronAddress,     walletState.connectEnvKeyTron);
+  console.log("");
 });
 
 // ── DEBUG: raw quote response ─────────────────────────────────
+app.get("/api/debug/assets", async (req, res) => {
+  try {
+    const raw = await garden.getAssets();
+    res.json(raw);
+  } catch(err) { res.status(500).json({ error: err.message }); }
+});
+
 app.get("/api/debug/quote", async (req, res) => {
   const { from, to, amount } = req.query;
   if (!from || !to) return res.status(400).json({ error: "from, to, amount required" });
@@ -395,8 +604,42 @@ app.get("/api/orders/stuck", async (req, res) => {
 });
 
 app.post("/api/orders/cancel/:id", async (req, res) => {
+  const id = req.params.id;
   try {
-    const r = await garden.patchOrder(req.params.id, "refund", null);
+    // 1. Try instant refund first (works before timelock — needs solver signature)
+    try {
+      const hashRes = await garden.getRefundHash(id);
+      const refundHash = hashRes.result?.refund_hash || hashRes.result;
+      if (refundHash) {
+        const r = await garden.patchOrder(id, "instant-refund", refundHash);
+        return res.json({ ok: true, method: "instant-refund", result: r });
+      }
+    } catch (_) { /* instant-refund not available — fall through to regular refund */ }
+
+    // 2. Regular refund (works after timelock expires)
+    const r = await garden.patchOrder(id, "refund", null);
+    res.json({ ok: true, method: "refund", result: r });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get instant-refund hash only (for manual flows)
+app.get("/api/orders/:id/refund-hash", async (req, res) => {
+  try {
+    const r = await garden.getRefundHash(req.params.id);
+    res.json(r);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Redeem an order on destination chain (after solver has locked)
+app.post("/api/orders/:id/redeem", async (req, res) => {
+  const { secret } = req.body;
+  if (!secret) return res.status(400).json({ error: "secret required" });
+  try {
+    const r = await garden.patchOrder(req.params.id, "redeem", secret);
     res.json({ ok: true, result: r });
   } catch (err) {
     res.status(500).json({ error: err.message });

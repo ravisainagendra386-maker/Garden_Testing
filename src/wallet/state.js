@@ -1,16 +1,21 @@
 // src/wallet/state.js
 // Single source of truth for wallet addresses.
-// Both server.js (writes) and runner.js (reads) use this module.
-// Nothing is ever written to disk.
+// Priority per type:  envkey (lowest) < privy < wallet-extension (highest)
 
 const store = {
-  evmSource: null,  // 'metamask' | 'privy' | null
+  evmSource:      null,  // 'metamask' | 'privy' | 'envkey' | null
+  solanaSource:   null,  // 'phantom'  | 'privy' | 'envkey' | null
+  btcSource:      null,  // 'manual'   | 'envkey' | null
+  starknetSource: null,  // 'argent'   | 'envkey' | null
+  suiSource:      null,  // 'sui'      | 'envkey' | null
+  tronSource:     null,  // 'tronlink' | 'envkey' | null
+
   evm:      null,   // { address, source, tokenBalances }
-  btc:      null,   // { address, wif, balance }
+  btc:      null,   // { address, wif, balance, source }
   solana:   null,   // { address, balance, source }
-  starknet: null,   // { address }
-  sui:      null,   // { address }
-  tron:     null,   // { address }
+  starknet: null,   // { address, source }
+  sui:      null,   // { address, source }
+  tron:     null,   // { address, source }
   privy:    null,   // { appId, appSecret, evmWalletId, solanaWalletId }
 };
 
@@ -36,84 +41,196 @@ function getAddressByType(type) {
   }
 }
 
-// ── SETTERS ───────────────────────────────────────────────────
+// ── HELPERS ───────────────────────────────────────────────────
+// Returns true if incoming source can override current source
+// Priority: extension > privy > envkey
+const PRIORITY = { envkey: 0, privy: 1, phantom: 2, manual: 2, argent: 2, sui: 2, tronlink: 2, metamask: 2 };
+function canOverride(incoming, current) {
+  if (!current) return true;
+  if (current === incoming) return true;
+  return (PRIORITY[incoming] ?? 1) >= (PRIORITY[current] ?? 1);
+}
 
+// ── EVM ───────────────────────────────────────────────────────
 function connectMetaMask(address) {
-  if (store.evmSource === "privy")
-    throw new Error("Privy is already connected as EVM wallet. Disconnect Privy first.");
-  store.evm = { address, source: "metamask" };
+  if (store.evmSource && store.evmSource !== "metamask")
+    console.log(`[wallet] MetaMask overriding EVM source: ${store.evmSource}`);
+  store.evm = { address, source: "metamask", tokenBalances: store.evm?.tokenBalances || {} };
   store.evmSource = "metamask";
 }
 
 function connectPrivy({ appId, appSecret, evmWalletId, solanaWalletId }) {
   if (store.evmSource === "metamask")
-    throw new Error("MetaMask is already connected as EVM wallet. Disconnect MetaMask first.");
+    throw new Error("MetaMask is already connected. Disconnect MetaMask first.");
+  if (store.evmSource === "envkey")
+    console.log("[wallet] Privy overriding envkey EVM source");
   store.privy = { appId, appSecret, evmWalletId, solanaWalletId };
-  store.evm   = { address: evmWalletId, source: "privy" };
+  store.evm   = { address: evmWalletId, source: "privy", tokenBalances: store.evm?.tokenBalances || {} };
   store.evmSource = "privy";
-  if (solanaWalletId && !store.solana)
+  if (solanaWalletId && store.solanaSource !== "phantom") {
     store.solana = { address: solanaWalletId, source: "privy" };
-  return {
-    evmAddress:    evmWalletId,
-    solanaAddress: solanaWalletId || null,
-  };
-}
-
-function connectBtc(address, wif, balance) {
-  store.btc = { address, wif: wif || null, balance: balance || "unknown" };
-}
-
-function connectSolana(address, balance) {
-  if (store.solana?.source === "privy")
-    throw new Error("Privy Solana wallet already connected. Disconnect Privy first.");
-  store.solana = { address, balance: balance || null, source: "phantom" };
-}
-
-function connectStarknet(address) { store.starknet = { address }; }
-function connectSui(address)      { store.sui      = { address }; }
-function connectTron(address)     { store.tron     = { address }; }
-
-// Store EVM token balances fetched from public RPCs
-// balances = { "arbitrum_sepolia": 12345678 (wei), ... }
-function setEvmBalances(address, balances) {
-  if (store.evm?.address === address) {
-    store.evm.tokenBalances = balances;
+    store.solanaSource = "privy";
   }
+  return { evmAddress: evmWalletId, solanaAddress: solanaWalletId || null };
 }
 
+function connectEnvKeyEvm(address) {
+  if (!canOverride("envkey", store.evmSource)) {
+    console.log(`[wallet] envkey EVM ignored — ${store.evmSource} already connected`);
+    return false;
+  }
+  store.evm = { address, source: "envkey", tokenBalances: store.evm?.tokenBalances || {} };
+  store.evmSource = "envkey";
+  console.log(`[wallet] envkey EVM: ${address}`);
+  return true;
+}
+// legacy alias
+const connectEnvKey = connectEnvKeyEvm;
+
+// ── BITCOIN ───────────────────────────────────────────────────
+function connectBtc(address, wif, balance, source) {
+  const src = source || (wif ? "manual" : "manual");
+  if (!canOverride(src, store.btcSource)) {
+    console.log(`[wallet] BTC ${src} ignored — ${store.btcSource} already connected`);
+    return false;
+  }
+  store.btc = { address, wif: wif || null, balance: balance || "unknown", source: src };
+  store.btcSource = src;
+  console.log(`[wallet] BTC [${src}]: ${address}`);
+  return true;
+}
+
+function connectEnvKeyBtc(address, wif) {
+  if (!canOverride("envkey", store.btcSource)) {
+    console.log(`[wallet] envkey BTC ignored — ${store.btcSource} already connected`);
+    return false;
+  }
+  store.btc = { address, wif, balance: "unknown", source: "envkey" };
+  store.btcSource = "envkey";
+  console.log(`[wallet] envkey BTC: ${address}`);
+  return true;
+}
+
+// ── SOLANA ────────────────────────────────────────────────────
+function connectSolana(address, balance, source) {
+  const src = source || "phantom";
+  if (!canOverride(src, store.solanaSource)) {
+    console.log(`[wallet] Solana ${src} ignored — ${store.solanaSource} already connected`);
+    return false;
+  }
+  store.solana = { address, balance: balance || null, source: src };
+  store.solanaSource = src;
+  return true;
+}
+
+function connectEnvKeySolana(address) {
+  if (!canOverride("envkey", store.solanaSource)) {
+    console.log(`[wallet] envkey Solana ignored — ${store.solanaSource} already connected`);
+    return false;
+  }
+  store.solana = { address, balance: null, source: "envkey" };
+  store.solanaSource = "envkey";
+  console.log(`[wallet] envkey Solana: ${address}`);
+  return true;
+}
+
+// ── STARKNET ──────────────────────────────────────────────────
+function connectStarknet(address, source) {
+  const src = source || "argent";
+  store.starknet = { address, source: src };
+  store.starknetSource = src;
+}
+
+function connectEnvKeyStarknet(address) {
+  if (!canOverride("envkey", store.starknetSource)) return false;
+  store.starknet = { address, source: "envkey" };
+  store.starknetSource = "envkey";
+  console.log(`[wallet] envkey Starknet: ${address}`);
+  return true;
+}
+
+// ── SUI ───────────────────────────────────────────────────────
+function connectSui(address, source) {
+  const src = source || "sui";
+  store.sui = { address, source: src };
+  store.suiSource = src;
+}
+
+function connectEnvKeySui(address) {
+  if (!canOverride("envkey", store.suiSource)) return false;
+  store.sui = { address, source: "envkey" };
+  store.suiSource = "envkey";
+  console.log(`[wallet] envkey Sui: ${address}`);
+  return true;
+}
+
+// ── TRON ──────────────────────────────────────────────────────
+function connectTron(address, source) {
+  const src = source || "tronlink";
+  store.tron = { address, source: src };
+  store.tronSource = src;
+}
+
+function connectEnvKeyTron(address) {
+  if (!canOverride("envkey", store.tronSource)) return false;
+  store.tron = { address, source: "envkey" };
+  store.tronSource = "envkey";
+  console.log(`[wallet] envkey Tron: ${address}`);
+  return true;
+}
+
+// ── EVM BALANCES ──────────────────────────────────────────────
+function setEvmBalances(address, balances) {
+  if (store.evm?.address === address) store.evm.tokenBalances = balances;
+}
+
+// ── DISCONNECT ────────────────────────────────────────────────
 function disconnect(type) {
-  if (type === "evm" || type === "metamask") {
-    store.evm = null; store.evmSource = null;
-  } else if (type === "privy") {
-    if (store.evmSource === "privy") { store.evm = null; store.evmSource = null; }
-    if (store.solana?.source === "privy") store.solana = null;
-    store.privy = null;
-  } else if (type === "btc")      { store.btc      = null; }
-  else if (type === "solana")     { store.solana   = null; }
-  else if (type === "starknet")   { store.starknet = null; }
-  else if (type === "sui")        { store.sui      = null; }
-  else if (type === "tron")       { store.tron     = null; }
+  switch (type) {
+    case "evm": case "metamask": case "envkey":
+      store.evm = null; store.evmSource = null; break;
+    case "privy":
+      if (store.evmSource === "privy")       { store.evm = null; store.evmSource = null; }
+      if (store.solanaSource === "privy")    { store.solana = null; store.solanaSource = null; }
+      store.privy = null; break;
+    case "btc":      store.btc = null;      store.btcSource = null;      break;
+    case "solana":   store.solana = null;   store.solanaSource = null;   break;
+    case "starknet": store.starknet = null; store.starknetSource = null; break;
+    case "sui":      store.sui = null;      store.suiSource = null;      break;
+    case "tron":     store.tron = null;     store.tronSource = null;     break;
+  }
 }
 
 // ── STATUS ────────────────────────────────────────────────────
 function getStatus() {
   return {
-    evmSource: store.evmSource,
-    evm:      store.evm      ? { address: store.evm.address, source: store.evm.source, tokenBalances: store.evm.tokenBalances || {} } : null,
-    btc:      store.btc      ? { address: store.btc.address,      balance: store.btc.balance }                     : null,
-    solana:   store.solana   ? { address: store.solana.address,   balance: store.solana.balance, source: store.solana.source } : null,
-    starknet: store.starknet ? { address: store.starknet.address }                                                 : null,
-    sui:      store.sui      ? { address: store.sui.address }                                                      : null,
-    tron:     store.tron     ? { address: store.tron.address }                                                     : null,
-    privy:    store.privy    ? { connected: true,  evmAddress: store.evm?.address, solanaAddress: store.solana?.address } : { connected: false },
+    evmSource:      store.evmSource,
+    solanaSource:   store.solanaSource,
+    btcSource:      store.btcSource,
+    starknetSource: store.starknetSource,
+    suiSource:      store.suiSource,
+    tronSource:     store.tronSource,
+    evm:      store.evm      ? { address: store.evm.address,      source: store.evm.source,      tokenBalances: store.evm.tokenBalances || {} } : null,
+    btc:      store.btc      ? { address: store.btc.address,      source: store.btc.source,      balance: store.btc.balance }                   : null,
+    solana:   store.solana   ? { address: store.solana.address,   source: store.solana.source,   balance: store.solana.balance }                : null,
+    starknet: store.starknet ? { address: store.starknet.address, source: store.starknet.source }                                               : null,
+    sui:      store.sui      ? { address: store.sui.address,      source: store.sui.source }                                                    : null,
+    tron:     store.tron     ? { address: store.tron.address,     source: store.tron.source }                                                   : null,
+    privy:    store.privy    ? { connected: true, evmAddress: store.evm?.address, solanaAddress: store.solana?.address } : { connected: false },
   };
 }
 
 module.exports = {
+  // getters
   getEvmAddress, getBtcAddress, getBtcWif,
   getSolanaAddress, getStarknetAddress, getSuiAddress, getTronAddress,
   getAddressByType, getPrivyCreds, getStatus,
-  connectMetaMask, connectPrivy, connectBtc,
-  connectSolana, connectStarknet, connectSui, connectTron,
+  // connect — extension/manual (highest priority)
+  connectMetaMask, connectPrivy, connectBtc, connectSolana,
+  connectStarknet, connectSui, connectTron,
+  // connect — envkey (lowest priority)
+  connectEnvKey, connectEnvKeyEvm, connectEnvKeyBtc, connectEnvKeySolana,
+  connectEnvKeyStarknet, connectEnvKeySui, connectEnvKeyTron,
+  // misc
   disconnect, setEvmBalances,
 };

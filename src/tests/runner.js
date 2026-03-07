@@ -2,6 +2,7 @@
 const garden = require("../api/garden");
 const config  = require("../config");
 const { initiateEvm, redeemEvm } = require("../htlc/evm");
+const envkey = require("../wallet/envkey");
 const { initiateHtlc }           = require("../wallet/btc");
 const walletState = require("../wallet/state");
 
@@ -9,12 +10,19 @@ let _emit = null;
 let _approvalQueue = [];
 // Map of active testId → abort controller
 const _activeTests = new Map();
+let _globalAbort = false;
+// Cache of validated pairs: Set of "fromAsset::toAsset" strings
+let _validPairsCache = { ts: 0, pairs: null };
+const PAIRS_CACHE_MS = 10 * 60 * 1000; // 10 min
 
 function setEmitter(fn) { _emit = fn; }
 function emit(event, data) {
   if (_emit) _emit(event, data);
   else console.log(`[${event}]`, JSON.stringify(data).slice(0, 120));
 }
+
+// ── APPROVAL / EVM TX / EIP-712 SIGN QUEUE ──────────────────
+// All async browser-side responses use one unified array queue.
 
 async function requestApproval(txData) {
   return new Promise(resolve => {
@@ -24,7 +32,7 @@ async function requestApproval(txData) {
   });
 }
 
-// Request MetaMask in the browser to sign a pre-built Garden EVM transaction
+// Regular MetaMask tx — user pays gas
 async function requestEvmTx({ orderId, label, to, data, value, chainId, gasLimit }) {
   return new Promise((resolve, reject) => {
     const id = `evmtx_${Date.now()}`;
@@ -32,10 +40,20 @@ async function requestEvmTx({ orderId, label, to, data, value, chainId, gasLimit
     _approvalQueue.push({ id, resolve, reject });
     setTimeout(() => {
       const idx = _approvalQueue.findIndex(a => a.id === id);
-      if (idx !== -1) {
-        _approvalQueue.splice(idx, 1);
-        reject(new Error("EVM tx timeout — MetaMask not responded in 5 min"));
-      }
+      if (idx !== -1) { _approvalQueue.splice(idx, 1); reject(new Error("EVM tx timeout — MetaMask not responded in 5 min")); }
+    }, 300000);
+  });
+}
+
+// Gasless EIP-712 — MetaMask signs, Garden relayer submits
+async function requestEvmSign({ orderId, label, signData, chainId }) {
+  return new Promise((resolve, reject) => {
+    const id = `evmsign_${Date.now()}`;
+    emit("evm_sign_request", { id, orderId, label, signData, chainId: String(chainId) });
+    _approvalQueue.push({ id, resolve, reject });
+    setTimeout(() => {
+      const idx = _approvalQueue.findIndex(a => a.id === id);
+      if (idx !== -1) { _approvalQueue.splice(idx, 1); reject(new Error("EIP-712 sign timeout — MetaMask not responded in 5 min")); }
     }, 300000);
   });
 }
@@ -46,11 +64,19 @@ function handleApproval(id, approved) {
 }
 
 function handleEvmTxResponse(id, txHash) {
-  // txHash = hex string if approved, false if rejected
   const idx = _approvalQueue.findIndex(q => q.id === id);
   if (idx !== -1) {
     if (txHash) _approvalQueue[idx].resolve(txHash);
     else _approvalQueue[idx].reject(new Error("EVM transaction rejected by user"));
+    _approvalQueue.splice(idx, 1);
+  }
+}
+
+function handleEvmSignResponse(id, signature) {
+  const idx = _approvalQueue.findIndex(q => q.id === id);
+  if (idx !== -1) {
+    if (signature) _approvalQueue[idx].resolve(signature);
+    else _approvalQueue[idx].reject(new Error("EIP-712 signature rejected by user"));
     _approvalQueue.splice(idx, 1);
   }
 }
@@ -61,6 +87,7 @@ function abortTest(testId) {
 }
 
 function abortAll() {
+  _globalAbort = true;
   _activeTests.forEach(ctrl => { ctrl.abort = true; });
 }
 
@@ -180,7 +207,47 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
       step("Liquidity Check", "pass", "Could not verify (continuing)");
     }
 
-    // 5. Create order — Garden manages secrets, no secret_hash needed
+    // 5b. Balance check — verify source wallet has enough BEFORE locking anything on-chain
+    step("Balance Check", "running");
+    checkAbort();
+    try {
+      const wallets = walletState.getStatus();
+      let balance = null;
+      let balanceLabel = "";
+
+      if (fromChain === "bitcoin") {
+        const rawBal = wallets.btc?.balance;
+        if (rawBal && rawBal !== "unknown") {
+          balance = Math.floor(parseFloat(rawBal) * 1e8); // → sats
+          balanceLabel = `${balance.toLocaleString()} sats`;
+        }
+      } else if (fromChain === "evm") {
+        // Try tokenBalances cache (populated by fetchEvmBalances)
+        const evmBal = wallets.evm?.tokenBalances?.[fromAsset];
+        if (evmBal !== undefined) {
+          balance = Number(evmBal);
+          balanceLabel = `${balance} wei`;
+        }
+      } else if (fromChain === "solana") {
+        const rawBal = wallets.solana?.balance;
+        if (rawBal) { balance = parseFloat(rawBal); balanceLabel = `${balance} SOL`; }
+      }
+
+      if (balance !== null && balance < safeAmount) {
+        const msg = `Insufficient balance: have ${balanceLabel}, need ${safeAmount.toLocaleString()} (atomic units)`;
+        step("Balance Check", "fail", msg);
+        emit("test_end", { testId, label, status: "skipped", error: msg });
+        _activeTests.delete(testId);
+        return { testId, label, status: "skipped", error: msg };
+      }
+
+      const balMsg = balance !== null ? `${balanceLabel} ≥ ${safeAmount.toLocaleString()} ✓` : "Balance unknown (EVM — check wallet)";
+      step("Balance Check", balance !== null ? "pass" : "pass", balMsg);
+    } catch(balErr) {
+      step("Balance Check", "pass", `Could not verify (${balErr.message}) — continuing`);
+    }
+
+    // 5c. Create order — Garden manages secrets, no secret_hash needed
     // Per Garden docs: send source + destination amounts from quote, plus solver_id
     step("Create Order", "running");
     checkAbort();
@@ -246,10 +313,26 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
       if (!btcWif) throw new Error("BTC private key (WIF) not saved — go to Connect Wallets and paste your WIF key");
       initTxHash = await initiateHtlc({ htlcAddress, amountSats: htlcAmount, wif: btcWif, fromAddress: btcAddress });
     } else if (fromChain === "evm") {
-      // Garden provides a pre-built initiate_transaction — send it directly via MetaMask
       const prebuiltTx = orderRes.result?.initiate_transaction;
-      if (prebuiltTx?.data && prebuiltTx?.to) {
-        // Emit a ws event so the dashboard can prompt MetaMask in the browser
+      const signData   = orderRes.result?.sign_data || orderRes.result?.eip712_data || orderRes.result?.permit_data;
+
+      if (signData && prebuiltTx?.chain_id) {
+        // ── GASLESS PATH: sign EIP-712 typed data, relayer submits tx ──
+        step("Initiate HTLC", "pending", "Waiting for EIP-712 signature (gasless)…");
+        const signature = await requestEvmSign({
+          orderId,
+          label,
+          signData,
+          chainId: prebuiltTx.chain_id,
+        });
+        // Notify Garden with signature instead of tx_hash — relayer submits for us
+        step("Initiate HTLC", "pass", "Signed (gasless — relayer submitting)");
+        await garden.patchOrder(orderId, "initiate", { signature });
+        step("Notify Garden", "pass", "Signature accepted by relayer");
+        // Skip the normal Notify Garden step since we already patched above
+        initTxHash = "gasless_relayer";
+      } else if (prebuiltTx?.data && prebuiltTx?.to) {
+        // ── REGULAR PATH: send tx via MetaMask, user pays gas ──
         step("Initiate HTLC", "pending", "Waiting for MetaMask approval…");
         initTxHash = await requestEvmTx({
           orderId,
@@ -260,7 +343,7 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
           chainId: prebuiltTx.chain_id,
           gasLimit: prebuiltTx.gas_limit || "0x493e0",
         });
-      } else if (orderRes.result?.source?.evmSource === "privy" || walletState.getStatus().evmSource === "privy") {
+      } else if (walletState.getStatus().evmSource === "privy") {
         // Privy server-side signing
         initTxHash = await initiateEvm({
           htlcAddress,
@@ -271,19 +354,31 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
           expiry: Math.floor(Date.now() / 1000) + 7200,
           chainKey: fromAsset.split(":")[0],
         });
+      } else if (walletState.getStatus().evmSource === "envkey" && envkey.isAvailable()) {
+        // Backend private key — sign and broadcast directly, no user interaction
+        step("Initiate HTLC", "running", "Signing with .env private key…");
+        initTxHash = await envkey.sendTransaction({
+          to:       prebuiltTx?.to      || htlcAddress,
+          data:     prebuiltTx?.data    || "0x",
+          value:    prebuiltTx?.value   || "0x0",
+          chainId:  prebuiltTx?.chain_id || fromAsset.split(":")[0],
+          gasLimit: prebuiltTx?.gas_limit,
+        });
       } else {
-        throw new Error("EVM source: no pre-built transaction from Garden and no Privy wallet. Connect Privy for automated EVM sends, or enable Manual Approve mode.");
+        throw new Error("EVM source: connect MetaMask in the dashboard, or set EVM_PRIVATE_KEY in .env for automated signing.");
       }
     } else {
       throw new Error(`Initiation not yet implemented for: ${fromChain}`);
     }
     step("Initiate HTLC", "pass", "Transaction sent", initTxHash);
 
-    // 8. Notify Garden
-    step("Notify Garden", "running");
-    checkAbort();
-    await garden.patchOrder(orderId, "initiate", initTxHash);
-    step("Notify Garden", "pass", "Acknowledged");
+    // 8. Notify Garden (skip if gasless path already patched above)
+    if (initTxHash !== "gasless_relayer") {
+      step("Notify Garden", "running");
+      checkAbort();
+      await garden.patchOrder(orderId, "initiate", initTxHash);
+      step("Notify Garden", "pass", "Acknowledged");
+    }
 
     // 9. Wait for solver to lock
     step("Solver Lock", "running", "Waiting for solver…");
@@ -294,19 +389,57 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     // 10. Redeem on destination
     step("Redeem", "running");
     checkAbort();
-    let redeemTxHash;
-    if (toChain === "evm") {
-      const htlcContract = lockResult.order?.destination_htlc_address;
-      const secret = lockResult.order?.secret || orderRes.result?.secret;
-      redeemTxHash = await redeemEvm({
-        htlcAddress: htlcContract,
-        secret,
-        chainKey: toAsset.split(":")[0],
-      });
-    } else {
+    let redeemTxHash = "solver_auto_redeem";
+    const destStatus = walletState.getStatus();
+
+    // ── Try backend auto-redeem first, fall back to solver ──
+    try {
+      const redeemTx = lockResult.order?.redeem_transaction;
+      const secret   = lockResult.order?.secret || orderRes.result?.secret;
+
+      if (toChain === "evm") {
+        const htlcContract = lockResult.order?.destination_htlc_address;
+
+        if (redeemTx?.data && redeemTx?.to &&
+            (destStatus.evmSource === "envkey" || destStatus.evmSource === "privy") &&
+            envkey.isEvmAvailable()) {
+          // envkey: use Garden's pre-built redeem tx
+          step("Redeem", "running", "Signing redeem with .env key…");
+          redeemTxHash = await envkey.sendEvmTransaction({
+            to: redeemTx.to, data: redeemTx.data,
+            value: redeemTx.value || "0x0",
+            chainId: redeemTx.chain_id, gasLimit: redeemTx.gas_limit,
+          });
+        } else if (secret && htlcContract && destStatus.evmSource === "privy") {
+          // Privy: sign with server wallet
+          redeemTxHash = await redeemEvm({ htlcAddress: htlcContract, secret, chainKey: toAsset.split(":")[0] });
+        } else {
+          step("Redeem", "pending", "Waiting for solver to auto-redeem EVM destination…");
+        }
+
+      } else if (toChain === "solana") {
+        if (redeemTx && destStatus.solanaSource === "envkey" && envkey.isSolanaAvailable()) {
+          step("Redeem", "running", "Signing Solana redeem with .env key…");
+          redeemTxHash = await envkey.sendSolanaTransaction(redeemTx);
+        } else {
+          step("Redeem", "pending", "Waiting for solver to auto-redeem Solana…");
+        }
+
+      } else if (toChain === "bitcoin") {
+        // Bitcoin destination — solver always handles BTC redemption
+        step("Redeem", "pending", "Waiting for solver to redeem BTC…");
+
+      } else {
+        // starknet, sui, tron — solver handles
+        step("Redeem", "pending", `Waiting for solver to auto-redeem ${toChain}…`);
+      }
+    } catch (redeemErr) {
+      console.warn(`[runner] backend redeem failed, falling back to solver: ${redeemErr.message}`);
+      step("Redeem", "pending", `Backend redeem failed (${redeemErr.message}) — solver will handle`);
       redeemTxHash = "solver_auto_redeem";
     }
-    step("Redeem", "pass", "Redemption sent", redeemTxHash);
+
+    step("Redeem", "pass", redeemTxHash === "solver_auto_redeem" ? "Solver will auto-redeem" : "Redeemed", redeemTxHash);
 
     // 11. Poll for completion
     step("Completion", "running", "Waiting for confirmation…");
@@ -360,7 +493,7 @@ async function runApiTests() {
 }
 
 // ── BUILD ROUTES FROM GARDEN ASSETS + CONNECTED WALLETS ───────
-async function buildRoutes() {
+async function buildRoutes(amountOverrides = {}) {
   const wallets = walletState.getStatus();
   const connectedTypes = new Set();
   if (wallets.evm)      connectedTypes.add("evm");
@@ -384,18 +517,41 @@ async function buildRoutes() {
     return wt && connectedTypes.has(wt);
   });
 
-  // Build routes directly from assets — no policy call needed.
-  // Garden /policy is a global blacklist, not per-pair. We validate via quote at trade time.
+  // Use validated pairs cache if available (populated by explicit Validate Pairs action).
+  // Otherwise run all combinations — unsupported pairs skip quickly via quote error.
+  const now = Date.now();
+  const validPairs = (_validPairsCache.pairs && now - _validPairsCache.ts < PAIRS_CACHE_MS)
+    ? _validPairsCache.pairs : null;
+  if (validPairs) console.log(`[buildRoutes] filtering by ${validPairs.size} validated pairs`);
+
+  function assetFamily(asset) {
+    const t = (asset.name || asset.id || '').toLowerCase().split(':').pop();
+    if (/btc$|^btc|wbtc|cbtc|cbbtc|sbtc|hbtc|btcn|lbtc|tbtc|pbtc|rbtc/.test(t)) return 'btc';
+    if (/^eth$|^weth$/.test(t)) return 'eth';
+    if (/usdc|usdt|dai|busd/.test(t)) return 'stable';
+    return 'other_' + t;
+  }
+  function isPairPlausible(from, to) {
+    const ff = assetFamily(from), tf = assetFamily(to);
+    if (ff === tf) return true;
+    if (ff === 'btc' && tf !== 'btc') return false;
+    if (tf === 'btc' && ff !== 'btc') return false;
+    return true;
+  }
+
   const routes = [];
   for (const from of supported) {
     for (const to of supported) {
       if (from.id === to.id) continue;
+      if (!isPairPlausible(from, to)) continue;
+      if (validPairs && !validPairs.has(`${from.id}::${to.id}`)) continue;
+      const overrideAmt = amountOverrides[from.id];
       routes.push({
         fromAsset: from.id,
         toAsset:   to.id,
         fromChain: getWalletTypeForAsset(from),
         toChain:   getWalletTypeForAsset(to),
-        amount:    parseInt(from.min_amount || 50000),
+        amount:    overrideAmt !== undefined ? parseInt(overrideAmt) : parseInt(from.min_amount || 50000),
         fromMeta:  from,
         toMeta:    to,
         label:     `${from.name} → ${to.name}`,
@@ -406,10 +562,10 @@ async function buildRoutes() {
 }
 
 // ── RUN ALL ───────────────────────────────────────────────────
-async function runAll() {
+async function runAll(amountOverrides = {}) {
   emit("suite_start", { env: config.env, ts: new Date().toISOString() });
   await runApiTests();
-  const routes  = await buildRoutes();
+  const routes  = await buildRoutes(amountOverrides);
   const results = [];
 
   emit("suite_routes", { count: routes.length, routes: routes.map(r => r.label) });
@@ -421,10 +577,15 @@ async function runAll() {
     return results;
   }
 
+  _globalAbort = false; // reset on fresh run
   for (const route of routes) {
+    if (_globalAbort) {
+      emit("suite_aborted", { stopped: results.length, remaining: routes.length - results.length });
+      break;
+    }
     const result = await runRoute(route);
     results.push(result);
-    await new Promise(r => setTimeout(r, 1000));
+    if (!_globalAbort) await new Promise(r => setTimeout(r, 1000));
   }
 
   emit("suite_end", {
@@ -437,4 +598,9 @@ async function runAll() {
   return results;
 }
 
-module.exports = { runAll, runApiTests, runRoute, buildRoutes, setEmitter, handleApproval, handleEvmTxResponse, abortTest, abortAll };
+function setValidPairsCache(pairs) {
+  _validPairsCache = { ts: Date.now(), pairs };
+  console.log(`[runner] valid pairs cache updated: ${pairs.size} pairs`);
+}
+
+module.exports = { runAll, runApiTests, runRoute, buildRoutes, setEmitter, handleApproval, handleEvmTxResponse, abortTest, abortAll, setValidPairsCache };
