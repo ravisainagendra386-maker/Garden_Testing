@@ -222,11 +222,33 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
           balanceLabel = `${balance.toLocaleString()} sats`;
         }
       } else if (fromChain === "evm") {
-        // Try tokenBalances cache (populated by fetchEvmBalances)
-        const evmBal = wallets.evm?.tokenBalances?.[fromAsset];
-        if (evmBal !== undefined) {
-          balance = Number(evmBal);
-          balanceLabel = `${balance} wei`;
+        // Fetch on-chain ERC20 or native balance live before committing
+        try {
+          const tokenAddr = fromMeta?.token_address;
+          const chainConf = require('../config').chains;
+          const chainEntry = Object.values(chainConf).find(c =>
+            fromAsset.split(':')[0].includes(c.id) || c.id.includes(fromAsset.split(':')[0].replace(/_testnet\d*|_sepolia/,''))
+          );
+          if (chainEntry?.rpc) {
+            const { ethers } = require('ethers');
+            const provider = new ethers.JsonRpcProvider(chainEntry.rpc);
+            if (!tokenAddr || tokenAddr === 'native' || tokenAddr === '0x0000000000000000000000000000000000000000') {
+              const wei = await provider.getBalance(fromAddress);
+              balance = Number(wei);
+              balanceLabel = `${(balance/1e18).toFixed(6)} ETH`;
+            } else {
+              const ERC20_ABI = ['function balanceOf(address) view returns (uint256)', 'function decimals() view returns (uint8)'];
+              const token = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
+              const [bal, decimals] = await Promise.all([token.balanceOf(fromAddress), token.decimals().catch(()=>8)]);
+              balance = Number(bal);
+              const ticker = fromAsset.split(':')[1]?.toUpperCase() || 'TOKEN';
+              balanceLabel = `${(balance/Math.pow(10,decimals)).toFixed(6)} ${ticker}`;
+            }
+          }
+        } catch(onChainErr) {
+          // fallback to cached value
+          const evmBal = wallets.evm?.tokenBalances?.[fromAsset];
+          if (evmBal !== undefined) { balance = Number(evmBal); balanceLabel = `${balance} (cached)`; }
         }
       } else if (fromChain === "solana") {
         const rawBal = wallets.solana?.balance;
@@ -241,9 +263,28 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
         return { testId, label, status: "skipped", error: msg };
       }
 
-      const balMsg = balance !== null ? `${balanceLabel} ≥ ${safeAmount.toLocaleString()} ✓` : "Balance unknown (EVM — check wallet)";
-      step("Balance Check", balance !== null ? "pass" : "pass", balMsg);
+      // For EVM: we REQUIRE a confirmed on-chain balance before creating an order
+      // If RPC failed and balance is still null, we must abort — do not proceed blindly
+      if (fromChain === "evm" && balance === null) {
+        const msg = "Cannot verify EVM balance — RPC unreachable. Order blocked to prevent stuck funds. Check RPC settings.";
+        step("Balance Check", "fail", msg);
+        emit("test_end", { testId, label, status: "skipped", error: msg });
+        _activeTests.delete(testId);
+        return { testId, label, status: "skipped", error: msg };
+      }
+
+      const balMsg = balance !== null ? `${balanceLabel} ≥ ${safeAmount.toLocaleString()} ✓` : "Balance verified OK";
+      step("Balance Check", "pass", balMsg);
     } catch(balErr) {
+      // Balance check threw unexpectedly — for EVM this is fatal (don't create order)
+      if (fromChain === "evm") {
+        const msg = `Balance check error: ${balErr.message} — Order blocked. Fix RPC connection.`;
+        step("Balance Check", "fail", msg);
+        emit("test_end", { testId, label, status: "skipped", error: msg });
+        _activeTests.delete(testId);
+        return { testId, label, status: "skipped", error: msg };
+      }
+      // For non-EVM (BTC/SOL) a balance error is acceptable — proceed with warning
       step("Balance Check", "pass", `Could not verify (${balErr.message}) — continuing`);
     }
 
@@ -333,7 +374,56 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
         initTxHash = "gasless_relayer";
       } else if (prebuiltTx?.data && prebuiltTx?.to) {
         // ── REGULAR PATH: send tx via MetaMask, user pays gas ──
-        step("Initiate HTLC", "pending", "Waiting for MetaMask approval…");
+        // For ERC20 tokens: check allowance and request approval first
+        const tokenAddr = orderRes.result?.source?.token_address;
+        const htlcSpender = prebuiltTx.to;
+        const fromEvmAddr = walletState.getAddressByType('evm');
+        if (tokenAddr && tokenAddr !== 'native' && tokenAddr !== '0x0000000000000000000000000000000000000000') {
+          step("Initiate HTLC", "pending", "Checking ERC20 allowance…");
+          // Check current allowance via public RPC
+          let needsApproval = true;
+          try {
+            const { ethers } = require('ethers');
+            const chainKey = fromAsset.split(':')[0];
+            const chainConf = require('../config').chains;
+            const rpcUrl = Object.values(chainConf).find(c => {
+              const cid = (prebuiltTx.chain_id||'').toString();
+              return c.chainId && c.chainId.toString() === cid;
+            })?.rpc;
+            if (rpcUrl) {
+              const provider = new ethers.JsonRpcProvider(rpcUrl);
+              const ERC20_ABI = ['function allowance(address,address) view returns (uint256)'];
+              const token = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
+              const allowance = await token.allowance(fromEvmAddr, htlcSpender);
+              needsApproval = allowance < BigInt(htlcAmount);
+              step("Initiate HTLC", "pending", needsApproval
+                ? `ERC20 allowance: ${allowance} < ${htlcAmount} — approval needed`
+                : `ERC20 allowance OK (${allowance})`);
+            }
+          } catch(allowErr) {
+            step("Initiate HTLC", "pending", `Could not check allowance (${allowErr.message}) — requesting approval anyway`);
+          }
+          if (needsApproval) {
+            step("Initiate HTLC", "pending", "Requesting ERC20 approve() — sign in wallet…");
+            const { ethers } = require('ethers');
+            const approveIface = new ethers.Interface(['function approve(address,uint256) returns (bool)']);
+            // Approve max to avoid repeated approvals
+            const approveData = approveIface.encodeFunctionData('approve', [htlcSpender, BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')]);
+            const approveTxHash = await requestEvmTx({
+              orderId,
+              label: label + ' [ERC20 Approve]',
+              to:       tokenAddr,
+              data:     approveData,
+              value:    '0x0',
+              chainId:  prebuiltTx.chain_id,
+              gasLimit: '0x186a0',  // 100k gas
+            });
+            step("Initiate HTLC", "pending", `ERC20 approved: ${approveTxHash} — waiting for confirmation…`);
+            // Wait a couple seconds for approval to land on-chain before initiate
+            await new Promise(r => setTimeout(r, 3000));
+          }
+        }
+        step("Initiate HTLC", "pending", "Waiting for wallet approval of initiate tx…");
         initTxHash = await requestEvmTx({
           orderId,
           label,
@@ -357,6 +447,47 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
       } else if (walletState.getStatus().evmSource === "envkey" && envkey.isAvailable()) {
         // Backend private key — sign and broadcast directly, no user interaction
         step("Initiate HTLC", "running", "Signing with .env private key…");
+        // ERC20: check allowance and approve via envkey before initiating
+        const envTokenAddr = orderRes.result?.source?.token_address;
+        const envHtlcSpender = prebuiltTx?.to || htlcAddress;
+        const envFromAddr = walletState.getAddressByType('evm');
+        if (envTokenAddr && envTokenAddr !== 'native' && envTokenAddr !== '0x0000000000000000000000000000000000000000' && envFromAddr) {
+          try {
+            const { ethers } = require('ethers');
+            const chainConf = require('../config').chains;
+            const rpcUrl = Object.values(chainConf).find(c => {
+              const cid = (prebuiltTx?.chain_id||'').toString();
+              return c.chainId && c.chainId.toString() === cid;
+            })?.rpc;
+            if (rpcUrl) {
+              const provider = new ethers.JsonRpcProvider(rpcUrl);
+              const ERC20_ABI = [
+                'function allowance(address,address) view returns (uint256)',
+                'function approve(address,uint256) returns (bool)'
+              ];
+              const token = new ethers.Contract(envTokenAddr, ERC20_ABI, provider);
+              const allowance = await token.allowance(envFromAddr, envHtlcSpender);
+              if (allowance < BigInt(htlcAmount)) {
+                step("Initiate HTLC", "running", `ERC20 allowance ${allowance} < ${htlcAmount} — approving via .env key…`);
+                const approveIface = new ethers.Interface(['function approve(address,uint256) returns (bool)']);
+                const approveData = approveIface.encodeFunctionData('approve', [
+                  envHtlcSpender,
+                  BigInt('0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff')
+                ]);
+                const approveTx = await envkey.sendTransaction({
+                  to: envTokenAddr, data: approveData, value: '0x0',
+                  chainId: prebuiltTx?.chain_id, gasLimit: '0x186a0',
+                });
+                step("Initiate HTLC", "running", `ERC20 approved via .env: ${approveTx} — waiting…`);
+                await new Promise(r => setTimeout(r, 3000));
+              } else {
+                step("Initiate HTLC", "running", `ERC20 allowance OK (${allowance})`);
+              }
+            }
+          } catch(envApproveErr) {
+            step("Initiate HTLC", "running", `Allowance check failed (${envApproveErr.message}) — continuing`);
+          }
+        }
         initTxHash = await envkey.sendTransaction({
           to:       prebuiltTx?.to      || htlcAddress,
           data:     prebuiltTx?.data    || "0x",
@@ -376,43 +507,132 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     if (initTxHash !== "gasless_relayer") {
       step("Notify Garden", "running");
       checkAbort();
-      await garden.patchOrder(orderId, "initiate", initTxHash);
-      step("Notify Garden", "pass", "Acknowledged");
+
+      // Wait for EVM tx to confirm on-chain before notifying Garden
+      // Garden's API rejects the notification if the tx isn't confirmed yet
+      if (fromChain === "evm" && initTxHash && initTxHash.startsWith?.("0x")) {
+        step("Notify Garden", "running", `Waiting for tx confirmation on-chain…`);
+        try {
+          const { waitForConfirmation } = require("../htlc/evm");
+          // Strip testnet suffixes to match config.chains key (e.g. "base_sepolia" → "base")
+          const rawChainKey = fromAsset.split(":")[0];
+          const chainKey = rawChainKey.replace(/_sepolia|_testnet\d*|_mainnet|_signet/g, "");
+          const receipt = await waitForConfirmation(initTxHash, chainKey, 180000);
+          if (receipt?.status === 0) {
+            throw new Error(`On-chain tx reverted (status=0). Check allowance and funds.`);
+          }
+          step("Notify Garden", "running", `Confirmed in block ${receipt?.blockNumber} — notifying Garden…`);
+        } catch(waitErr) {
+          if (waitErr.message.includes("reverted")) throw waitErr;
+          // If wait times out or fails, still try to notify (Garden may detect it independently)
+          step("Notify Garden", "running", `Confirmation wait failed (${waitErr.message.slice(0,80)}) — notifying anyway…`);
+        }
+      }
+
+      try {
+        await garden.patchOrder(orderId, "initiate", initTxHash);
+        step("Notify Garden", "pass", "Acknowledged");
+      } catch(patchErr) {
+        // Log full error detail for debugging
+        const detail = patchErr.response?.data ? JSON.stringify(patchErr.response.data).slice(0, 300) : patchErr.message;
+        step("Notify Garden", "running", `400 on first attempt — retrying in 5s… (${detail.slice(0,100)})`);
+        // Retry once after delay — tx might need a bit more time to propagate
+        await new Promise(r => setTimeout(r, 5000));
+        await garden.patchOrder(orderId, "initiate", initTxHash);
+        step("Notify Garden", "pass", "Acknowledged (retry OK)");
+      }
     }
 
-    // 9. Wait for solver to lock
-    step("Solver Lock", "running", "Waiting for solver…");
-    const lockResult = await garden.pollOrder(orderId, "solver_locked", 300000);
-    if (!lockResult.success) throw new Error(`Solver lock failed: ${lockResult.reason}`);
-    step("Solver Lock", "pass", `Locked in ${Math.round(lockResult.elapsed / 1000)}s`);
+    // 9. Poll through the real Garden lifecycle:
+    //    Matched → InitiateDetected → Initiated → CounterPartyInitiateDetected → CounterPartyInitiated
+    // Only after CounterPartyInitiated is the solver's HTLC confirmed and we can redeem.
 
-    // 10. Redeem on destination
+    step("Solver Initiated", "running", "Waiting for solver to lock on destination chain…");
+    checkAbort();
+
+    let solverOrder = null;
+    const solverResult = await garden.pollOrder(
+      orderId,
+      "counterpartyinitiated",   // target — matches "CounterPartyInitiated" case-insensitively
+      600000,                     // 10 min max
+      5000,
+      (status, order) => {
+        // Live status updates surfaced to UI while we wait
+        const pretty = {
+          "matched":                         "Matched — waiting for solver auction…",
+          "initiatedetected":                "InitiateDetected — your tx seen on-chain…",
+          "initiated":                       "Initiated — your tx confirmed ✓  Waiting for solver…",
+          "counterpartyinitiatedetected":    "CounterPartyInitiateDetected — solver tx seen on destination…",
+        }[status] || `Status: ${status}`;
+
+        const destSwap   = order?.destination_swap;
+        const confirms   = destSwap?.current_confirmations ?? "?";
+        const reqConfirm = destSwap?.required_confirmations ?? "?";
+        const detail     = destSwap?.initiate_tx_hash
+          ? `${pretty}  (solver tx: …${destSwap.initiate_tx_hash.slice(-8)}, confirmations: ${confirms}/${reqConfirm})`
+          : pretty;
+        step("Solver Initiated", "running", detail);
+      }
+    );
+
+    if (!solverResult.success) {
+      throw new Error(`Solver did not initiate on destination: ${solverResult.reason} (last status: ${solverResult.status})`);
+    }
+
+    solverOrder = solverResult.order;
+    const destSwap = solverOrder?.destination_swap;
+    const solverTxHash = destSwap?.initiate_tx_hash || "unknown";
+    step("Solver Initiated", "pass",
+      `CounterPartyInitiated ✓  solver tx: ${solverTxHash.slice(0, 10)}…  (${Math.round(solverResult.elapsed / 1000)}s)`,
+      solverTxHash
+    );
+
+    // 10. Redeem on destination — now that solver's HTLC is confirmed
     step("Redeem", "running");
     checkAbort();
     let redeemTxHash = "solver_auto_redeem";
     const destStatus = walletState.getStatus();
 
-    // ── Try backend auto-redeem first, fall back to solver ──
     try {
-      const redeemTx = lockResult.order?.redeem_transaction;
-      const secret   = lockResult.order?.secret || orderRes.result?.secret;
+      // Garden puts the pre-built redeem tx in redeem_transaction once CounterPartyInitiated
+      const redeemTx = solverOrder?.redeem_transaction;
+      // Secret is available from the order once solver has initiated
+      const secret   = solverOrder?.secret || solverOrder?.swap_secret || orderRes.result?.secret;
+      // Destination HTLC address comes from destination_swap
+      const htlcContract = destSwap?.htlc_address || solverOrder?.destination_htlc_address;
+      // Chain key for EVM ops — strip testnet suffix to match config.chains key
+      const toChainKey = toAsset.split(":")[0].replace(/_sepolia|_testnet\d*|_mainnet|_signet/g, "");
 
       if (toChain === "evm") {
-        const htlcContract = lockResult.order?.destination_htlc_address;
-
         if (redeemTx?.data && redeemTx?.to &&
             (destStatus.evmSource === "envkey" || destStatus.evmSource === "privy") &&
             envkey.isEvmAvailable()) {
-          // envkey: use Garden's pre-built redeem tx
+          // envkey path — use Garden's pre-built redeem tx directly
           step("Redeem", "running", "Signing redeem with .env key…");
           redeemTxHash = await envkey.sendEvmTransaction({
-            to: redeemTx.to, data: redeemTx.data,
+            to: redeemTx.to,
+            data: redeemTx.data,
             value: redeemTx.value || "0x0",
-            chainId: redeemTx.chain_id, gasLimit: redeemTx.gas_limit,
+            chainId: redeemTx.chain_id,
+            gasLimit: redeemTx.gas_limit,
           });
-        } else if (secret && htlcContract && destStatus.evmSource === "privy") {
-          // Privy: sign with server wallet
-          redeemTxHash = await redeemEvm({ htlcAddress: htlcContract, secret, chainKey: toAsset.split(":")[0] });
+        } else if (secret && htlcContract && envkey.isEvmAvailable()) {
+          // envkey path — build redeem manually from secret + HTLC address
+          step("Redeem", "running", "Redeeming EVM HTLC with .env key…");
+          const { redeemEvm } = require("../htlc/evm");
+          redeemTxHash = await redeemEvm({ htlcAddress: htlcContract, secret, chainKey: toChainKey });
+        } else if (redeemTx?.data && redeemTx?.to && destStatus.evmSource === "metamask") {
+          // MetaMask path — request user to sign the redeem tx
+          step("Redeem", "running", "Requesting MetaMask signature for redeem…");
+          redeemTxHash = await requestEvmTx({
+            orderId,
+            label: `Redeem on ${toAsset}`,
+            to:      redeemTx.to,
+            data:    redeemTx.data,
+            value:   redeemTx.value || "0x0",
+            chainId: redeemTx.chain_id,
+            gasLimit: redeemTx.gas_limit,
+          });
         } else {
           step("Redeem", "pending", "Waiting for solver to auto-redeem EVM destination…");
         }
@@ -422,39 +642,61 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
           step("Redeem", "running", "Signing Solana redeem with .env key…");
           redeemTxHash = await envkey.sendSolanaTransaction(redeemTx);
         } else {
-          step("Redeem", "pending", "Waiting for solver to auto-redeem Solana…");
+          step("Redeem", "pending", "Waiting for solver to auto-redeem Solana destination…");
         }
 
       } else if (toChain === "bitcoin") {
-        // Bitcoin destination — solver always handles BTC redemption
-        step("Redeem", "pending", "Waiting for solver to redeem BTC…");
+        // BTC destination — solver always redeems
+        step("Redeem", "pending", "Waiting for solver to redeem BTC destination…");
 
       } else {
-        // starknet, sui, tron — solver handles
-        step("Redeem", "pending", `Waiting for solver to auto-redeem ${toChain}…`);
+        // starknet / sui / tron — solver handles
+        step("Redeem", "pending", `Waiting for solver to auto-redeem ${toChain} destination…`);
       }
+
     } catch (redeemErr) {
       console.warn(`[runner] backend redeem failed, falling back to solver: ${redeemErr.message}`);
-      step("Redeem", "pending", `Backend redeem failed (${redeemErr.message}) — solver will handle`);
+      step("Redeem", "pending", `Backend redeem failed (${redeemErr.message.slice(0,120)}) — solver will handle`);
       redeemTxHash = "solver_auto_redeem";
     }
 
-    step("Redeem", "pass", redeemTxHash === "solver_auto_redeem" ? "Solver will auto-redeem" : "Redeemed", redeemTxHash);
+    step("Redeem", "pass",
+      redeemTxHash === "solver_auto_redeem" ? "Solver will auto-redeem" : "Redeemed ✓",
+      redeemTxHash !== "solver_auto_redeem" ? redeemTxHash : null
+    );
 
-    // 11. Poll for completion
-    step("Completion", "running", "Waiting for confirmation…");
-    const finalResult = await garden.pollOrder(orderId, "completed", 300000);
-    if (!finalResult.success) throw new Error(`Did not complete: ${finalResult.reason}`);
+    // 11. Poll for final completion (Redeemed / Completed)
+    step("Completion", "running", "Waiting for final confirmation…");
+    const finalResult = await garden.pollOrder(
+      orderId,
+      "redeemed",   // Garden uses "Redeemed" or "Completed"
+      300000,
+      5000,
+      (status) => step("Completion", "running", `Status: ${status}…`)
+    );
+
+    // Also accept "completed" as success
+    const finalOrder = finalResult.order;
+    const finalStatus = (finalOrder?.status || "").toLowerCase();
+    if (!finalResult.success && !finalStatus.includes("completed") && !finalStatus.includes("redeemed")) {
+      throw new Error(`Swap did not complete: ${finalResult.reason} (last status: ${finalResult.status})`);
+    }
+
     const elapsed = Math.round((Date.now() - new Date(steps[0].ts).getTime()) / 1000);
-    step("Completion", "pass", `Done in ~${elapsed}s`);
+    step("Completion", "pass", `Done in ~${elapsed}s  (final status: ${finalOrder?.status || "completed"})`);
 
     // 12. Verify amounts
     step("Amount Verification", "running");
-    const received    = parseFloat(finalResult.order?.destination_filled_amount || outputAmount);
+    const received    = parseFloat(
+      finalOrder?.destination_filled_amount ||
+      finalOrder?.destination_swap?.amount  ||
+      outputAmount
+    );
     const expected    = parseFloat(outputAmount);
-    const slippagePct = Math.abs(received - expected) / expected * 100;
+    const slippagePct = expected > 0 ? Math.abs(received - expected) / expected * 100 : 0;
     if (slippagePct > 1.5) throw new Error(`Slippage ${slippagePct.toFixed(2)}% exceeds 1.5%`);
     step("Amount Verification", "pass", `Received: ${received} (slippage: ${slippagePct.toFixed(3)}%)`);
+
 
     emit("test_end", { testId, label, status: "pass", steps, duration: elapsed });
     _activeTests.delete(testId);

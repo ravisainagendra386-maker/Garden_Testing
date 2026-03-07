@@ -17,7 +17,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, "../dashboard")));
 
 const server = http.createServer(app);
-const wss    = new WebSocket.Server({ server });
+const wss    = new WebSocket.Server({ server, path: '/ws' });
 
 function broadcast(event, data) {
   const msg = JSON.stringify({ event, data, ts: new Date().toISOString() });
@@ -101,22 +101,145 @@ app.post("/api/switch-env", (req, res) => {
   res.json({ ok: true, message: `Switched to ${env}. Restart the server.` });
 });
 
+// ── Asset ID resolver ─────────────────────────────────────────
+// The swap window sends simplified IDs like "base:wbtc" or "bitcoin:btc".
+// Garden's API needs the full asset ID e.g. "base_sepolia:wbtc".
+// This function resolves simplified → full ID using the live asset list.
+let _cachedAssets = null;
+async function getAssets() {
+  if (_cachedAssets) return _cachedAssets;
+  try { _cachedAssets = await garden.getAssets(); } catch(_) { _cachedAssets = []; }
+  // Expire cache after 5 min
+  setTimeout(() => { _cachedAssets = null; }, 5 * 60 * 1000);
+  return _cachedAssets;
+}
+
+// Input: "base:wbtc" → output: { assetId: "base_sepolia:wbtc", walletType: "evm", meta: {...} }
+async function resolveAssetId(simplified) {
+  if (!simplified) return null;
+  const parts = simplified.split(":");
+  const chainHint  = parts[0].toLowerCase();  // e.g. "base", "bitcoin", "base_sepolia"
+  const tickerHint = (parts[1] || "").toLowerCase(); // e.g. "wbtc", "btc", "cbltc"
+
+  const assets = await getAssets();
+  const list = assets.result || assets.assets || (Array.isArray(assets) ? assets : []);
+
+  // 1. Try exact ID match first (e.g. "base_sepolia:cbltc" passed directly from swap)
+  const exactMatch = list.find(a => (a.id || "").toLowerCase() === simplified.toLowerCase());
+  if (exactMatch) {
+    const walletType = (() => {
+      const c = (exactMatch.chain || exactMatch.id?.split(":")[0] || "").toLowerCase();
+      if (c.startsWith("bitcoin")) return "bitcoin";
+      if (c.startsWith("solana"))  return "solana";
+      if (c.startsWith("starknet"))return "starknet";
+      if (c.startsWith("tron"))    return "tron";
+      if (c.startsWith("sui"))     return "sui";
+      return "evm";
+    })();
+    return { assetId: exactMatch.id, walletType, meta: exactMatch };
+  }
+
+  // 2. Score each asset: higher = better match
+  let best = null, bestScore = -1;
+  for (const a of list) {
+    const id      = (a.id || "").toLowerCase();
+    const chain   = (a.chain || id.split(":")[0] || "").toLowerCase();
+    const ticker  = (a.asset || a.ticker || id.split(":")[1] || "").toLowerCase();
+
+    // Chain must match (prefix match — "base" matches "base_sepolia", and "base_sepolia" matches too)
+    const chainMatch = chain === chainHint
+      || chain.startsWith(chainHint + "_")
+      || chainHint.startsWith(chain + "_")
+      || chain.split("_")[0] === chainHint.split("_")[0];
+    if (!chainMatch) continue;
+
+    // Ticker must match
+    const tickerMatch = !tickerHint || ticker === tickerHint || ticker.includes(tickerHint) || tickerHint.includes(ticker);
+    if (!tickerMatch) continue;
+
+    // Prefer exact matches
+    const score = (chain === chainHint ? 2 : 1) + (ticker === tickerHint ? 2 : 1);
+    if (score > bestScore) { bestScore = score; best = a; }
+  }
+
+  if (!best) return null;
+
+  // Determine wallet type from the resolved asset
+  const walletType = (() => {
+    const c = (best.chain || best.id?.split(":")[0] || "").toLowerCase();
+    if (c.startsWith("bitcoin")) return "bitcoin";
+    if (c.startsWith("solana"))  return "solana";
+    if (c.startsWith("starknet"))return "starknet";
+    if (c.startsWith("tron"))    return "tron";
+    if (c.startsWith("sui"))     return "sui";
+    return "evm";
+  })();
+
+  return { assetId: best.id, walletType, meta: best };
+}
+
 app.post("/api/quote", async (req, res) => {
   const { fromChain, toChain, amount } = req.body;
-  const from = config.chains[fromChain]; const to = config.chains[toChain];
-  if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
-  try { res.json(await garden.getQuote(from.asset, to.asset, amount)); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  if (!fromChain || !toChain) return res.status(400).json({ error: "fromChain and toChain required" });
+
+  try {
+    // Support both old format ("bitcoin") and new swap format ("base:wbtc")
+    let fromAssetId, toAssetId;
+    if (fromChain.includes(":") || toChain.includes(":")) {
+      // New swap window format
+      const [fromRes, toRes] = await Promise.all([resolveAssetId(fromChain), resolveAssetId(toChain)]);
+      if (!fromRes) return res.status(400).json({ error: `Unknown asset: ${fromChain}` });
+      if (!toRes)   return res.status(400).json({ error: `Unknown asset: ${toChain}` });
+      fromAssetId = fromRes.assetId;
+      toAssetId   = toRes.assetId;
+    } else {
+      // Legacy format — chain key like "bitcoin", "base"
+      const from = config.chains[fromChain]; const to = config.chains[toChain];
+      if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
+      fromAssetId = from.asset; toAssetId = to.asset;
+    }
+    res.json(await garden.getQuote(fromAssetId, toAssetId, amount));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 app.post("/api/trade", async (req, res) => {
   const { fromChain, toChain, amount } = req.body;
   if (!fromChain || !toChain || !amount) return res.status(400).json({ error: "fromChain, toChain, amount required" });
-  const from = config.chains[fromChain]; const to = config.chains[toChain];
-  if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
-  res.json({ started: true });
-  runner.runRoute({ fromChain, toChain, fromAsset: from.asset, toAsset: to.asset, amount, label: `Chatbot: ${from.name} → ${to.name}` })
-    .catch(err => broadcast("error", { message: err.message }));
+
+  try {
+    let fromAssetId, toAssetId, fromWalletType, toWalletType, label;
+
+    if (fromChain.includes(":") || toChain.includes(":")) {
+      // New swap window format: "base:wbtc" → resolve to full asset ID
+      const [fromRes, toRes] = await Promise.all([resolveAssetId(fromChain), resolveAssetId(toChain)]);
+      if (!fromRes) return res.status(400).json({ error: `Unknown asset: ${fromChain}` });
+      if (!toRes)   return res.status(400).json({ error: `Unknown asset: ${toChain}` });
+      fromAssetId    = fromRes.assetId;
+      toAssetId      = toRes.assetId;
+      fromWalletType = fromRes.walletType;
+      toWalletType   = toRes.walletType;
+      label = `Swap: ${fromChain} → ${toChain}`;
+    } else {
+      // Legacy format
+      const from = config.chains[fromChain]; const to = config.chains[toChain];
+      if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
+      fromAssetId    = from.asset;
+      toAssetId      = to.asset;
+      fromWalletType = from.type === "evm" ? "evm" : fromChain;
+      toWalletType   = to.type   === "evm" ? "evm" : toChain;
+      label = `Swap: ${from.name} → ${to.name}`;
+    }
+
+    res.json({ started: true, fromAsset: fromAssetId, toAsset: toAssetId });
+    runner.runRoute({
+      fromChain: fromWalletType,
+      toChain:   toWalletType,
+      fromAsset: fromAssetId,
+      toAsset:   toAssetId,
+      amount:    parseInt(amount),
+      label,
+    }).catch(err => broadcast("error", { message: err.message }));
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ── ASSETS ────────────────────────────────────────────────────
@@ -387,30 +510,76 @@ const FREE_RPCS = {
   alpen_testnet:     "https://rpc.testnet.alpen.xyz",
 };
 
+// ERC20 balanceOf ABI (minimal)
+const ERC20_BALANCE_ABI = ["function balanceOf(address owner) view returns (uint256)", "function decimals() view returns (uint8)", "function symbol() view returns (string)"];
+
 app.post("/api/wallet/evm/balances", async (req, res) => {
   const { address } = req.body;
   if (!address) return res.status(400).json({ error: "address required" });
 
-  const results = {};
+  const results = {};       // chainPrefix → native wei (BigInt serialized as string)
+  const tokenResults = {};  // chainPrefix → { TICKER: formattedBalance }
   const rpcErrors = [];
+
+  // Build per-chain ERC20 token map from cached garden assets
+  const chainTokenMap = {}; // chainPrefix → [{id, ticker, token_address}]
+  const rawAssets = await getAssets().catch(() => null);
+  const assetList = (rawAssets?.result || rawAssets?.assets || (Array.isArray(rawAssets) ? rawAssets : []));
+  for (const a of assetList) {
+    const chainId = (a.chain || a.id?.split(':')[0] || '').toLowerCase();
+    const tokenAddr = a.token_address || a.tokenAddress;
+    const ticker = (a.asset || a.ticker || a.id?.split(':')[1] || '').toLowerCase();
+    if (!tokenAddr || tokenAddr === 'native' || tokenAddr === '0x0000000000000000000000000000000000000000') continue;
+    // Match chain to FREE_RPCS key
+    const rpcKey = Object.keys(FREE_RPCS).find(k => chainId.startsWith(k.split('_')[0]) || k.startsWith(chainId.split('_')[0]));
+    if (!rpcKey) continue;
+    if (!chainTokenMap[rpcKey]) chainTokenMap[rpcKey] = [];
+    // Avoid duplicates
+    if (!chainTokenMap[rpcKey].find(t => t.tokenAddr === tokenAddr)) {
+      chainTokenMap[rpcKey].push({ id: a.id, ticker, tokenAddr });
+    }
+  }
+
+  const { ethers } = require('ethers');
 
   await Promise.all(Object.entries(FREE_RPCS).map(async ([chainPrefix, rpcUrl]) => {
     try {
+      // Native balance
       const r = await axios.post(rpcUrl, {
         jsonrpc: "2.0", id: 1, method: "eth_getBalance",
         params: [address, "latest"]
       }, { timeout: 5000 });
       const hex = r.data?.result;
-      if (hex) results[chainPrefix] = parseInt(hex, 16);
+      if (hex) results[chainPrefix] = String(parseInt(hex, 16));
       else rpcErrors.push({ chain: chainPrefix, message: "No result from RPC" });
+
+      // ERC20 token balances for this chain
+      const tokens = chainTokenMap[chainPrefix] || [];
+      if (tokens.length && hex) {
+        const provider = new ethers.JsonRpcProvider(rpcUrl);
+        const tokenBals = {};
+        await Promise.all(tokens.map(async ({ ticker, tokenAddr }) => {
+          try {
+            const token = new ethers.Contract(tokenAddr, ERC20_BALANCE_ABI, provider);
+            const [bal, decimals] = await Promise.all([
+              token.balanceOf(address),
+              token.decimals().catch(() => 8)
+            ]);
+            const balNum = Number(bal);
+            const formatted = (balNum / Math.pow(10, Number(decimals))).toFixed(6);
+            tokenBals[ticker.toUpperCase()] = { raw: String(balNum), formatted, tokenAddr };
+          } catch (_) {}
+        }));
+        if (Object.keys(tokenBals).length) tokenResults[chainPrefix] = tokenBals;
+      }
     } catch(err) {
       rpcErrors.push({ chain: chainPrefix, message: err.message });
     }
   }));
 
   walletState.setEvmBalances(address, results);
-  console.log(`[evm balances] ${Object.keys(results).length} chains OK, ${rpcErrors.length} errors`);
-  res.json({ ok: true, address, balances: results, rpcErrors });
+  console.log(`[evm balances] ${Object.keys(results).length} chains OK, ${rpcErrors.length} errors, ${Object.values(tokenResults).reduce((s,t)=>s+Object.keys(t).length,0)} ERC20 balances`);
+  res.json({ ok: true, address, balances: results, tokenBalances: tokenResults, rpcErrors });
 });
 
 // ── RPC: update URL for a chain ──────────────────────────────
@@ -509,6 +678,44 @@ app.post("/api/wallet/disconnect", (req, res) => {
   res.json({ ok: true });
 });
 
+// Returns which chain types have an .env key configured
+app.get("/api/wallet/envkey-status", (req, res) => {
+  res.json({
+    evm:      envkey.isEvmAvailable()      ? { address: envkey.getEvmAddress()      } : null,
+    btc:      envkey.isBtcAvailable()      ? { address: envkey.getBtcAddress()       } : null,
+    solana:   envkey.isSolanaAvailable()   ? { address: envkey.getSolanaAddress()    } : null,
+    starknet: envkey.isStarknetAvailable() ? { address: envkey.getStarknetAddress()  } : null,
+    sui:      envkey.isSuiAvailable()      ? { address: envkey.getSuiAddress()       } : null,
+    tron:     envkey.isTronAvailable()     ? { address: envkey.getTronAddress()      } : null,
+  });
+});
+
+// Force-switch a chain type to use the .env key (overrides MetaMask/Privy)
+app.post("/api/wallet/use-envkey", (req, res) => {
+  const { type } = req.body;
+  try {
+    let addr = null;
+    if (type === 'evm' && envkey.isEvmAvailable()) {
+      addr = envkey.getEvmAddress();
+      walletState.disconnect('evm');
+      walletState.connectEnvKeyEvm(addr);
+    } else if (type === 'btc' && envkey.isBtcAvailable()) {
+      addr = envkey.getBtcAddress();
+      walletState.disconnect('btc');
+      walletState.connectEnvKeyBtc(addr, envkey.getBtcWif());
+    } else if (type === 'solana' && envkey.isSolanaAvailable()) {
+      addr = envkey.getSolanaAddress();
+      walletState.disconnect('solana');
+      walletState.connectEnvKeySolana(addr);
+    } else {
+      return res.status(400).json({ error: `No .env key configured for type: ${type}` });
+    }
+    res.json({ ok: true, address: addr, source: 'envkey' });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get("/api/wallet/balances", async (req, res) => {
   const btcAddr = walletState.getBtcAddress();
   if (btcAddr) {
@@ -520,7 +727,20 @@ app.get("/api/wallet/balances", async (req, res) => {
       walletState.connectBtc(btcAddr, walletState.getBtcWif(), (sats / 1e8).toFixed(8));
     } catch (_) {}
   }
-  res.json(walletState.getStatus());
+  // Return wallet status but NEVER expose private keys or full addresses from .env
+  const status = walletState.getStatus();
+  const safeStatus = JSON.parse(JSON.stringify(status));
+  // Redact: replace env-sourced addresses with shortened form so keys can't be harvested
+  for (const key of ['evm','btc','solana','starknet','sui','tron']) {
+    if (safeStatus[key]?.source === 'envkey' && safeStatus[key]?.address) {
+      const addr = safeStatus[key].address;
+      safeStatus[key].address = addr.slice(0,6) + '…' + addr.slice(-4);
+      safeStatus[key].addressRedacted = true;
+    }
+    // Never expose wif key
+    if (safeStatus[key]?.wif) delete safeStatus[key].wif;
+  }
+  res.json(safeStatus);
 });
 
 // ── START ─────────────────────────────────────────────────────

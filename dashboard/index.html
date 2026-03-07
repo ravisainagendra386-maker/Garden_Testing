@@ -125,15 +125,7 @@
   .modal-actions { display: flex; gap: 10px; }
 
   /* ── CHATBOT ── */
-  .chat-container { display: flex; flex-direction: column; height: calc(100vh - 130px); }
-  .chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-  .chat-bubble { max-width: 80%; padding: 12px 16px; border-radius: 12px; font-size: 13px; line-height: 1.5; }
-  .chat-bubble.bot { background: var(--bg3); border: 1px solid var(--border); align-self: flex-start; border-radius: 4px 12px 12px 12px; }
-  .chat-bubble.user { background: var(--accent); color: #000; align-self: flex-end; border-radius: 12px 12px 4px 12px; font-weight: 600; }
-  .chat-input-row { display: flex; gap: 10px; padding: 16px; border-top: 1px solid var(--border); }
-  .chat-input { flex: 1; background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; color: var(--text); font-family: inherit; font-size: 13px; outline: none; }
-  .chat-input:focus { border-color: var(--accent); }
-  .chat-suggestions { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 16px 12px; }
+  /* swap panel styles handled inline */
   .suggestion { padding: 5px 12px; border-radius: 20px; background: var(--bg3); border: 1px solid var(--border); font-size: 12px; cursor: pointer; color: var(--muted); transition: all .15s; }
   .suggestion:hover { color: var(--accent); border-color: var(--accent); }
 
@@ -220,6 +212,7 @@
       </div>
       <div class="status-dot" id="wsStatus" title="WebSocket disconnected"></div>
       <span style="font-size:12px;color:var(--muted)" id="wsLabel">Connecting…</span>
+
     </div>
   </header>
 
@@ -240,7 +233,7 @@
     </div>
     <div class="nav-section">Tools</div>
     <div class="nav-item" onclick="showPanel('chatbot')">
-      <span class="nav-icon">💬</span> Trade Chatbot
+      <span class="nav-icon">⇄</span> Swap
     </div>
     <div class="nav-item" onclick="showPanel('wallets')">
       <span class="nav-icon">💳</span> Connect Wallets <span id="walletCount" style="margin-left:auto;font-size:10px;background:rgba(34,197,94,.2);color:#22c55e;padding:1px 6px;border-radius:10px;display:none"></span>
@@ -378,35 +371,147 @@
 
     <!-- CHATBOT PANEL -->
     <div class="panel" id="panel-chatbot">
-      <h1 class="section-title">Trade Chatbot</h1>
-      <div class="chat-container card" style="padding:0">
-        <div class="chat-messages" id="chatMessages">
-          <div class="chat-bubble bot">
-            👋 Hi! I can initiate a trade on any Garden Finance route.<br><br>
-            Try: <b>"swap 50000 sats from Bitcoin to Arbitrum"</b><br>
-            Or: <b>"bridge BTC to Base"</b><br>
-            Or ask: <b>"what routes are available?"</b>
+      <h1 class="section-title">⇄ Swap</h1>
+      <div style="display:grid;grid-template-columns:480px 1fr;gap:20px;align-items:start">
+
+        <!-- ══ SWAP CARD ══ -->
+        <div class="card" style="padding:0;overflow:visible;position:relative">
+
+          <!-- SEND box -->
+          <div style="padding:16px 16px 10px;border-bottom:1px solid var(--border)">
+            <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:10px">Send</div>
+            <div style="display:flex;align-items:center;gap:0">
+              <!-- USD input -->
+              <div style="flex:1;display:flex;align-items:baseline;gap:4px;min-width:0">
+                <span style="font-size:24px;color:var(--muted);font-weight:700;flex-shrink:0">$</span>
+                <input id="sw-usd-amount" type="number" placeholder="0" oninput="swapUsdChanged()"
+                  style="flex:1;background:none;border:none;outline:none;color:var(--text);font-size:32px;font-family:'JetBrains Mono',monospace;font-weight:700;width:0;min-width:0">
+              </div>
+              <!-- Token button with dropdown anchor -->
+              <div id="sw-from-anchor" style="position:relative;flex-shrink:0">
+                <button id="sw-from-token-btn" onclick="openTokenPicker('from')"
+                  style="display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:8px 12px 8px 10px;cursor:pointer;white-space:nowrap;transition:border-color .15s"
+                  onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'">
+                  <span id="sw-from-token-icon" style="font-size:20px">🔘</span>
+                  <div style="text-align:left">
+                    <div id="sw-from-token-name" style="font-weight:700;font-size:14px;color:var(--text)">Select token</div>
+                    <div id="sw-from-chain-label" style="font-size:10px;color:var(--muted)">Choose chain</div>
+                  </div>
+                  <span style="color:var(--muted);font-size:12px">▾</span>
+                </button>
+              </div>
+            </div>
+            <!-- Token amount derived from USD -->
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px">
+              <span id="sw-from-token-amt" style="font-size:12px;color:var(--muted);font-family:'JetBrains Mono',monospace">≈ — token</span>
+              <div style="display:flex;gap:5px">
+                <button onclick="setSwUsd(1)"   style="font-size:10px;padding:2px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer">$1</button>
+                <button onclick="setSwUsd(10)"  style="font-size:10px;padding:2px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer">$10</button>
+                <button onclick="setSwUsd(100)" style="font-size:10px;padding:2px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer">$100</button>
+                <button onclick="setSwUsd(500)" style="font-size:10px;padding:2px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer">$500</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- FLIP button -->
+          <div style="display:flex;align-items:center;justify-content:center;height:0;position:relative;z-index:1">
+            <button onclick="swapDirection()" title="Flip"
+              style="position:absolute;background:var(--bg2);border:2px solid var(--border);border-radius:50%;width:34px;height:34px;cursor:pointer;font-size:15px;display:flex;align-items:center;justify-content:center;transition:all .2s"
+              onmouseenter="this.style.borderColor='var(--accent)';this.style.transform='rotate(180deg)'"
+              onmouseleave="this.style.borderColor='var(--border)';this.style.transform='rotate(0deg)'">⇅</button>
+          </div>
+
+          <!-- RECEIVE box -->
+          <div style="padding:16px 16px 14px;border-bottom:1px solid var(--border)">
+            <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:10px;margin-top:2px">Receive</div>
+            <div style="display:flex;align-items:center;gap:0">
+              <div id="sw-receive-amount" style="flex:1;font-size:28px;font-family:'JetBrains Mono',monospace;font-weight:700;color:var(--muted)">0</div>
+              <!-- Token button TO with dropdown anchor -->
+              <div id="sw-to-anchor" style="position:relative;flex-shrink:0">
+                <button id="sw-to-token-btn" onclick="openTokenPicker('to')"
+                  style="display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:8px 12px 8px 10px;cursor:pointer;white-space:nowrap;transition:border-color .15s"
+                  onmouseenter="this.style.borderColor='var(--accent)'" onmouseleave="this.style.borderColor='var(--border)'">
+                  <span id="sw-to-token-icon" style="font-size:20px">🔘</span>
+                  <div style="text-align:left">
+                    <div id="sw-to-token-name" style="font-weight:700;font-size:14px;color:var(--text)">Select token</div>
+                    <div id="sw-to-chain-label" style="font-size:10px;color:var(--muted)">Choose chain</div>
+                  </div>
+                  <span style="color:var(--muted);font-size:12px">▾</span>
+                </button>
+              </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-top:8px">
+              <span id="sw-receive-usd" style="font-size:12px;color:var(--muted)"></span>
+              <span id="sw-rate-display" style="font-size:12px;color:var(--muted)"></span>
+            </div>
+          </div>
+
+          <!-- QUOTE bar -->
+          <div id="sw-quote-bar" style="display:none;padding:10px 16px;border-bottom:1px solid var(--border);background:rgba(34,197,94,.04)">
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted)">
+              <span>Fee</span><span id="sw-fee" style="color:var(--text)">—</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:4px">
+              <span>Route</span><span id="sw-route-label" style="color:var(--cyan)">—</span>
+            </div>
+          </div>
+
+          <!-- ITERATIONS + ACTION -->
+          <div style="padding:14px 16px">
+            <!-- Iterations row -->
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+              <span style="font-size:12px;color:var(--muted);white-space:nowrap">Repeat swap</span>
+              <div style="display:flex;align-items:center;background:var(--bg3);border:1px solid var(--border);border-radius:8px;overflow:hidden">
+                <button onclick="changeIter(-1)" style="background:none;border:none;padding:6px 12px;color:var(--muted);cursor:pointer;font-size:16px;transition:color .15s" onmouseenter="this.style.color='var(--text)'" onmouseleave="this.style.color='var(--muted)'">−</button>
+                <span id="sw-iter-display" style="font-size:13px;font-weight:700;color:var(--text);min-width:24px;text-align:center">1</span>
+                <button onclick="changeIter(+1)" style="background:none;border:none;padding:6px 12px;color:var(--muted);cursor:pointer;font-size:16px;transition:color .15s" onmouseenter="this.style.color='var(--text)'" onmouseleave="this.style.color='var(--muted)'">+</button>
+              </div>
+              <span style="font-size:11px;color:var(--muted)" id="sw-iter-label">time</span>
+              <div style="margin-left:auto;display:flex;gap:6px">
+                <button onclick="setIter(1)"  style="font-size:10px;padding:3px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer" title="1x">1×</button>
+                <button onclick="setIter(5)"  style="font-size:10px;padding:3px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer" title="5x">5×</button>
+                <button onclick="setIter(10)" style="font-size:10px;padding:3px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer" title="10x">10×</button>
+                <button onclick="setIter(20)" style="font-size:10px;padding:3px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer" title="20x">20×</button>
+              </div>
+            </div>
+
+            <button id="sw-action-btn" onclick="swapExecute()"
+              style="width:100%;padding:15px;border-radius:14px;font-size:16px;font-weight:700;cursor:pointer;background:var(--bg3);border:1px solid var(--border);color:var(--muted);transition:all .2s"
+              disabled>Select tokens to swap</button>
+            <div id="sw-status" style="margin-top:8px;font-size:12px;text-align:center;color:var(--muted);min-height:16px"></div>
           </div>
         </div>
-        <div class="chat-suggestions" id="chatSuggestions">
-          <span class="suggestion" onclick="chatSend('swap BTC to Arbitrum')">BTC → Arbitrum</span>
-          <span class="suggestion" onclick="chatSend('swap BTC to Base')">BTC → Base</span>
-          <span class="suggestion" onclick="chatSend('swap BTC to MegaETH')">BTC → MegaETH</span>
-          <span class="suggestion" onclick="chatSend('swap BTC to Solana')">BTC → Solana</span>
-          <span class="suggestion" onclick="chatSend('what routes are available')">Available routes?</span>
-        </div>
-        <div class="chat-input-row">
-          <input class="chat-input" id="chatInput" placeholder="e.g. swap 50000 sats from Bitcoin to Arbitrum…" onkeydown="if(event.key==='Enter') chatSend()">
-          <button class="btn btn-green" onclick="chatSend()">Send</button>
+
+        <!-- ══ RIGHT PANEL ══ -->
+        <div style="display:flex;flex-direction:column;gap:14px">
+
+          <!-- Selected combinations -->
+          <div id="sw-pair-badge" class="card" style="padding:14px 16px;display:none">
+            <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px">Active Combinations</div>
+            <div id="sw-pair-route" style="font-size:13px;font-weight:700;line-height:1.7"></div>
+            <div id="sw-pair-limits" style="font-size:11px;color:var(--muted);margin-top:6px"></div>
+            <div id="sw-combo-count" style="font-size:11px;color:var(--cyan);margin-top:4px"></div>
+          </div>
+
+          <!-- Recent -->
+          <div class="card" style="padding:14px 16px">
+            <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:10px">Recent Swaps</div>
+            <div id="sw-recent" style="font-size:12px;color:var(--muted)">No swaps yet this session</div>
+          </div>
         </div>
       </div>
-    </div>
 
+<!-- token picker is now an inline dropdown -->
+    </div>
     <!-- CONNECT WALLETS PANEL -->
     <div class="panel" id="panel-wallets">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
         <h1 class="section-title" style="margin:0">💳 Connected Wallets</h1>
-        <span id="walletSummary" style="font-size:12px;color:var(--muted)">0/7 wallets connected</span>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span id="walletSummary" style="font-size:12px;color:var(--muted)">0/7 wallets connected</span>
+          <button id="walletRefreshBtn" onclick="refreshAllWalletBalances()" class="btn btn-ghost"
+            style="font-size:11px;padding:5px 12px" title="Refresh all wallet balances">🔄 Refresh Balances</button>
+        </div>
       </div>
       <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Connect your wallets to enable test execution across all Garden Finance chains.</p>
 
@@ -427,21 +532,21 @@
       <div class="wallet-group" id="wg-evm">
         <div class="wallet-group-header">
           <div style="display:flex;align-items:center;gap:10px">
-            <span style="font-size:18px">🦊</span>
+            <span style="font-size:18px" id="evm-wallet-icon">🔌</span>
             <div>
-              <div style="font-weight:700;font-size:14px">EVM Chains — MetaMask</div>
-              <div style="font-size:11px;color:var(--muted)">Covers 11 chains with one connection</div>
+              <div style="font-weight:700;font-size:14px">EVM Wallet <span id="evm-wallet-name" style="color:var(--muted);font-weight:400;font-size:12px"></span></div>
+              <div style="font-size:11px;color:var(--muted)">Covers 11 chains — MetaMask, OKX, Rabby, any injected wallet</div>
             </div>
           </div>
-          <div style="display:flex;align-items:center;gap:10px">
-            <span id="evm-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+          <div style="display:flex;align-items:center;gap:8px">
             <span id="evm-rpc-status" style="font-size:11px;color:var(--muted)"></span>
-            <button class="btn btn-green" id="evm-btn" onclick="connectMetaMask()" style="font-size:12px;padding:6px 14px">Connect MetaMask</button>
+            <code id="evm-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);cursor:pointer" onclick="copyAddr(this)" title="Click to copy">Not connected</code>
+            <button id="evm-expand-btn" onclick="toggleChainList()" style="background:none;border:none;color:var(--muted);font-size:16px;cursor:pointer;padding:2px 6px;display:none" title="Show balances">▾</button>
+            <button class="btn btn-green" id="evm-btn" onclick="showConnectModal()" style="font-size:12px;padding:6px 14px">Connect Wallet</button>
+            <button class="btn btn-ghost" id="evm-envkey-btn" onclick="useEnvKeyEvm()" style="font-size:11px;padding:5px 10px;display:none" title="Use .env private key">&#x1F510; .env</button>
           </div>
         </div>
-        <div class="chain-list" id="evm-chain-list">
-          <!-- populated by JS -->
-        </div>
+        <div id="evm-chain-list" style="display:none;margin-top:4px"></div>
       </div>
 
       <!-- BITCOIN GROUP -->
@@ -469,7 +574,7 @@
             <button class="btn btn-green" onclick="saveBtcWallet()" style="font-size:12px;padding:6px 14px">Save</button>
           </div>
         </div>
-        <div id="btc-status" style="font-size:12px;color:var(--muted);margin-top:8px;padding-top:8px"></div>
+        <div id="btc-status" style="font-size:12px;color:var(--muted);margin-top:8px;padding-top:8px;cursor:pointer" onclick="copyAddr(this)" title="Click to copy address"></div>
       </div>
 
       <!-- SOLANA GROUP -->
@@ -483,7 +588,7 @@
             </div>
           </div>
           <div style="display:flex;align-items:center;gap:10px">
-            <span id="sol-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <code id="sol-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);cursor:pointer" onclick="copyAddr(this)" title="Click to copy">Not connected</code>
             <span id="sol-balance" style="font-size:11px;color:var(--cyan)"></span>
             <button class="btn btn-green" id="sol-btn" onclick="connectPhantom()" style="font-size:12px;padding:6px 14px">Connect Phantom</button>
           </div>
@@ -501,7 +606,7 @@
             </div>
           </div>
           <div style="display:flex;align-items:center;gap:10px">
-            <span id="stark-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <code id="stark-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);cursor:pointer" onclick="copyAddr(this)" title="Click to copy">Not connected</code>
             <button class="btn btn-green" id="stark-btn" onclick="connectStarknet()" style="font-size:12px;padding:6px 14px">Connect ArgentX</button>
           </div>
         </div>
@@ -518,7 +623,7 @@
             </div>
           </div>
           <div style="display:flex;align-items:center;gap:10px">
-            <span id="sui-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <code id="sui-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);cursor:pointer" onclick="copyAddr(this)" title="Click to copy">Not connected</code>
             <button class="btn btn-green" id="sui-btn" onclick="connectSui()" style="font-size:12px;padding:6px 14px">Connect Sui</button>
           </div>
         </div>
@@ -535,7 +640,7 @@
             </div>
           </div>
           <div style="display:flex;align-items:center;gap:10px">
-            <span id="tron-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted)">Not connected</span>
+            <code id="tron-addr" style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);cursor:pointer" onclick="copyAddr(this)" title="Click to copy">Not connected</code>
             <button class="btn btn-green" id="tron-btn" onclick="connectTron()" style="font-size:12px;padding:6px 14px">Connect TronLink</button>
           </div>
         </div>
@@ -591,6 +696,14 @@
         Require manual approval before every transaction
       </label>
       <p style="font-size:12px;color:var(--muted);margin-top:8px">When enabled, a prompt appears before each transaction is sent on-chain.</p>
+
+      <!-- .env key status notification -->
+      <div id="envkey-notice" style="margin-top:18px;background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.3);border-radius:10px;padding:14px 16px">
+        <div style="font-weight:700;font-size:13px;color:var(--yellow);margin-bottom:8px">📄 .env Key Status</div>
+        <div id="envkey-notice-body" style="font-size:12px;color:var(--muted);line-height:1.7">
+          Loading .env key status…
+        </div>
+      </div>
     </div>
 
     <!-- LIVE LOG PANEL -->
@@ -630,18 +743,35 @@ let allChains = [];
 let suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
 
 // ── WEBSOCKET ──
+let _wsRetryDelay = 1000;
+let _wsConnected = false;
 function connectWS() {
+  if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
   const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
   const wsHost  = location.host || 'localhost:3001';
-  ws = new WebSocket(`${wsProto}://${wsHost}`);
+  try {
+    ws = new WebSocket(`${wsProto}://${wsHost}/ws`);
+  } catch(e) {
+    setWsStatus(false);
+    setTimeout(connectWS, _wsRetryDelay = Math.min(_wsRetryDelay * 2, 15000));
+    return;
+  }
   ws.onopen = () => {
+    _wsRetryDelay = 1000;
+    _wsConnected = true;
     setWsStatus(true);
     loadConfig();
     loadChains();
-    checkStuckOrders(); // check for stuck orders on connect
+    checkStuckOrders();
+    updateEnvKeyNotice();
   };
-  ws.onclose = () => { setWsStatus(false); setTimeout(connectWS, 3000); };
-  ws.onmessage = (e) => handleWsMessage(JSON.parse(e.data));
+  ws.onclose = () => {
+    _wsConnected = false;
+    setWsStatus(false);
+    setTimeout(connectWS, _wsRetryDelay = Math.min(_wsRetryDelay * 1.5, 10000));
+  };
+  ws.onerror = () => {}; // suppress console error; onclose fires after
+  ws.onmessage = (e) => { try { handleWsMessage(JSON.parse(e.data)); } catch(_) {} };
 }
 
 function setWsStatus(ok) {
@@ -694,7 +824,7 @@ function handleTestEnd({ label, status, error, steps }) {
     suiteStats.passed++;
   } else if (status === 'fail') {
     suiteStats.failed++;
-    addIssue('tech', 'critical', `Failed: ${label}`, error || 'See step log');
+    addIssue('tech', 'critical', `Failed: ${label}`, error || 'See step log', { steps, orderId: data.orderId });
   } else {
     suiteStats.skipped++;
     // Log meaningful skips to issues (not wallet-not-connected noise)
@@ -738,7 +868,72 @@ function handleSuiteEnd(d) {
 
 let _tradeableAbort = false;
 
+// ── Refresh all connected wallet balances ─────────────────────
+async function refreshAllWalletBalances() {
+  const btn = document.getElementById('walletRefreshBtn');
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Refreshing…'; }
+  const tasks = [];
+
+  // EVM
+  const addr = evmAddress || document.getElementById('evm-addr')?.dataset?.full;
+  if (addr && addr.startsWith('0x')) tasks.push(fetchEvmBalances(addr));
+
+  // BTC — fetch via /api/wallet/balances
+  tasks.push(fetch('/api/wallet/balances').then(r => r.json()).then(d => {
+    const btcBal = d.btc?.balance;
+    if (btcBal !== undefined) {
+      const btcEl = document.getElementById('btc-balance');
+      if (btcEl) btcEl.textContent = btcBal !== 'unknown' ? `${btcBal} BTC` : '—';
+    }
+    const solBal = d.solana?.balance;
+    if (solBal !== undefined) {
+      const solEl = document.getElementById('sol-balance');
+      if (solEl) solEl.textContent = solBal ? `${parseFloat(solBal).toFixed(4)} SOL` : '—';
+    }
+  }).catch(() => {}));
+
+  await Promise.allSettled(tasks);
+  if (btn) { btn.disabled = false; btn.textContent = '🔄 Refresh Balances'; }
+  updateEnvKeyNotice();
+}
+
+// ── .env key status notice in wallet panel ────────────────────
+async function updateEnvKeyNotice() {
+  const el = document.getElementById('envkey-notice-body');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/wallet/envkey-status');
+    const d = await r.json();
+    const rows = [];
+    const keys = [
+      { key: 'evm',      label: 'EVM (EVM_PRIVATE_KEY)',         varName: 'EVM_PRIVATE_KEY' },
+      { key: 'btc',      label: 'Bitcoin (BTC_PRIVATE_KEY_WIF)', varName: 'BTC_PRIVATE_KEY_WIF' },
+      { key: 'solana',   label: 'Solana (SOLANA_PRIVATE_KEY)',   varName: 'SOLANA_PRIVATE_KEY' },
+      { key: 'starknet', label: 'Starknet',                      varName: 'STARKNET_PRIVATE_KEY' },
+      { key: 'sui',      label: 'Sui (SUI_PRIVATE_KEY)',         varName: 'SUI_PRIVATE_KEY' },
+      { key: 'tron',     label: 'Tron (TRON_PRIVATE_KEY)',       varName: 'TRON_PRIVATE_KEY' },
+    ];
+    for (const { key, label, varName } of keys) {
+      const v = d[key];
+      if (v && v.address) {
+        const addr = v.address;
+        const shortAddr = addr.length > 16 ? addr.slice(0,10)+'…'+addr.slice(-6) : addr;
+        rows.push(`<span style="color:var(--green)">✅ ${label}</span> — <code style="background:var(--bg3);padding:1px 5px;border-radius:3px;font-size:11px">${shortAddr}</code>`);
+      } else {
+        rows.push(`<span style="color:var(--muted)">⬜ ${label}</span> — <span style="color:var(--muted);font-size:11px">not set — add <code style="background:var(--bg3);padding:1px 4px;border-radius:3px">${varName}</code> to .env</span>`);
+      }
+    }
+    el.innerHTML = rows.join('<br>');
+  } catch(e) {
+    el.textContent = 'Could not load .env key status.';
+  }
+}
+
 async function stopAll() {
+  // Reset dashboard Run All button
+  const dashBtn = document.getElementById('btnRunAll');
+  if (dashBtn) { dashBtn.disabled = false; dashBtn.innerHTML = '▶ Run All Tests'; }
+  document.getElementById('btnStop').style.display = 'none';
   _tradeableAbort = true; // stop the client-side tradeable loop
   await fetch('/api/abort', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({}) });
   document.getElementById('btnStop').style.display = 'none';
@@ -770,44 +965,44 @@ function handleApiTestsDone(results) {
 }
 
 async function handleEvmTxRequest({ id, orderId, label, to, data, value, chainId, gasLimit }) {
-  // Garden sends a pre-built tx — we need to send it via MetaMask
-  if (!window.ethereum) {
-    addIssue('tech', 'critical', 'MetaMask required', 'EVM HTLC needs MetaMask to sign. Connect MetaMask first.');
+  const provider = window._evmProvider;
+  if (!provider) {
+    addIssue('tech', 'critical', 'EVM wallet required', 'Connect an EVM wallet (MetaMask, OKX, Rabby…) first.');
     await fetch('/api/evm-tx-response', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ id, txHash: false }) });
     return;
   }
   try {
-    // Switch to the right chain first
     const chainHex = '0x' + parseInt(chainId).toString(16);
-    try { await window.ethereum.request({ method:'wallet_switchEthereumChain', params:[{chainId: chainHex}] }); }
-    catch(switchErr) { console.warn('Chain switch failed:', switchErr.message); }
+    const chainName = EVM_CHAINS.find(c => c.chainId.toLowerCase() === chainHex.toLowerCase())?.name || chainHex;
 
-    logEvent('info', { label: `🦊 MetaMask: sign EVM HTLC for ${label}` });
-    const accounts = await window.ethereum.request({ method:'eth_requestAccounts' });
-    const txHash = await window.ethereum.request({
+    logEvent('info', { label: `🔀 Switching ${window._evmWalletName || 'wallet'} to ${chainName}…` });
+    await ensureChain(chainHex);
+
+    logEvent('info', { label: `🔏 ${window._evmWalletName || 'Wallet'}: sign EVM HTLC for ${label} on ${chainName}` });
+    const accounts = await provider.request({ method: 'eth_requestAccounts' });
+    const txHash = await provider.request({
       method: 'eth_sendTransaction',
       params: [{
-        from:     accounts[0],
+        from:  accounts[0],
         to,
         data,
-        value:    value || '0x0',
-        gas:      gasLimit || '0x493e0',
-        chainId:  chainHex,
+        value: value || '0x0',
+        gas:   gasLimit || '0x493e0',
       }]
     });
     await fetch('/api/evm-tx-response', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ id, txHash }) });
-    logEvent('info', { label: `✅ EVM HTLC sent: ${txHash}` });
+    logEvent('info', { label: `✅ EVM HTLC sent on ${chainName}: ${txHash}` });
   } catch(err) {
-    addIssue('tech', 'warning', `MetaMask rejected: ${label}`, err.message);
+    addIssue('tech', 'warning', `Wallet rejected: ${label}`, err.message);
     await fetch('/api/evm-tx-response', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ id, txHash: false }) });
   }
 }
 
 async function handleEvmSignRequest({ id, orderId, label, signData, chainId }) {
-  if (!window.ethereum) {
+  if (!window._evmProvider) {
     addIssue('tech', 'critical', 'MetaMask required', 'EIP-712 signing needs MetaMask.');
     await fetch('/api/evm-sign-response', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ id, signature: false }) });
@@ -816,15 +1011,16 @@ async function handleEvmSignRequest({ id, orderId, label, signData, chainId }) {
   try {
     // Switch to correct chain
     const chainHex = '0x' + parseInt(chainId).toString(16);
-    try { await window.ethereum.request({ method:'wallet_switchEthereumChain', params:[{chainId: chainHex}] }); }
-    catch(e) { console.warn('Chain switch:', e.message); }
+    const chainName = EVM_CHAINS.find(c => c.chainId.toLowerCase() === chainHex.toLowerCase())?.name || chainHex;
+    logEvent('info', { label: `🔀 Switching ${window._evmWalletName||'wallet'} to ${chainName} for EIP-712…` });
+    await ensureChain(chainHex);
 
-    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
-    logEvent('info', { label: `✍️ MetaMask: sign EIP-712 for ${label} (gasless)` });
+    const accounts = await window._evmProvider.request({ method: 'eth_requestAccounts' });
+    logEvent('info', { label: `✍️ ${window._evmWalletName||'Wallet'}: sign EIP-712 for ${label} (gasless)` });
 
     // eth_signTypedData_v4 expects (address, JSON string of typed data)
     const typedDataStr = typeof signData === 'string' ? signData : JSON.stringify(signData);
-    const signature = await window.ethereum.request({
+    const signature = await window._evmProvider.request({
       method: 'eth_signTypedData_v4',
       params: [accounts[0], typedDataStr],
     });
@@ -941,23 +1137,63 @@ function addIssue(type, severity, title, detail, meta = {}) {
   badge.style.display = 'inline';
 }
 
+// Track which issues are expanded
+const _issueExpanded = new Set();
+
+function toggleIssueExpand(idx) {
+  if (_issueExpanded.has(idx)) _issueExpanded.delete(idx);
+  else _issueExpanded.add(idx);
+  renderIssues(_currentIssueFilter || 'all');
+}
+
+let _currentIssueFilter = 'all';
+
 function renderIssues(filter = 'all') {
+  _currentIssueFilter = filter;
   const list = document.getElementById('issueList');
   const filtered = filter === 'all' ? issues : issues.filter(i => i.type === filter || i.severity === filter);
   if (!filtered.length) { list.innerHTML = '<div class="empty-state">No issues detected yet — run tests first</div>'; return; }
-  list.innerHTML = filtered.map(i => `
-    <div class="issue-item">
+  list.innerHTML = filtered.map((i, idx) => {
+    const expanded = _issueExpanded.has(idx);
+    // If issue has steps (linked to a test run), show them in the dropdown
+    const hasSteps = i.meta?.steps && i.meta.steps.length > 0;
+    const hasExtra = hasSteps || i.meta?.orderId || i.meta?.txHash;
+
+    const stepsHtml = hasSteps ? i.meta.steps.map(st => {
+      const icon = st.status === 'pass' ? '✅' : st.status === 'fail' ? '❌' : st.status === 'running' ? '⏳' : '⏸';
+      const col  = st.status === 'pass' ? 'var(--green)' : st.status === 'fail' ? 'var(--red)' : st.status === 'running' ? 'var(--yellow)' : 'var(--muted)';
+      const txLink = st.txHash && st.txHash.startsWith('0x') ? ` <a href="#" style="color:var(--cyan);font-size:10px" onclick="event.stopPropagation()">${st.txHash.slice(0,10)}…</a>` : '';
+      return `<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.04)">
+        <span style="flex-shrink:0;width:18px">${icon}</span>
+        <div style="flex:1">
+          <span style="font-weight:600;font-size:12px;color:${col}">${st.name}</span>${txLink}
+          ${st.detail ? `<div style="font-size:11px;color:var(--muted);margin-top:1px">${st.detail}</div>` : ''}
+        </div>
+        <span style="font-size:10px;color:var(--muted);flex-shrink:0">${st.ts ? st.ts.split('T')[1]?.slice(0,8) : ''}</span>
+      </div>`;
+    }).join('') : '';
+
+    const extraHtml = i.meta?.orderId ? `<div style="font-size:11px;color:var(--muted);margin-top:6px">Order: <code style="color:var(--cyan)">${i.meta.orderId}</code></div>` : '';
+
+    return `<div class="issue-item" style="cursor:${hasExtra?'pointer':'default'}" onclick="${hasExtra ? `toggleIssueExpand(${idx})` : ''}">
       <div class="issue-header">
-        <span class="issue-title">${i.title}</span>
-        <div style="display:flex;align-items:center;gap:8px">
-          ${i.type === 'rpc' && i.meta?.chain ? `<button class="btn btn-ghost" onclick="openRpcModal('${i.meta.chain}')"
+        <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0">
+          ${hasExtra ? `<span style="color:var(--muted);font-size:12px;transition:transform .2s;display:inline-block;transform:rotate(${expanded?90:0}deg)">▶</span>` : ''}
+          <span class="issue-title" style="flex:1">${i.title}</span>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
+          ${i.type === 'rpc' && i.meta?.chain ? `<button class="btn btn-ghost" onclick="event.stopPropagation();openRpcModal('${i.meta.chain}')"
             style="font-size:10px;padding:2px 8px;border-color:var(--cyan);color:var(--cyan)">🔧 Fix RPC</button>` : ''}
           <span class="badge sev-${i.severity}">${i.severity.toUpperCase()}</span>
         </div>
       </div>
       <div class="issue-detail">${i.detail}</div>
       <div style="font-size:11px;color:var(--muted);margin-top:4px">${i.type.toUpperCase()} · ${i.ts}</div>
-    </div>`).join('');
+      ${expanded && hasExtra ? `<div style="margin-top:10px;background:var(--bg3);border-radius:8px;padding:10px 12px">
+        ${stepsHtml}${extraHtml}
+      </div>` : ''}
+    </div>`;
+  }).join('');
 }
 
 function filterIssues(f) { renderIssues(f); }
@@ -1054,89 +1290,716 @@ function toggleManualApprove() {
 }
 
 // ── CHATBOT ──
-const chainAliases = {
-  btc: 'bitcoin', bitcoin: 'bitcoin', arbitrum: 'arbitrum', arb: 'arbitrum',
-  base: 'base', solana: 'solana', sol: 'solana', ethereum: 'ethereum', eth: 'ethereum',
-  megaeth: 'megaeth', mega: 'megaeth', bnb: 'bnbchain', bsc: 'bnbchain',
-  berachain: 'berachain', bera: 'berachain', unichain: 'unichain', uni: 'unichain',
-  hyperevm: 'hyperevm', hyper: 'hyperevm', corn: 'corn', botanix: 'botanix',
-  core: 'core', starknet: 'starknet', stark: 'starknet', sui: 'sui', tron: 'tron',
+// ═══════════════════════════════════════════════════════════
+// SWAP ENGINE v3 — Chain-first multi-select
+// ═══════════════════════════════════════════════════════════
+
+const CHAIN_META = {
+  // key must match the normalised chain prefix from Garden API
+  bitcoin:    { icon: '₿',  label: 'Bitcoin Testnet' },
+  litecoin:   { icon: 'Ł',  label: 'Litecoin Testnet' },
+  ethereum:   { icon: '⬡',  label: 'Ethereum Sepolia' },
+  arbitrum:   { icon: '🔵', label: 'Arbitrum Sepolia' },
+  base:       { icon: '🔷', label: 'Base Sepolia' },
+  bnbchain:   { icon: '🟡', label: 'BNB Testnet' },
+  solana:     { icon: '◎',  label: 'Solana Devnet' },
+  starknet:   { icon: '🌐', label: 'Starknet Testnet' },
+  sui:        { icon: '💧', label: 'Sui Testnet' },
+  tron:       { icon: '🔴', label: 'Tron Testnet' },
+  hyperevm:   { icon: '⚡', label: 'HyperEVM Testnet' },
+  megaeth:    { icon: '🚀', label: 'MegaETH Testnet' },
+  berachain:  { icon: '🐻', label: 'Berachain Testnet' },
+  unichain:   { icon: '🦄', label: 'Unichain Sepolia' },
+  corn:       { icon: '🌽', label: 'Corn Testnet' },
+  botanix:    { icon: '🌿', label: 'Botanix Testnet' },
+  core:       { icon: '⚙️', label: 'Core Testnet' },
+  citrea:     { icon: '🟠', label: 'Citrea Testnet' },
+  alpen:      { icon: '🏔️', label: 'Alpen Signet' },
+  monad:      { icon: '🟣', label: 'Monad Testnet' },
 };
 
-function botMsg(text) {
-  const msgs = document.getElementById('chatMessages');
-  msgs.innerHTML += `<div class="chat-bubble bot">${text}</div>`;
-  msgs.scrollTop = msgs.scrollHeight;
+const ASSET_META = {
+  btc:   { icon: '₿',  color: '#f7931a', name: 'Bitcoin',             coingeckoId: 'bitcoin' },
+  ltc:   { icon: 'Ł',  color: '#345d9d', name: 'Litecoin',            coingeckoId: 'litecoin' },
+  wbtc:  { icon: '🔶', color: '#f09242', name: 'Wrapped BTC',         coingeckoId: 'wrapped-bitcoin' },
+  cbtc:  { icon: '🟧', color: '#e8703a', name: 'Canonical BTC',       coingeckoId: 'bitcoin' },
+  cbbtc: { icon: '🔵', color: '#0052ff', name: 'Coinbase Wrapped BTC',coingeckoId: 'coinbase-wrapped-btc' },
+  sbtc:  { icon: '🟫', color: '#c0883d', name: 'Synthetic BTC',       coingeckoId: 'bitcoin' },
+  lbtc:  { icon: '🟪', color: '#7c3aed', name: 'Liquid BTC',          coingeckoId: 'bitcoin' },
+  eth:   { icon: '⬡',  color: '#627eea', name: 'Ethereum',            coingeckoId: 'ethereum' },
+  weth:  { icon: '🔷', color: '#627eea', name: 'Wrapped ETH',         coingeckoId: 'ethereum' },
+  usdc:  { icon: '💵', color: '#2775ca', name: 'USD Coin',            coingeckoId: 'usd-coin' },
+  usdt:  { icon: '💚', color: '#26a17b', name: 'Tether',              coingeckoId: 'tether' },
+  bnb:   { icon: '🟡', color: '#f0b90b', name: 'BNB',                 coingeckoId: 'binancecoin' },
+  sol:   { icon: '◎',  color: '#9945ff', name: 'Solana',              coingeckoId: 'solana' },
+  sui:   { icon: '💧', color: '#4da2ff', name: 'Sui',                 coingeckoId: 'sui' },
+  trx:   { icon: '🔴', color: '#eb0029', name: 'Tron',                coingeckoId: 'tron' },
+  cbltc: { icon: '🔷', color: '#0052ff', name: 'Coinbase Wrapped LTC', coingeckoId: 'litecoin' },
+  wltc:  { icon: 'Ł',  color: '#345d9d', name: 'Wrapped Litecoin',     coingeckoId: 'litecoin' },
+  xbtc:  { icon: '🟠', color: '#ff6b35', name: 'xBTC',                 coingeckoId: 'bitcoin' },
+  hbtc:  { icon: '🟡', color: '#f0b90b', name: 'Huobi BTC',            coingeckoId: 'bitcoin' },
+  tbtc:  { icon: '🟤', color: '#7b4f2e', name: 'tBTC',                 coingeckoId: 'tbtc' },
+  rbtc:  { icon: '🔶', color: '#e8703a', name: 'RBTC',                 coingeckoId: 'bitcoin' },
+};
+
+// Maps Garden API chain IDs → our CHAIN_META key
+// Handles all the testnet suffix variants Garden uses
+const CHAIN_ID_MAP = {
+  'bitcoin_testnet4':    'bitcoin',
+  'bitcoin_testnet':     'bitcoin',
+  'bitcoin_signet':      'bitcoin',
+  'bitcoin_mainnet':     'bitcoin',
+  'bitcoin':             'bitcoin',
+  'litecoin_testnet':    'litecoin',
+  'litecoin':            'litecoin',
+  'ethereum_sepolia':    'ethereum',
+  'ethereum_mainnet':    'ethereum',
+  'ethereum':            'ethereum',
+  'arbitrum_sepolia':    'arbitrum',
+  'arbitrum_mainnet':    'arbitrum',
+  'arbitrum':            'arbitrum',
+  'base_sepolia':        'base',
+  'base_mainnet':        'base',
+  'base':                'base',
+  'bnbchain_testnet':    'bnbchain',
+  'bnbchain_mainnet':    'bnbchain',
+  'bnbchain':            'bnbchain',
+  'solana_devnet':       'solana',
+  'solana_mainnet':      'solana',
+  'solana':              'solana',
+  'starknet_testnet':    'starknet',
+  'starknet_mainnet':    'starknet',
+  'starknet':            'starknet',
+  'sui_testnet':         'sui',
+  'sui_mainnet':         'sui',
+  'sui':                 'sui',
+  'tron_testnet':        'tron',
+  'tron_mainnet':        'tron',
+  'tron':                'tron',
+  'hyperevm_testnet':    'hyperevm',
+  'hyperevm':            'hyperevm',
+  'megaeth_testnet':     'megaeth',
+  'megaeth':             'megaeth',
+  'berachain_testnet':   'berachain',
+  'berachain':           'berachain',
+  'unichain_sepolia':    'unichain',
+  'unichain':            'unichain',
+  'corn_testnet':        'corn',
+  'corn':                'corn',
+  'botanix_testnet':     'botanix',
+  'botanix':             'botanix',
+  'core_testnet':        'core',
+  'core':                'core',
+  'citrea_testnet':      'citrea',
+  'citrea':              'citrea',
+  'alpen_signet':        'alpen',
+  'alpen_testnet':       'alpen',
+  'alpen':               'alpen',
+  'monad_testnet':       'monad',
+  'monad':               'monad',
+  // Numeric EVM chain IDs (from Garden API evm:CHAINID format)
+  '84532':   'base',       // Base Sepolia
+  '8453':    'base',       // Base Mainnet
+  '421614':  'arbitrum',   // Arbitrum Sepolia
+  '42161':   'arbitrum',   // Arbitrum Mainnet
+  '11155111':'ethereum',   // Ethereum Sepolia
+  '1':       'ethereum',   // Ethereum Mainnet
+  '97':      'bnbchain',   // BNB Testnet
+  '56':      'bnbchain',   // BNB Mainnet
+  '10143':   'monad',      // Monad Testnet
+  '8150':    'botanix',    // Botanix Testnet
+  '5115':    'core',       // Core Testnet
+  '21000001':'corn',       // Corn Testnet
+  '998':     'hyperevm',   // HyperEVM Testnet
+  '80069':   'berachain',  // Berachain Testnet
+  '1301':    'unichain',   // Unichain Sepolia
+  '5003':    'megaeth',    // MegaETH Testnet
+  '3636':    'botanix',    // Botanix alt
+};
+
+// Normalize raw chain string from Garden API to a CHAIN_META key
+function normalizeChain(raw) {
+  raw = (raw||'').toLowerCase().trim();
+  // Handle "evm:84532" style — extract numeric chainId part
+  if (raw.startsWith('evm:')) {
+    const chainId = raw.split(':')[1];
+    if (CHAIN_ID_MAP[chainId]) return CHAIN_ID_MAP[chainId];
+  }
+  // Direct map lookup first
+  if (CHAIN_ID_MAP[raw]) return CHAIN_ID_MAP[raw];
+  // Try stripping common suffixes
+  const stripped = raw.replace(/_testnet\d*|_sepolia|_mainnet|_signet|_devnet/g, '');
+  if (CHAIN_ID_MAP[stripped]) return CHAIN_ID_MAP[stripped];
+  if (CHAIN_META[stripped])   return stripped;
+  // Prefix match against CHAIN_META keys
+  return Object.keys(CHAIN_META).find(k => raw.startsWith(k) || k === stripped.split('_')[0]) || raw;
 }
 
-function userMsg(text) {
-  const msgs = document.getElementById('chatMessages');
-  msgs.innerHTML += `<div class="chat-bubble user">${text}</div>`;
-  msgs.scrollTop = msgs.scrollHeight;
+// State
+let swState = {
+  // Each side stores: selectedChains (Set of chainKeys), selectedAssets (Set of assetIds, empty=all for chain)
+  from: { chains: new Set(), assets: new Set() },
+  to:   { chains: new Set(), assets: new Set() },
+  quote: null,
+  activeSide: null,
+  iterations: 1,
+};
+
+let swAllAssets = [];   // [{id, rawChain, chainKey, chainLabel, ticker, name, icon, color, chainIcon, raw}]
+let swChainKeys  = [];  // ordered list of unique chainKey strings found in assets
+
+// ── Build asset data from gardenAssets ──
+function buildSwapData() {
+  const seenChains = new Set();
+  swAllAssets = [];
+  swChainKeys  = [];
+  for (const a of gardenAssets) {
+    const rawChain = (a.chain || a.id?.split(':')[0] || '').toLowerCase();
+    const chainKey = normalizeChain(rawChain);
+    const ticker   = (a.asset || a.ticker || a.id?.split(':')[1] || '').toLowerCase();
+    if (!ticker || !chainKey) continue;
+    const m  = ASSET_META[ticker] || {};
+    const cm = CHAIN_META[chainKey] || { icon: '🔘', label: chainKey.replace(/_/g,' ').replace(/\w/g,c=>c.toUpperCase()) };
+    swAllAssets.push({ id: a.id, rawChain, chainKey, chainLabel: cm.label,
+      ticker, name: m.name || a.name || a.asset_name || ticker.toUpperCase(), icon: m.icon || '🔸',
+      color: m.color || '#888', chainIcon: cm.icon, raw: a });
+    if (!seenChains.has(chainKey)) { seenChains.add(chainKey); swChainKeys.push(chainKey); }
+  }
+  console.log('[swap] built', swAllAssets.length, 'assets across', swChainKeys.length, 'chains:', swChainKeys);
 }
 
-function chatSend(msg) {
-  const input = document.getElementById('chatInput');
-  const text = msg || input.value.trim();
-  if (!text) return;
-  input.value = '';
-  userMsg(text);
-  processChatCommand(text.toLowerCase());
+// ── USD Price System ──
+const _USD_PRICES = {};        // ticker → USD price
+let   _USD_PRICES_TS = 0;      // last fetch timestamp
+const _USD_PRICE_TTL = 60000;  // 1 min cache
+
+const COINGECKO_IDS = Object.fromEntries(
+  Object.entries(ASSET_META).map(([k,v]) => [k, v.coingeckoId]).filter(([,v])=>v)
+);
+
+async function fetchUsdPrices(tickers) {
+  if (!tickers.length) return;
+  const now = Date.now();
+  if (now - _USD_PRICES_TS < _USD_PRICE_TTL) return; // still fresh
+  try {
+    const ids = [...new Set(tickers.map(t => COINGECKO_IDS[t]).filter(Boolean))].join(',');
+    if (!ids) return;
+    const r = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd`, { cache: 'no-store' });
+    const d = await r.json();
+    for (const [ticker, cgId] of Object.entries(COINGECKO_IDS)) {
+      if (d[cgId]?.usd) _USD_PRICES[ticker] = d[cgId].usd;
+    }
+    // Stablecoins
+    _USD_PRICES['usdc'] = _USD_PRICES['usdc'] || 1;
+    _USD_PRICES['usdt'] = _USD_PRICES['usdt'] || 1;
+    _USD_PRICES_TS = now;
+    updateUsdDisplays();
+  } catch(e) {
+    // Use fallback prices if CoinGecko fails
+    const fallback = { btc:95000, ltc:80, eth:3200, wbtc:95000, cbtc:95000, cbbtc:95000, sbtc:95000, lbtc:95000, bnb:600, sol:140, usdc:1, usdt:1, sui:2, trx:0.12 };
+    Object.assign(_USD_PRICES, fallback);
+    _USD_PRICES_TS = now;
+    updateUsdDisplays();
+  }
 }
 
-async function processChatCommand(text) {
-  // Routes query
-  if (text.includes('available') || text.includes('routes') || text.includes('chains')) {
-    const chains = allChains.map(c => c.name).join(', ');
-    botMsg(`Available chains: <b>${chains}</b><br><br>All routes go through Bitcoin as the source or destination.`);
-    return;
+function getUsdPrice(ticker) {
+  return _USD_PRICES[ticker?.toLowerCase()] || 0;
+}
+
+function usdToAtomic(usd, ticker) {
+  const price = getUsdPrice(ticker);
+  if (!price || !usd) return 0;
+  const amount = usd / price;  // amount in native token units
+  return Math.round(amount * 1e8);
+}
+
+function atomicToUsd(atomic, ticker) {
+  const price = getUsdPrice(ticker);
+  if (!price) return null;
+  return (atomic / 1e8) * price;
+}
+
+function updateUsdDisplays() {
+  const fromPairs = getEffectivePairs('from');
+  const toPairs   = getEffectivePairs('to');
+  const usdAmt = parseFloat(document.getElementById('sw-usd-amount')?.value) || 0;
+  const fromTicker = fromPairs.length === 1 ? fromPairs[0].ticker : null;
+
+  if (fromTicker && usdAmt > 0) {
+    const price = getUsdPrice(fromTicker);
+    const tokenAmt = price > 0 ? (usdAmt / price) : 0;
+    const fmtAmt = tokenAmt < 0.0001 ? tokenAmt.toExponential(3) : tokenAmt.toFixed(6);
+    document.getElementById('sw-from-token-amt').textContent = price > 0
+      ? `≈ ${fmtAmt} ${fromTicker.toUpperCase()} @ $${price.toLocaleString()}`
+      : `No price data for ${fromTicker.toUpperCase()}`;
   }
 
-  // Quote query
-  if (text.includes('quote') || text.includes('how much')) {
-    const match = parseRoute(text);
-    if (!match) { botMsg("I couldn't parse that. Try: <b>quote 50000 sats BTC to Arbitrum</b>"); return; }
-    botMsg(`⏳ Getting quote for ${match.fromName} → ${match.toName}…`);
-    const q = await fetch('/api/quote', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ fromChain: match.from, toChain: match.to, amount: match.amount }) }).then(r=>r.json());
-    if (q.error) { botMsg(`❌ ${q.error}`); return; }
-    const out = q.result?.output_amount || q.result?.to_amount;
-    botMsg(`📊 Quote: <b>${match.amount}</b> ${match.fromName} → <b>~${out}</b> ${match.toName}`);
-    return;
+  // Update receive-side USD estimate from quote
+  const receiveEl = document.getElementById('sw-receive-usd');
+  if (receiveEl && swState.quote?.out) {
+    const toTicker = toPairs.length === 1 ? toPairs[0].ticker : null;
+    if (toTicker) {
+      const rcvUsd = atomicToUsd(Number(swState.quote.out), toTicker);
+      receiveEl.textContent = rcvUsd ? `≈ $${rcvUsd.toFixed(2)}` : '';
+    }
   }
-
-  // Initiate trade
-  if (text.includes('swap') || text.includes('bridge') || text.includes('trade') || text.includes('send')) {
-    const match = parseRoute(text);
-    if (!match) { botMsg("I couldn't parse that. Try: <b>swap 50000 sats from Bitcoin to Arbitrum</b>"); return; }
-    botMsg(`🚀 Initiating trade: <b>${match.fromName} → ${match.toName}</b> with amount <b>${match.amount}</b>…`);
-    const r = await fetch('/api/trade', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ fromChain: match.from, toChain: match.to, amount: match.amount }) }).then(r=>r.json());
-    if (r.error) { botMsg(`❌ ${r.error}`); return; }
-    botMsg(`✅ Test trade started! Switch to <b>Dashboard</b> or <b>Live Log</b> to monitor progress.`);
-    return;
-  }
-
-  botMsg(`I can help you:<br>• <b>swap BTC to Arbitrum</b> — initiate a test trade<br>• <b>quote 50000 sats BTC to Base</b> — get a price quote<br>• <b>what routes are available?</b> — list all chains`);
 }
 
-function parseRoute(text) {
-  const amountMatch = text.match(/(\d+)/);
-  const amount = amountMatch ? parseInt(amountMatch[1]) : 50000;
-  let from = null, to = null;
-  const words = text.split(/\s+/);
-  let foundFrom = false;
-  for (const w of words) {
-    const chain = chainAliases[w.replace(/[^a-z]/g,'')];
-    if (chain && !foundFrom) { from = chain; foundFrom = true; }
-    else if (chain && foundFrom) { to = chain; break; }
-  }
-  if (!from || !to) return null;
-  const fromName = allChains.find(c => c.id === from)?.name || from;
-  const toName = allChains.find(c => c.id === to)?.name || to;
-  return { from, to, amount, fromName, toName };
+// Called when USD input changes
+function swapUsdChanged() {
+  clearTimeout(_quoteDebounce);
+  _quoteDebounce = setTimeout(() => {
+    updateUsdDisplays();
+    const fromPairs = getEffectivePairs('from');
+    const toPairs   = getEffectivePairs('to');
+    if (fromPairs.length && toPairs.length) {
+      const usd = parseFloat(document.getElementById('sw-usd-amount').value);
+      if (usd > 0) {
+        const fromTicker = fromPairs[0].ticker;
+        const atomic = usdToAtomic(usd, fromTicker);
+        if (atomic > 0) fetchSwapQuote(fromPairs[0].id, toPairs[0].id, atomic);
+        else { document.getElementById('sw-receive-amount').textContent = '0'; swState.quote = null; }
+      } else {
+        document.getElementById('sw-receive-amount').textContent = '0';
+        swState.quote = null;
+      }
+    }
+    updateSwapBtn();
+  }, 500);
 }
 
+function setSwUsd(val) {
+  document.getElementById('sw-usd-amount').value = val;
+  swapUsdChanged();
+}
+
+function initSwapPanel() {
+  swState.iterations = 1; updateIterDisplay();
+  swState.from = { chains: new Set(), assets: new Set() };
+  swState.to   = { chains: new Set(), assets: new Set() };
+  if (gardenAssets.length) { buildSwapData(); }
+  else fetch('/api/assets').then(r=>r.json()).then(d => {
+    gardenAssets = d.result || d.assets || d || [];
+    buildSwapData(); renderSideSelector('from'); renderSideSelector('to');
+  }).catch(()=>{});
+  renderSideSelector('from');
+  renderSideSelector('to');
+  updateSwapBtn();
+  // Fetch prices for common tickers
+  fetchUsdPrices(['btc','eth','wbtc','ltc','bnb','sol','usdc','usdt','sui','trx']);
+}
+
+// ── Side selector renders inside the token button area ──
+// Instead of a modal, clicking the token btn opens/closes an inline dropdown panel
+
+let _openDropdown = null;
+
+// Use a single fixed-position modal for both sides (simpler, always visible)
+function openTokenPicker(side) {
+  _openDropdown = side;
+  swState.activeSide = side;
+  let modal = document.getElementById('sw-picker-modal');
+  if (!modal) {
+    modal = document.createElement('div');
+    modal.id = 'sw-picker-modal';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:9900;display:flex;align-items:center;justify-content:center';
+    modal.addEventListener('click', e => { if (e.target === modal) closeTokenDropdown(); });
+    document.body.appendChild(modal);
+  }
+  modal.innerHTML = `<div style="background:#14141f;border:1px solid var(--border);border-radius:16px;width:460px;max-height:82vh;overflow:hidden;display:flex;flex-direction:column;box-shadow:0 24px 60px rgba(0,0,0,.7)">
+    <div style="padding:14px 16px 10px;border-bottom:1px solid var(--border)">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div style="font-weight:700;font-size:14px;color:var(--text)">${side==='from'?'Send from':'Receive on'} — select chains &amp; assets</div>
+        <button onclick="closeTokenDropdown()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0 4px;line-height:1">×</button>
+      </div>
+      <input id="sw-${side}-search" placeholder="Search chains or assets…" oninput="filterDropdown('${side}')"
+        style="width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:12px;outline:none;box-sizing:border-box">
+    </div>
+    <div style="overflow-y:auto;flex:1" id="sw-${side}-dlist"></div>
+    <div style="padding:10px 16px;border-top:1px solid var(--border);display:flex;justify-content:space-between;align-items:center">
+      <span style="font-size:11px;color:var(--muted)" id="sw-${side}-sel-summary"></span>
+      <button onclick="closeTokenDropdown();updatePairBadge();updateSwapBtn();"
+        style="background:var(--accent);border:none;border-radius:8px;padding:7px 18px;font-weight:700;font-size:13px;cursor:pointer;color:#000">Done</button>
+    </div>
+  </div>`;
+  modal.style.display = 'flex';
+  renderDropdownList(side, '');
+  setTimeout(() => document.getElementById(`sw-${side}-search`)?.focus(), 80);
+}
+
+function closeTokenDropdown() {
+  const m = document.getElementById('sw-picker-modal');
+  if (m) m.style.display = 'none';
+  _openDropdown = null;
+  updatePairBadge();
+  updateSwapBtn();
+}
+
+// renderDropdownContent merged into openTokenPicker
+
+function filterDropdown(side) {
+  const q = document.getElementById(`sw-${side}-search`)?.value.trim().toLowerCase() || '';
+  renderDropdownList(side, q);
+}
+
+function renderDropdownList(side, query) {
+  const list = document.getElementById(`sw-${side}-dlist`);
+  if (!list) return;
+  const st = swState[side];
+  const chains = swChainKeys.length ? swChainKeys : Object.keys(CHAIN_META);
+
+  let html = '';
+  for (const ck of chains) {
+    const cm = CHAIN_META[ck] || { icon: '🔘', label: ck };
+    const chainLabel = cm.label;
+    // Show chain if query matches chain name OR any of its asset tickers
+    if (query) {
+      const assetMatch = swAllAssets.filter(a=>a.chainKey===ck).some(a=>
+        a.ticker.includes(query) || a.name.toLowerCase().includes(query)
+      );
+      if (!chainLabel.toLowerCase().includes(query) && !assetMatch) continue;
+    }
+
+    const chainSelected = st.chains.has(ck);
+    const chainAssets   = swAllAssets.filter(a => a.chainKey === ck);
+    if (!chainAssets.length) continue;
+
+    html += `<div style="border-bottom:1px solid rgba(255,255,255,.05)">
+      <!-- Chain header row -->
+      <div onclick="toggleChainSel('${side}','${ck}')"
+        style="display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;background:${chainSelected?'rgba(34,197,94,.06)':'none'};transition:background .12s"
+        onmouseenter="this.style.background='var(--bg3)'" onmouseleave="this.style.background='${chainSelected?'rgba(34,197,94,.06)':'none'}'">
+        <div style="width:18px;height:18px;border:2px solid ${chainSelected?'var(--accent)':'var(--border)'};border-radius:4px;background:${chainSelected?'var(--accent)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s">
+          ${chainSelected?'<span style="color:#000;font-size:11px;font-weight:900">✓</span>':''}
+        </div>
+        <span style="font-size:18px">${cm.icon}</span>
+        <div style="flex:1">
+          <div style="font-weight:700;font-size:13px;color:var(--text)">${chainLabel}</div>
+          <div style="font-size:10px;color:var(--muted)">${chainAssets.map(a=>a.ticker.toUpperCase()).join(' · ')}</div>
+        </div>
+        <span style="font-size:11px;color:var(--muted)">${chainAssets.length} asset${chainAssets.length!==1?'s':''}</span>
+      </div>
+      <!-- Asset rows (only shown when chain selected) -->
+      ${chainSelected ? chainAssets.map(a => {
+        const aSelected = st.assets.has(a.id);
+        // Look up balance: from EVM token balances or EVM native balances
+        let balStr = '';
+        try {
+          const evmBals = window._evmBalances || {};
+          const evmTokBals = window._evmTokenBalances || {};
+          const chainBalsKey = Object.keys(evmBals).find(k => a.rawChain.startsWith(k.split('_')[0]) || k.startsWith(a.rawChain.split('_')[0]));
+          if (chainBalsKey) {
+            const ticker = a.ticker.toUpperCase();
+            const tokBal = evmTokBals[chainBalsKey]?.[ticker];
+            if (tokBal) {
+              const hasB = parseFloat(tokBal.formatted) > 0;
+              balStr = `<span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:${hasB?'var(--green)':'var(--muted)'}">${tokBal.formatted} ${ticker}</span>`;
+            } else if (a.ticker === 'eth' || a.ticker === 'bnb') {
+              const wei = Number(evmBals[chainBalsKey] || 0);
+              const formatted = (wei/1e18).toFixed(5);
+              const hasB = wei > 0;
+              balStr = `<span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:${hasB?'var(--green)':'var(--muted)'}">${formatted} ${ticker.toUpperCase()}</span>`;
+            }
+          }
+        } catch(_) {}
+        // For 'from' side: disable assets with no balance
+        const hasBalance = (() => {
+          if (side !== 'from') return true; // 'to' side always enabled
+          try {
+            const evmBals = window._evmBalances || {};
+            const evmTokBals = window._evmTokenBalances || {};
+            const chainBalsKey = Object.keys(evmBals).find(k =>
+              a.rawChain.startsWith(k.split('_')[0]) || k.startsWith(a.rawChain.split('_')[0]) ||
+              a.rawChain === k || normalizeChain(a.rawChain) === normalizeChain(k)
+            );
+            if (!chainBalsKey) return false; // no balance data for this chain — hide
+            const ticker = a.ticker.toUpperCase();
+            const tokBal = evmTokBals[chainBalsKey]?.[ticker];
+            if (tokBal) return parseFloat(tokBal.formatted) > 0;
+            // Native balance check
+            const isNative = ['eth','bnb','bera','core','btcn'].includes(a.ticker.toLowerCase());
+            if (isNative) {
+              const wei = Number(evmBals[chainBalsKey] || 0);
+              return wei > 0;
+            }
+            return false;
+          } catch(_) { return true; } // error → show anyway
+        })();
+        // If no EVM balance data loaded yet, fall back to showing (don't hide until we have data)
+        const balDataLoaded = Object.keys(window._evmBalances||{}).length > 0 || Object.keys(window._evmTokenBalances||{}).length > 0;
+        const disableRow = side === 'from' && balDataLoaded && !hasBalance;
+        return `<div onclick="${disableRow ? '' : `toggleAssetSel('${side}','${a.id}')`}"
+          style="display:flex;align-items:center;gap:10px;padding:8px 14px 8px 44px;cursor:${disableRow?'not-allowed':'pointer'};background:${aSelected?'rgba(34,197,94,.04)':'none'};opacity:${disableRow?'0.35':'1'};transition:background .12s"
+          ${!disableRow ? `onmouseenter="this.style.background='var(--bg3)'" onmouseleave="this.style.background='${aSelected?'rgba(34,197,94,.04)':'none'}'"` : ''}>
+          <div style="width:16px;height:16px;border:2px solid ${aSelected?'var(--accent)':'var(--border)'};border-radius:3px;background:${aSelected?'rgba(34,197,94,.2)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s">
+            ${aSelected?'<span style="color:var(--accent);font-size:10px;font-weight:900">✓</span>':''}
+          </div>
+          <span style="font-size:18px">${a.icon}</span>
+          <div style="flex:1">
+            <div style="font-weight:600;font-size:12px;color:var(--text)">${a.name}</div>
+            <div style="font-size:10px;color:var(--muted)">${a.ticker.toUpperCase()}</div>
+          </div>
+          ${balStr
+            ? `<div style="font-size:11px;font-family:'JetBrains Mono',monospace">${balStr}</div>`
+            : disableRow
+              ? '<span style="font-size:10px;color:var(--muted)">no balance</span>'
+              : ''}
+        </div>`;
+      }).join('') : ''}
+    </div>`;
+  }
+  if (!html) html = '<div style="text-align:center;color:var(--muted);padding:24px;font-size:13px">No chains found</div>';
+  list.innerHTML = html;
+  updateDropdownSummary(side);
+}
+
+function toggleChainSel(side, chainKey) {
+  const st = swState[side];
+  if (st.chains.has(chainKey)) {
+    st.chains.delete(chainKey);
+    // Remove all assets of this chain
+    swAllAssets.filter(a=>a.chainKey===chainKey).forEach(a=>st.assets.delete(a.id));
+  } else {
+    st.chains.add(chainKey);
+  }
+  renderDropdownList(side, document.getElementById(`sw-${side}-search`)?.value.trim().toLowerCase()||'');
+  renderSideSelector(side);
+  updateSwapBtn();
+}
+
+function toggleAssetSel(side, assetId) {
+  const st = swState[side];
+  if (st.assets.has(assetId)) { st.assets.delete(assetId); }
+  else { st.assets.add(assetId); }
+  renderDropdownList(side, document.getElementById(`sw-${side}-search`)?.value.trim().toLowerCase()||'');
+  renderSideSelector(side);
+  updateSwapBtn();
+}
+
+function updateDropdownSummary(side) {
+  const st = swState[side];
+  const el = document.getElementById(`sw-${side}-sel-summary`);
+  if (!el) return;
+  const numChains = st.chains.size;
+  const numAssets = st.assets.size;
+  const effectivePairs = getEffectivePairs(side);
+  if (!numChains) { el.textContent = 'Nothing selected'; return; }
+  let txt = `${numChains} chain${numChains!==1?'s':''}`;
+  if (numAssets) txt += `, ${numAssets} asset${numAssets!==1?'s':''}`;
+  else txt += ` (all assets)`;
+  txt += ` → ${effectivePairs.length} asset${effectivePairs.length!==1?'s':''}`;
+  el.textContent = txt;
+}
+
+// Get effective asset IDs for a side (all assets in selected chains, filtered by selected assets if any)
+function getEffectivePairs(side) {
+  const st = swState[side];
+  if (!st.chains.size) return [];
+  const inSelectedChains = swAllAssets.filter(a => st.chains.has(a.chainKey));
+  if (!st.assets.size) return inSelectedChains; // all assets in chains
+  return inSelectedChains.filter(a => st.assets.has(a.id));
+}
+
+// Render the token button to summarize selection
+function renderSideSelector(side) {
+  const st = swState[side];
+  const fromPairs = getEffectivePairs(side);
+  const iconEl = document.getElementById(`sw-${side}-token-icon`);
+  const nameEl = document.getElementById(`sw-${side}-token-name`);
+  const chainEl = document.getElementById(`sw-${side}-chain-label`);
+  if (!st.chains.size) {
+    iconEl.textContent = '🔘'; nameEl.textContent = 'Select token'; chainEl.textContent = 'Choose chain';
+  } else if (fromPairs.length === 1) {
+    const a = fromPairs[0];
+    iconEl.textContent = a.icon; nameEl.textContent = a.ticker.toUpperCase(); chainEl.textContent = a.chainLabel;
+  } else if (st.chains.size === 1) {
+    const ck = [...st.chains][0];
+    const cm = CHAIN_META[ck] || { icon: '🔘', label: ck };
+    iconEl.textContent = cm.icon;
+    nameEl.textContent = st.assets.size ? `${st.assets.size} assets` : `All assets`;
+    chainEl.textContent = cm.label;
+  } else {
+    iconEl.textContent = '🌐';
+    nameEl.textContent = `${fromPairs.length} assets`;
+    chainEl.textContent = `${st.chains.size} chains`;
+  }
+  // Fetch prices for visible tickers
+  const tickers = getEffectivePairs(side).map(a=>a.ticker);
+  if (tickers.length) fetchUsdPrices(tickers);
+  // Re-run USD display update
+  updateUsdDisplays();
+}
+
+// ── Iterations ──
+function changeIter(delta) { swState.iterations = Math.max(1, Math.min(50, swState.iterations+delta)); updateIterDisplay(); }
+function setIter(n) { swState.iterations = n; updateIterDisplay(); }
+function updateIterDisplay() {
+  const n = swState.iterations;
+  document.getElementById('sw-iter-display').textContent = n;
+  document.getElementById('sw-iter-label').textContent = n===1?'time':'times';
+}
+
+// ── Direction flip ──
+function swapDirection() {
+  const tmp = { chains: swState.from.chains, assets: swState.from.assets };
+  swState.from.chains = swState.to.chains; swState.from.assets = swState.to.assets;
+  swState.to.chains   = tmp.chains;        swState.to.assets   = tmp.assets;
+  renderSideSelector('from'); renderSideSelector('to');
+  document.getElementById('sw-usd-amount').value = '';
+  document.getElementById('sw-from-token-amt').textContent = '≈ — token';
+  document.getElementById('sw-receive-amount').textContent = '0';
+  document.getElementById('sw-receive-usd').textContent = '';
+  swState.quote = null; updateSwapBtn(); updatePairBadge();
+}
+
+// ── Quote ──
+let _quoteDebounce = null;
+// swapAmountChanged merged into swapUsdChanged
+
+async function fetchSwapQuote(fromAssetId, toAssetId, atomicAmount) {
+  if (!atomicAmount || atomicAmount <= 0) { document.getElementById('sw-receive-amount').textContent='0'; swState.quote=null; updateSwapBtn(); return; }
+  document.getElementById('sw-receive-amount').textContent = '…';
+  document.getElementById('sw-receive-amount').style.color = 'var(--muted)';
+  try {
+    const q = await fetch('/api/quote',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({fromChain:fromAssetId,toChain:toAssetId,amount:atomicAmount})}).then(r=>r.json());
+    const out = q.result?.output_amount||q.result?.to_amount||q.result?.receive;
+    if (q.error||out===undefined) {
+      document.getElementById('sw-receive-amount').textContent='—';
+      document.getElementById('sw-receive-amount').style.color='var(--red)';
+      document.getElementById('sw-rate-display').textContent=q.error||'No quote';
+      document.getElementById('sw-quote-bar').style.display='none';
+      swState.quote=null;
+    } else {
+      const toAsset = swAllAssets.find(a=>a.id===toAssetId);
+      const fromAsset = swAllAssets.find(a=>a.id===fromAssetId);
+      const toTicker = toAsset?.ticker.toUpperCase()||'';
+      const fromTicker = fromAsset?.ticker.toUpperCase()||'';
+      const outFloat=(Number(out)/1e8).toFixed(6);
+      // Show receive amount + USD value
+      const rcvUsd = atomicToUsd(Number(out), toAsset?.ticker);
+      document.getElementById('sw-receive-amount').textContent=`${outFloat} ${toTicker}`;
+      document.getElementById('sw-receive-amount').style.color='var(--green)';
+      const rcvUsdEl = document.getElementById('sw-receive-usd');
+      if (rcvUsdEl) rcvUsdEl.textContent = rcvUsd ? `≈ $${rcvUsd.toFixed(2)}` : '';
+      document.getElementById('sw-rate-display').textContent=`1 ${fromTicker} = ${(Number(out)/atomicAmount).toFixed(6)} ${toTicker}`;
+      const fee=q.result?.fee||q.result?.protocol_fee;
+      document.getElementById('sw-fee').textContent=fee?(Number(fee)/1e8).toFixed(6)+' '+fromTicker:'Included';
+      document.getElementById('sw-route-label').textContent=`${fromAssetId} → ${toAssetId}`;
+      document.getElementById('sw-quote-bar').style.display='block';
+      swState.quote={fromId:fromAssetId,toId:toAssetId,atomicAmount,out};
+    }
+  } catch(e) { document.getElementById('sw-receive-amount').textContent='—'; swState.quote=null; }
+  updateSwapBtn();
+}
+
+function updateSwapBtn() {
+  const btn=document.getElementById('sw-action-btn');
+  const fromPairs=getEffectivePairs('from'), toPairs=getEffectivePairs('to');
+  if (!fromPairs.length) { btn.textContent='Select what to send';    btn.disabled=true; styleSwBtn('off'); return; }
+  if (!toPairs.length)   { btn.textContent='Select what to receive'; btn.disabled=true; styleSwBtn('off'); return; }
+  const amt=parseFloat(document.getElementById('sw-usd-amount')?.value)||0;
+  if (!amt||isNaN(amt)||amt<=0) { btn.textContent='Enter USD amount'; btn.disabled=true; styleSwBtn('off'); return; }
+  const combos=fromPairs.length*toPairs.length;
+  const iters=swState.iterations;
+  const total=combos*iters;
+  const label=total===1?'Swap':'Run '+total+' swap'+(total>1?'s':'');
+  btn.textContent=label+(combos>1?` (${combos} pairs × ${iters})`:iters>1?` ×${iters}`:'');
+  btn.disabled=false; styleSwBtn('on');
+}
+
+function styleSwBtn(state) {
+  const btn=document.getElementById('sw-action-btn');
+  if (state==='on')  {btn.style.background='var(--accent)';btn.style.color='#000';btn.style.borderColor='var(--accent)';btn.style.cursor='pointer';}
+  else if (state==='dim') {btn.style.background='rgba(34,197,94,.08)';btn.style.color='var(--green)';btn.style.borderColor='rgba(34,197,94,.2)';btn.style.cursor='default';}
+  else {btn.style.background='var(--bg3)';btn.style.color='var(--muted)';btn.style.borderColor='var(--border)';btn.style.cursor='default';}
+}
+
+async function swapExecute() {
+  const btn=document.getElementById('sw-action-btn'), status=document.getElementById('sw-status');
+  const fromPairs=getEffectivePairs('from'), toPairs=getEffectivePairs('to');
+  const amt=parseFloat(document.getElementById('sw-usd-amount')?.value)||0;
+  if (!fromPairs.length||!toPairs.length||!amt) return;
+
+  // Use the atomic amount stored in quote (derived from USD input)
+  const atomicAmount = swState.quote?.atomicAmount || (() => {
+    const fromPairsE = getEffectivePairs('from');
+    const tk = fromPairsE[0]?.ticker;
+    return usdToAtomic(amt, tk) || Math.round(amt * 1e8);
+  })();
+  // Build all (from,to) pairs excluding same-asset
+  const pairs=[];
+  for (const f of fromPairs) for (const t of toPairs) if (f.id!==t.id) pairs.push([f,t]);
+  if (!pairs.length) { status.textContent='No valid pairs (same asset on both sides)'; status.style.color='var(--red)'; return; }
+
+  const iters=swState.iterations;
+  const total=pairs.length*iters;
+  btn.disabled=true; let done=0;
+  styleSwBtn('dim');
+
+  try {
+    for (let i=0;i<iters;i++) {
+      for (const [f,t] of pairs) {
+        done++;
+        btn.textContent=`Starting swap ${done}/${total}…`;
+        const r=await fetch('/api/trade',{method:'POST',headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({fromChain:f.id,toChain:t.id,amount:atomicAmount})}).then(r=>r.json());
+        if (r.error) throw new Error(r.error);
+        if (done<total) await new Promise(res=>setTimeout(res,600));
+      }
+    }
+    btn.textContent=`✅ ${total} swap${total>1?'s':''} started!`;
+    btn.style.background='rgba(34,197,94,.15)'; btn.style.borderColor='var(--green)'; btn.style.color='var(--green)';
+    status.textContent='→ Switch to Dashboard or Live Log to monitor'; status.style.color='var(--cyan)';
+
+    swRecentSwaps.unshift({
+      from: fromPairs.length===1?`${fromPairs[0].ticker.toUpperCase()} on ${fromPairs[0].chainLabel}`:`${fromPairs.length} assets (${[...swState.from.chains].map(c=>CHAIN_META[c]?.label||c).join(', ')})`,
+      to:   toPairs.length===1?`${toPairs[0].ticker.toUpperCase()} on ${toPairs[0].chainLabel}`:`${toPairs.length} assets (${[...swState.to.chains].map(c=>CHAIN_META[c]?.label||c).join(', ')})`,
+      usd: amt, combos: pairs.length, iters, time: new Date().toLocaleTimeString()
+    });
+    if (swRecentSwaps.length>8) swRecentSwaps.pop();
+    renderRecentSwaps();
+    setTimeout(()=>updateSwapBtn(), 3000);
+  } catch(e) {
+    btn.textContent='❌ Failed'; btn.style.background='rgba(239,68,68,.1)'; btn.style.borderColor='var(--red)'; btn.style.color='var(--red)';
+    status.textContent=e.message; status.style.color='var(--red)';
+    setTimeout(()=>{btn.disabled=false;updateSwapBtn();},2500);
+  }
+}
+
+// setSwAmt replaced by setSwUsd
+
+function updatePairBadge() {
+  const badge=document.getElementById('sw-pair-badge');
+  const fromPairs=getEffectivePairs('from'), toPairs=getEffectivePairs('to');
+  if (!fromPairs.length&&!toPairs.length) { badge.style.display='none'; return; }
+  badge.style.display='block';
+  const fChains=[...swState.from.chains].map(c=>`${CHAIN_META[c]?.icon||'🔘'} ${CHAIN_META[c]?.label||c}`).join(', ')||'—';
+  const tChains=[...swState.to.chains].map(c=>`${CHAIN_META[c]?.icon||'🔘'} ${CHAIN_META[c]?.label||c}`).join(', ')||'—';
+  const fAssets=swState.from.assets.size?`(${swState.from.assets.size} asset${swState.from.assets.size!==1?'s':''})`:'(all assets)';
+  const tAssets=swState.to.assets.size?`(${swState.to.assets.size} asset${swState.to.assets.size!==1?'s':''})`:'(all assets)';
+  document.getElementById('sw-pair-route').innerHTML=
+    `<div style="margin-bottom:4px"><span style="color:var(--muted)">From:</span> ${fChains} ${fChains!=='—'?fAssets:''}</div>
+     <div><span style="color:var(--muted)">To:</span> ${tChains} ${tChains!=='—'?tAssets:''}</div>`;
+  const combos=fromPairs.length*toPairs.length;
+  document.getElementById('sw-combo-count').textContent=combos?`${combos} combination${combos!==1?'s':''} × ${swState.iterations} iteration${swState.iterations!==1?'s':''}. = ${combos*swState.iterations} orders`:'';
+  document.getElementById('sw-pair-limits').textContent='';
+}
+
+// Balance cache for asset picker — populated lazily
+window._swAssetBalances = {};
+
+let swRecentSwaps = [];
+function renderRecentSwaps() {
+  const el=document.getElementById('sw-recent');
+  if (!el||!swRecentSwaps.length) { if(el) el.textContent='No swaps yet this session'; return; }
+  el.innerHTML=swRecentSwaps.map(r=>`
+    <div style="padding:8px 0;border-bottom:1px solid var(--border)">
+      <div style="font-weight:600;font-size:12px">${r.from} → ${r.to}</div>
+      <div style="color:var(--muted);font-size:11px;margin-top:2px">$${r.usd||'?'} · ${r.combos} pair${r.combos!==1?'s':''} × ${r.iters} · ${r.time}</div>
+    </div>`).join('');
+}
 // ── LIVE LOG ──
 function logEvent(event, data) {
   const log = document.getElementById('liveLog');
@@ -1145,8 +2008,11 @@ function logEvent(event, data) {
             : event.includes('fail') || event.includes('error') ? 'log-fail'
             : event.includes('start') ? 'log-info' : 'log-warn';
   const detail = typeof data === 'object' ? (data.label || data.message || data.event || '') : '';
-  log.innerHTML += `<div class="log-line ${cls}"><span class="log-ts">[${ts}]</span> ${event}${detail ? ' — ' + detail : ''}</div>`;
-  log.scrollTop = log.scrollHeight;
+  // Prepend so newest entries appear at top — no scrolling needed
+  log.insertAdjacentHTML('afterbegin', `<div class="log-line ${cls}"><span class="log-ts">[${ts}]</span> ${event}${detail ? ' — ' + detail : ''}</div>`);
+  // Cap at 2000 lines to prevent memory bloat
+  const lines = log.children;
+  while (lines.length > 2000) log.removeChild(lines[lines.length - 1]);
   if (log.children.length > 2000) log.removeChild(log.firstChild);
 }
 
@@ -1182,6 +2048,8 @@ function showPanel(id) {
   items.forEach(item => { if (item.getAttribute('onclick')?.includes(id)) item.classList.add('active'); });
   if (id === 'combinations') loadCombinations();
   if (id === 'routes') refreshRouteGrid();
+  if (id === 'chatbot') initSwapPanel();
+  if (id === 'wallets') { updateEnvKeyNotice(); }
 }
 
 function filterRoutes(f) {
@@ -1619,6 +2487,10 @@ async function confirmTradeSizeModal() {
   // Show stop button, go to dashboard
   document.getElementById("btnStopTradeable").style.display = "inline-flex";
   document.getElementById("btnRunTradeable").disabled = true;
+  // Also show the dashboard Stop button so user can stop from dashboard panel
+  document.getElementById("btnStop").style.display = "inline-flex";
+  document.getElementById("btnRunAll").disabled = true;
+  document.getElementById("btnRunAll").innerHTML = '<span class="spinner"></span> Running…';
   showPanel("dashboard");
   document.getElementById("lastRunLabel").textContent = `⏳ Running ${tradeable.length} tradeable pairs…`;
 
@@ -1662,71 +2534,512 @@ const _origShowPanel = window.showPanel;
 
 // EVM chain definitions
 const EVM_CHAINS = [
-  { id: 'ethereum',  name: 'Ethereum',  chainId: '0xaa36a7', mainChainId: '0x1',     symbol: 'ETH',  icon: '⬡' },
-  { id: 'arbitrum',  name: 'Arbitrum',  chainId: '0x66eee',  mainChainId: '0xa4b1',  symbol: 'ETH',  icon: '🔵' },
-  { id: 'base',      name: 'Base',      chainId: '0x14a34',  mainChainId: '0x2105',  symbol: 'ETH',  icon: '🔷' },
-  { id: 'bnbchain',  name: 'BNB Chain', chainId: '0x61',     mainChainId: '0x38',    symbol: 'BNB',  icon: '🟡' },
-  { id: 'berachain', name: 'Berachain', chainId: '0x138d5',  mainChainId: '0x138d4', symbol: 'BERA', icon: '🐻' },
-  { id: 'unichain',  name: 'Unichain',  chainId: '0x515',    mainChainId: '0x515',   symbol: 'ETH',  icon: '🦄' },
-  { id: 'hyperevm',  name: 'HyperEVM',  chainId: '0x3e6',    mainChainId: '0x3e7',   symbol: 'ETH',  icon: '⚡' },
-  { id: 'corn',      name: 'Corn',      chainId: '0x1406f',  mainChainId: '0x1406f', symbol: 'BTCN', icon: '🌽' },
-  { id: 'botanix',   name: 'Botanix',   chainId: '0xe35',    mainChainId: '0xe35',   symbol: 'BTC',  icon: '🌿' },
-  { id: 'core',      name: 'Core',      chainId: '0x45b',    mainChainId: '0x45c',   symbol: 'CORE', icon: '⚙️' },
-  { id: 'megaeth',   name: 'MegaETH',   chainId: '0x18c6',   mainChainId: '0x18c6',  symbol: 'ETH',  icon: '🚀' },
+  { id: 'ethereum',  name: 'Ethereum Sepolia', chainId: '0xaa36a7', mainChainId: '0x1',     symbol: 'ETH',  icon: '⬡',  rpc: 'https://rpc.sepolia.org',                        explorer: 'https://sepolia.etherscan.io' },
+  { id: 'arbitrum',  name: 'Arbitrum Sepolia', chainId: '0x66eee',  mainChainId: '0xa4b1',  symbol: 'ETH',  icon: '🔵', rpc: 'https://sepolia-rollup.arbitrum.io/rpc',         explorer: 'https://sepolia.arbiscan.io' },
+  { id: 'base',      name: 'Base Sepolia',     chainId: '0x14a34',  mainChainId: '0x2105',  symbol: 'ETH',  icon: '🔷', rpc: 'https://sepolia.base.org',                       explorer: 'https://sepolia.basescan.org' },
+  { id: 'bnbchain',  name: 'BNB Testnet',      chainId: '0x61',     mainChainId: '0x38',    symbol: 'BNB',  icon: '🟡', rpc: 'https://data-seed-prebsc-1-s1.binance.org:8545', explorer: 'https://testnet.bscscan.com' },
+  { id: 'berachain', name: 'Berachain bArtio', chainId: '0x138d5',  mainChainId: '0x138d4', symbol: 'BERA', icon: '🐻', rpc: 'https://artio.rpc.berachain.com',                explorer: 'https://bartio.beratrail.io' },
+  { id: 'unichain',  name: 'Unichain Sepolia', chainId: '0x515',    mainChainId: '0x515',   symbol: 'ETH',  icon: '🦄', rpc: 'https://sepolia.unichain.org',                   explorer: 'https://uniscan.xyz' },
+  { id: 'hyperevm',  name: 'HyperEVM Testnet', chainId: '0x3e6',    mainChainId: '0x3e7',   symbol: 'ETH',  icon: '⚡', rpc: 'https://rpc.hyperliquid-testnet.xyz/evm',        explorer: 'https://explorer.hyperliquid.xyz' },
+  { id: 'corn',      name: 'Corn Testnet',     chainId: '0x1406f',  mainChainId: '0x1406f', symbol: 'BTCN', icon: '🌽', rpc: 'https://testnet.corn-rpc.com',                   explorer: 'https://testnet.cornscan.io' },
+  { id: 'botanix',   name: 'Botanix Testnet',  chainId: '0xe35',    mainChainId: '0xe35',   symbol: 'BTC',  icon: '🌿', rpc: 'https://node.botanixlabs.dev',                   explorer: 'https://blockscout.botanixlabs.dev' },
+  { id: 'core',      name: 'Core Testnet',     chainId: '0x45b',    mainChainId: '0x45c',   symbol: 'CORE', icon: '⚙️', rpc: 'https://rpc.test.btcs.network',                  explorer: 'https://scan.test.btcs.network' },
+  { id: 'megaeth',   name: 'MegaETH Testnet',  chainId: '0x18c6',   mainChainId: '0x18c6',  symbol: 'ETH',  icon: '🚀', rpc: 'https://carrot.megaeth.com',                     explorer: 'https://megaexplorer.xyz' },
 ];
+
+// Add a chain to MetaMask if it doesn't know about it yet
+async function addChainToMetaMask(chain) {
+  const p = window._evmProvider || window.ethereum;
+  await p.request({ method: 'wallet_addEthereumChain', params: [{
+    chainId: chain.chainId, chainName: chain.name,
+    nativeCurrency: { name: chain.symbol, symbol: chain.symbol, decimals: 18 },
+    rpcUrls: [chain.rpc], blockExplorerUrls: [chain.explorer],
+  }]});
+}
+
+// Switch MetaMask to a chain — add it first if needed
+async function ensureChain(chainIdHex) {
+  const provider = window._evmProvider || window.ethereum;
+  if (!provider) throw new Error('No EVM provider connected');
+  const chain = EVM_CHAINS.find(c => c.chainId.toLowerCase() === chainIdHex.toLowerCase());
+  try {
+    await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
+  } catch (switchErr) {
+    if (switchErr.code === 4902 && chain) {
+      try {
+        await provider.request({
+          method: 'wallet_addEthereumChain',
+          params: [{ chainId: chain.chainId, chainName: chain.name,
+            nativeCurrency: { name: chain.symbol, symbol: chain.symbol, decimals: 18 },
+            rpcUrls: [chain.rpc], blockExplorerUrls: [chain.explorer] }]
+        });
+        await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: chainIdHex }] });
+      } catch (addErr) {
+        throw new Error(`Could not add ${chain?.name || chainIdHex}: ${addErr.message}`);
+      }
+    } else {
+      throw switchErr;
+    }
+  }
+}
 
 let connectedWallets = { evm: false, btc: false, solana: false, privy: false, starknet: false, sui: false, tron: false };
 let evmAddress = null;
 let privyFormVisible = false;
+let _envKeyAvailable = false; // set true on load if server has envkey configured
 
-// Render EVM chain list
-function renderEvmChains(connected, address) {
-  const list = document.getElementById('evm-chain-list');
-  if (!connected) { list.innerHTML = ''; return; }
-  list.innerHTML = EVM_CHAINS.map(c => `
-    <div class="chain-row">
-      <div class="chain-name">${c.icon} ${c.name}</div>
-      <div class="chain-addr chain-connected">✅ ${shortenAddr(address)}</div>
-      <button onclick="switchToChain('${c.chainId}')" style="font-size:10px;padding:3px 8px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;color:var(--muted);cursor:pointer">Switch</button>
-    </div>`).join('');
+// Force switch active EVM signer back to .env key (override MetaMask)
+async function useEnvKeyEvm() {
+  if (!confirm('Switch to .env private key for EVM signing?\n\nMetaMask will no longer be used until you reconnect it.')) return;
+  try {
+    const r = await fetch('/api/wallet/use-envkey', { method: 'POST',
+      headers: {'Content-Type':'application/json'}, body: JSON.stringify({ type: 'evm' }) });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'Failed');
+    evmAddress = d.address;
+    connectedWallets.evm = true;
+    document.getElementById('evm-addr').textContent = shortenAddr(d.address) + ' 🔐 .env key';
+    document.getElementById('evm-addr').style.color = 'var(--yellow)';
+    document.getElementById('evm-btn').textContent = 'Override with MetaMask';
+    document.getElementById('evm-btn').className = 'btn btn-ghost';
+    document.getElementById('evm-btn').onclick = connectMetaMask;
+    const envBtn = document.getElementById('evm-envkey-btn');
+    if (envBtn) envBtn.style.display = 'none';
+    renderEvmChains(false, null);
+    updateWalletCount();
+  } catch(e) { alert('Could not switch to .env key: ' + e.message); }
 }
 
-// MetaMask connect
-async function connectMetaMask() {
-  if (!window.ethereum) {
-    alert('MetaMask not installed!\n\nInstall it from: https://metamask.io/download/');
+// Render EVM chain list — accordion per chain with asset balances
+function renderEvmChains(connected, address) {
+  const list   = document.getElementById('evm-chain-list');
+  const expBtn = document.getElementById('evm-expand-btn');
+  if (!connected) { list.innerHTML=''; list.style.display='none'; if(expBtn) expBtn.style.display='none'; return; }
+  if (expBtn) expBtn.style.display = 'inline';
+  list.innerHTML = EVM_CHAINS.map(c => `
+    <div style="border:1px solid var(--border);border-radius:10px;margin-bottom:6px;overflow:hidden">
+      <button onclick="toggleEvmChainRow('${c.id}')"
+        style="width:100%;text-align:left;background:var(--bg3);border:none;padding:10px 14px;cursor:pointer;
+        display:flex;align-items:center;gap:10px;color:var(--text)">
+        <span style="font-size:16px">${c.icon}</span>
+        <span style="font-weight:600;font-size:13px;flex:1">${c.name}</span>
+        <span id="chain-native-${c.id}" style="font-size:12px;color:var(--muted);margin-right:8px">…</span>
+        <span id="chain-chevron-${c.id}" style="color:var(--muted);font-size:12px">▾</span>
+      </button>
+      <div id="chain-assets-${c.id}" style="display:none;padding:8px 14px 10px;background:var(--bg2);border-top:1px solid var(--border)">
+        <div style="font-size:10px;color:var(--muted);margin-bottom:6px;text-transform:uppercase;letter-spacing:.06em">Assets</div>
+        <div id="chain-asset-list-${c.id}">
+          <div style="font-size:11px;color:var(--muted)">Loading…</div>
+        </div>
+      </div>
+    </div>`).join('');
+  refreshChainBalanceDisplay();
+}
+
+function toggleEvmChainRow(chainId) {
+  const panel   = document.getElementById(`chain-assets-${chainId}`);
+  const chevron = document.getElementById(`chain-chevron-${chainId}`);
+  const open = panel.style.display !== 'none';
+  panel.style.display = open ? 'none' : 'block';
+  chevron.textContent = open ? '▾' : '▴';
+  if (!open) renderChainAssetList(chainId);
+}
+
+function renderChainAssetList(chainId) {
+  const el = document.getElementById(`chain-asset-list-${chainId}`);
+  if (!el) return;
+  const chain = EVM_CHAINS.find(c => c.id === chainId);
+  if (!chain) return;
+  const bals = window._evmBalances || {};
+  const tokBals = window._evmTokenBalances || {};
+  const key = Object.keys(bals).find(k => k.startsWith(chainId) || chainId.startsWith(k.split('_')[0]));
+  const chainTokenBals = key ? (tokBals[key] || {}) : {};
+
+  // Native asset row
+  const wei = key ? bals[key] : null;
+  let nativeBal = '—';
+  let nativeHasBalance = false;
+  if (wei !== null && wei !== undefined) {
+    const weiN = Number(wei);
+    nativeHasBalance = weiN > 0;
+    nativeBal = weiN === 0 ? `0 ${chain.symbol}` : `${(weiN/1e18).toFixed(5)} ${chain.symbol}`;
+  }
+
+  const rows = [{ sym: chain.symbol, bal: nativeBal, isNative: true, hasBalance: nativeHasBalance }];
+
+  // Add ERC20 tokens — from the tokenBalances map returned by server
+  for (const [ticker, info] of Object.entries(chainTokenBals)) {
+    const formatted = info.formatted || '0';
+    const hasBalance = parseFloat(formatted) > 0;
+    const balStr = hasBalance ? `${formatted} ${ticker}` : `0 ${ticker}`;
+    rows.push({ sym: ticker, bal: balStr, isNative: false, hasBalance });
+  }
+
+  // Also add any garden assets for this chain that weren't in token balances (show — for unknown)
+  const chainKey = chain.id;
+  const gardenChainAssets = gardenAssets.filter(a => {
+    const ac = (a.chain || a.id?.split(':')[0] || '').toLowerCase();
+    return (ac.startsWith(chainKey) || chainKey.startsWith(ac.split('_')[0])) &&
+           a.token_address && a.token_address !== 'native' && a.token_address !== '0x0000000000000000000000000000000000000000';
+  });
+  for (const ga of gardenChainAssets) {
+    const t = (ga.asset || ga.ticker || ga.id?.split(':')[1] || '').toUpperCase();
+    if (rows.find(r => r.sym === t)) continue; // already have it
+    rows.push({ sym: t, bal: '—', isNative: false, hasBalance: false });
+  }
+
+  el.innerHTML = rows.map(({ sym, bal, isNative, hasBalance }) => {
+    const symLower = sym.toLowerCase();
+    const icon = isNative ? chain.icon : (ASSET_META[symLower]?.icon || '🔸');
+    const balColor = bal === '—' ? 'var(--muted)' : hasBalance ? 'var(--green)' : 'var(--muted)';
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.04)">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:16px">${icon}</span>
+        <div>
+          <div style="font-size:12px;font-weight:600">${sym}</div>
+          <div style="font-size:10px;color:var(--muted)">${isNative ? 'Native' : 'ERC-20'}</div>
+        </div>
+      </div>
+      <span style="font-size:12px;font-family:'JetBrains Mono',monospace;color:${balColor}">${bal}</span>
+    </div>`;
+  }).join('');
+}
+
+function toggleChainList() {
+  const list = document.getElementById('evm-chain-list');
+  const btn  = document.getElementById('evm-expand-btn');
+  const open = list.style.display !== 'none' && list.style.display !== '';
+  list.style.display = open ? 'none' : 'block';
+  if (btn) btn.textContent = open ? '▾' : '▴';
+}
+
+function refreshChainBalanceDisplay() {
+  const bals = window._evmBalances || {};
+  EVM_CHAINS.forEach(c => {
+    const el = document.getElementById(`chain-native-${c.id}`);
+    if (!el) return;
+    const key = Object.keys(bals).find(k => k.startsWith(c.id) || c.id.startsWith(k.split('_')[0]));
+    const wei = key ? bals[key] : null;
+    if (wei === null || wei === undefined) {
+      el.textContent = '—'; el.style.color = 'var(--muted)';
+    } else if (BigInt(wei) === 0n) {
+      el.textContent = `0 ${c.symbol}`; el.style.color = 'var(--muted)';
+    } else {
+      el.textContent = `${(Number(BigInt(wei))/1e18).toFixed(5)} ${c.symbol}`; el.style.color = 'var(--green)';
+    }
+    // Refresh open asset list if visible
+    if (document.getElementById(`chain-assets-${c.id}`)?.style.display !== 'none') renderChainAssetList(c.id);
+  });
+}
+
+// Collect ALL available EVM providers (handles multi-wallet environments)
+function getEvmProviders() {
+  const providers = [];
+  // EIP-6963 announced providers (modern standard)
+  if (window._eip6963Providers && window._eip6963Providers.length) {
+    return window._eip6963Providers;
+  }
+  // Fallback: sniff well-known wallet objects
+  const candidates = [
+    window.ethereum,
+    window.okxwallet,
+    window.phantom?.ethereum,
+  ].filter(Boolean);
+
+  const seen = new Set();
+  for (const p of candidates) {
+    // Multi-provider array (injected by MetaMask when multiple wallets present)
+    if (p.providers) {
+      for (const pp of p.providers) {
+        const id = pp.isOKExWallet || pp.isOKX ? 'okx'
+                 : pp.isMetaMask ? 'mm'
+                 : pp.isRabby ? 'rabby'
+                 : pp.isBraveWallet ? 'brave'
+                 : pp.isCoinbaseWallet ? 'coinbase'
+                 : Math.random().toString(36);
+        if (!seen.has(id)) { seen.add(id); providers.push(pp); }
+      }
+    } else if (p && !seen.has(p)) {
+      seen.add(p); providers.push(p);
+    }
+  }
+  return providers;
+}
+
+function providerInfo(p) {
+  if (!p) return { name: 'Unknown', icon: '🔌' };
+  if (p.isOKExWallet || p.isOKX)  return { name: 'OKX Wallet',    icon: '⭕' };
+  if (p.isRabby)                   return { name: 'Rabby',         icon: '🐰' };
+  if (p.isBraveWallet)             return { name: 'Brave Wallet',  icon: '🦁' };
+  if (p.isCoinbaseWallet)          return { name: 'Coinbase',      icon: '🔵' };
+  if (p.isMetaMask)                return { name: 'MetaMask',      icon: '🦊' };
+  return { name: 'EVM Wallet', icon: '🔌' };
+}
+
+// Listen for EIP-6963 wallet announcements
+window._eip6963Providers = [];
+window.addEventListener('eip6963:announceProvider', (e) => {
+  window._eip6963Providers.push(e.detail.provider);
+});
+window.dispatchEvent(new Event('eip6963:requestProvider'));
+
+// ── Garden-style unified connect modal ──────────────────────
+function showWalletConnectModal(options) {
+  return new Promise((resolve) => {
+    const existing = document.getElementById('gdn-wallet-modal');
+    if (existing) existing.remove();
+    const overlay = document.createElement('div');
+    overlay.id = 'gdn-wallet-modal';
+    overlay.style.cssText = 'position:fixed;inset:0;background:rgba(20,10,40,.72);backdrop-filter:blur(4px);z-index:10000;display:flex;align-items:center;justify-content:center';
+
+    const box = document.createElement('div');
+    box.style.cssText = 'background:#f5f4f8;color:#1a1040;border-radius:18px;width:420px;max-width:95vw;box-shadow:0 24px 80px rgba(0,0,0,.5);overflow:hidden;font-family:inherit;max-height:90vh;overflow-y:auto';
+
+    // Header
+    const hdr = document.createElement('div');
+    hdr.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:20px 22px 14px;position:sticky;top:0;background:#f5f4f8;z-index:1';
+    hdr.innerHTML = '<div style="font-weight:700;font-size:16px;color:#1a1040">Connect a Wallet</div>' +
+      '<button id="gwm-close" style="background:none;border:none;cursor:pointer;font-size:22px;color:#888;line-height:1;padding:2px 6px;border-radius:6px">×</button>';
+    box.appendChild(hdr);
+
+    // Group by ecosystem
+    const ecosystems = [...new Set(options.map(o => o.ecosystem))];
+    for (const eco of ecosystems) {
+      const ecoOpts = options.filter(o => o.ecosystem === eco);
+      const group = document.createElement('div');
+      group.style.cssText = 'background:#fff;border-radius:12px;margin:0 10px 10px;overflow:hidden;border:1px solid rgba(0,0,0,.07)';
+
+      const ecoLabel = document.createElement('div');
+      ecoLabel.style.cssText = 'font-size:11px;font-weight:700;color:#999;padding:10px 16px 6px;text-transform:uppercase;letter-spacing:.08em';
+      ecoLabel.textContent = 'Select ' + eco + ' wallet';
+      group.appendChild(ecoLabel);
+
+      for (const opt of ecoOpts) {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:14px;padding:13px 16px;cursor:pointer;transition:background .12s;border-top:1px solid rgba(0,0,0,.06)';
+
+        const chkId = 'gwm-chk-' + opt.id;
+        row.innerHTML =
+          '<span style="font-size:26px;flex-shrink:0">' + opt.icon + '</span>' +
+          '<div style="flex:1"><div style="font-weight:600;font-size:14px;color:#1a1040">' + opt.label + '</div>' +
+          (opt.desc ? '<div style="font-size:11px;color:#999">' + opt.desc + '</div>' : '') + '</div>' +
+          '<div id="' + chkId + '" style="width:22px;height:22px;border:2px solid #ddd;border-radius:5px;background:#fff;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s"></div>';
+
+        row.onmouseenter = () => row.style.background = '#f0eef8';
+        row.onmouseleave = () => row.style.background = opt._selected ? '#f0eef8' : '';
+        row.onclick = () => {
+          opt._selected = !opt._selected;
+          const chk = document.getElementById(chkId);
+          if (opt._selected) {
+            row.style.background = '#f0eef8';
+            chk.style.cssText = 'width:22px;height:22px;border:2px solid #e05c9b;border-radius:5px;background:#e05c9b;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s';
+            chk.innerHTML = '<svg width="12" height="12" viewBox="0 0 12 12"><polyline points="2,6 5,9 10,3" stroke="#fff" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+          } else {
+            row.style.background = '';
+            chk.style.cssText = 'width:22px;height:22px;border:2px solid #ddd;border-radius:5px;background:#fff;flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s';
+            chk.innerHTML = '';
+          }
+          updateBtn();
+        };
+        group.appendChild(row);
+      }
+      box.appendChild(group);
+    }
+
+    const statusDiv = document.createElement('div');
+    statusDiv.id = 'gwm-status';
+    statusDiv.style.cssText = 'text-align:center;padding:4px 16px;font-size:12px;color:#888;min-height:18px';
+    box.appendChild(statusDiv);
+
+    const connectBtn = document.createElement('button');
+    connectBtn.style.cssText = 'display:block;width:calc(100% - 20px);margin:8px 10px 10px;padding:15px;border-radius:12px;background:#d0cce8;border:none;color:#aaa;font-size:15px;font-weight:700;cursor:default;transition:all .2s';
+    connectBtn.textContent = 'Select a wallet';
+    connectBtn.onclick = async () => {
+      const sel = options.filter(o => o._selected);
+      if (!sel.length) return;
+      connectBtn.disabled = true;
+      connectBtn.style.background = '#b8aee0';
+      connectBtn.innerHTML = 'Connecting <span style="display:inline-block;animation:gwm-spin .8s linear infinite">◌</span>';
+      for (const opt of sel) {
+        try {
+          statusDiv.textContent = 'Connecting ' + opt.label + '…';
+          statusDiv.style.color = '#888';
+          await opt.action();
+        } catch(e) {
+          statusDiv.textContent = opt.label + ': ' + (e.message || e);
+          statusDiv.style.color = '#e05c3a';
+          await new Promise(r => setTimeout(r, 1800));
+        }
+      }
+      // Small delay so user sees final status before modal closes
+      await new Promise(r => setTimeout(r, 400));
+      overlay.remove();
+      resolve(true);
+    };
+    box.appendChild(connectBtn);
+
+
+
+    function updateBtn() {
+      const sel = options.filter(o => o._selected);
+      if (sel.length) {
+        connectBtn.style.background = 'linear-gradient(135deg,#a78bfa 0%,#7c3aed 100%)';
+        connectBtn.style.color = '#fff'; connectBtn.style.cursor = 'pointer';
+        connectBtn.textContent = 'Connect ' + sel.map(o => o.label).join(' + ');
+        connectBtn.disabled = false;
+      } else {
+        connectBtn.style.background = '#d0cce8'; connectBtn.style.color = '#aaa';
+        connectBtn.style.cursor = 'default'; connectBtn.textContent = 'Select a wallet';
+        connectBtn.disabled = true;
+      }
+    }
+
+    // CSS animation
+    if (!document.getElementById('gwm-style')) {
+      const st = document.createElement('style');
+      st.id = 'gwm-style';
+      st.textContent = '@keyframes gwm-spin{to{transform:rotate(360deg)}}';
+      document.head.appendChild(st);
+    }
+
+    hdr.querySelector('#gwm-close').onclick = () => { overlay.remove(); resolve(null); };
+    overlay.onclick = (e) => { if (e.target === overlay) { overlay.remove(); resolve(null); } };
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+  });
+}
+
+// EVM only picker — still returns provider for internal use
+function pickEvmWallet() {
+  const providers = getEvmProviders();
+  return new Promise((resolve) => {
+    if (!providers.length) { resolve(null); return; }
+    let _chosen = null;
+    const opts = providers.map((p, i) => {
+      const info = providerInfo(p);
+      return { id: 'evm' + i, label: info.name, icon: info.icon, desc: 'EVM Wallet', ecosystem: 'EVM',
+        action: async () => { _chosen = p; } };
+    });
+    showWalletConnectModal(opts).then(() => resolve(_chosen));
+  });
+}
+
+// Master "Connect Wallets" entry — Garden-style modal with ALL detected wallet types
+async function showConnectModal() {
+  const evmProviders = getEvmProviders();
+  const opts = [];
+
+  evmProviders.forEach((p, i) => {
+    const info = providerInfo(p);
+    opts.push({ id: 'evm' + i, label: info.name, icon: info.icon, desc: '11 EVM chains', ecosystem: 'EVM',
+      action: async () => { await _doConnectEvm(p); }
+    });
+  });
+
+  if (window.solana || window.phantom?.solana)
+    opts.push({ id: 'phantom', label: 'Phantom', icon: '👻', desc: 'Solana', ecosystem: 'Solana', action: connectPhantom });
+
+  if (window.starknet || window.argent)
+    opts.push({ id: 'starknet', label: 'ArgentX', icon: '🌐', desc: 'Starknet', ecosystem: 'Starknet', action: connectStarknet });
+
+  if (window.suiWallet || window.sui)
+    opts.push({ id: 'sui', label: 'Sui Wallet', icon: '💧', desc: 'Sui Network', ecosystem: 'Sui', action: connectSui });
+
+  if (window.tronWeb || window.tronLink)
+    opts.push({ id: 'tron', label: 'TronLink', icon: '🔴', desc: 'Tron Network', ecosystem: 'Tron', action: connectTron });
+
+  if (!opts.length) {
+    alert('No wallets detected.\nInstall MetaMask, Phantom, ArgentX, or another wallet extension.');
     return;
   }
+  await showWalletConnectModal(opts);
+}
+
+// Connect any injected EVM wallet (MetaMask, OKX, Rabby, etc.)
+// connectEvmWallet — always shows Garden-style modal, even for single wallet
+async function connectEvmWallet() {
+  // Route through master modal so user always gets the Garden-style prompt
+  await showConnectModal();
+}
+
+// Internal EVM connect action called from modal
+async function _doConnectEvm(provider) {
+  const accounts = await provider.request({ method: 'eth_requestAccounts' });
+  if (!accounts?.length) throw new Error('No accounts returned');
+  evmAddress = accounts[0];
+  connectedWallets.evm = true;
+  window._evmProvider = provider;
+  const info = providerInfo(provider);
+  window._evmWalletName = info.name;
+
+  document.getElementById('evm-wallet-icon').textContent = info.icon;
+  document.getElementById('evm-wallet-name').textContent = '(' + info.name + ')';
+
+  await fetch('/api/wallet/evm', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ address: evmAddress }) });
+
+  const addrEl = document.getElementById('evm-addr');
+  addrEl.textContent = shortenAddr(evmAddress);
+  addrEl.dataset.full = evmAddress;
+  addrEl.style.color = 'var(--green)';
+  addrEl.title = evmAddress + ' (click to copy)';
+  document.getElementById('evm-btn').textContent = 'Disconnect';
+  document.getElementById('evm-btn').className = 'btn btn-red';
+  document.getElementById('evm-btn').onclick = disconnectEvm;
+  document.getElementById('evm-expand-btn').style.display = 'inline';
+  const envBtn = document.getElementById('evm-envkey-btn');
+  if (envBtn) envBtn.style.display = _envKeyAvailable ? 'inline-flex' : 'none';
+  renderEvmChains(true, evmAddress);
+  updateWalletCount();
+  fetchEvmBalances(evmAddress);
+
+  provider.on('accountsChanged', (accs) => {
+    if (!accs.length) disconnectEvm();
+    else {
+      evmAddress = accs[0];
+      const el = document.getElementById('evm-addr');
+      el.textContent = shortenAddr(evmAddress);
+      el.dataset.full = evmAddress;
+      renderEvmChains(true, evmAddress);
+      fetch('/api/wallet/evm', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ address: evmAddress }) });
+    }
+  });
+}
+
+// Keep connectMetaMask as alias
+const connectMetaMask = connectEvmWallet;
+
+// Switch wallet — always shows picker regardless of current connection
+async function switchEvmWallet() {
+  const providers = getEvmProviders();
+  if (providers.length === 0) { alert('No EVM wallets detected.'); return; }
+  // Disconnect current first silently
+  window._evmProvider = null;
+  const provider = providers.length > 1 ? await pickEvmWallet() : providers[0];
+  if (!provider) return;
   try {
-    const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+    const accounts = await provider.request({ method: 'eth_requestAccounts' });
     evmAddress = accounts[0];
     connectedWallets.evm = true;
-
-    // Tell backend
-    await fetch('/api/wallet/evm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address: evmAddress }) });
-
-    document.getElementById('evm-addr').textContent = shortenAddr(evmAddress);
-    document.getElementById('evm-addr').style.color = 'var(--green)';
+    window._evmProvider = provider;
+    const info = providerInfo(provider);
+    window._evmWalletName = info.name;
+    document.getElementById('evm-wallet-icon').textContent = info.icon;
+    document.getElementById('evm-wallet-name').textContent = '(' + info.name + ')';
+    const addrEl = document.getElementById('evm-addr');
+    addrEl.textContent = shortenAddr(evmAddress);
+    addrEl.dataset.full = evmAddress;
+    addrEl.style.color = 'var(--green)';
+    addrEl.title = evmAddress + ' (click to copy)';
     document.getElementById('evm-btn').textContent = 'Disconnect';
     document.getElementById('evm-btn').className = 'btn btn-red';
     document.getElementById('evm-btn').onclick = disconnectEvm;
+    document.getElementById('evm-switch-btn').style.display = 'inline-flex';
+    await fetch('/api/wallet/evm', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ address: evmAddress }) });
     renderEvmChains(true, evmAddress);
     updateWalletCount();
-    // Fetch EVM balances from free public RPCs in background
     fetchEvmBalances(evmAddress);
-
-    // Listen for account changes
-    window.ethereum.on('accountsChanged', (accs) => {
-      if (accs.length === 0) disconnectEvm(); // will fall back to envkey if available
-      else {
-        evmAddress = accs[0];
-        document.getElementById('evm-addr').textContent = shortenAddr(evmAddress) + ' 🦊';
-        renderEvmChains(true, evmAddress);
-        fetch('/api/wallet/evm', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ address: evmAddress }) });
-      }
-    });
-  } catch (err) {
-    alert('MetaMask connection failed: ' + err.message);
+  } catch(e) {
+    alert('Switch failed: ' + e.message);
   }
 }
 
@@ -1763,9 +3076,9 @@ async function disconnectEvm() {
 
 
 async function switchToChain(chainId) {
-  if (!window.ethereum) return;
+  if (!window._evmProvider && !window.ethereum) return;
   try {
-    await window.ethereum.request({ method: 'wallet_switchEthereumChain', params: [{ chainId }] });
+    await ensureChain(chainId);
   } catch (err) {
     alert('Could not switch network: ' + err.message);
   }
@@ -2032,10 +3345,38 @@ async function loadWalletStates() {
     // EVM
     if (d.evm) {
       connectedWallets.evm = true; evmAddress = d.evm.address;
-      document.getElementById('evm-addr').textContent = shortenAddr(d.evm.address) + srcBadge(d.evm.source, 'metamask');
-      document.getElementById('evm-addr').style.color = srcColor(d.evm.source);
+      const _evmEl = document.getElementById('evm-addr');
+      _evmEl.textContent = shortenAddr(d.evm.address) + srcBadge(d.evm.source, 'metamask');
+      _evmEl.dataset.full = d.evm.address;
+      _evmEl.title = d.evm.address + ' (click to copy)';
+      _evmEl.style.color = srcColor(d.evm.source);
+      if (d.evm.source === 'metamask') {
+        // Find the provider that has this address and set _evmProvider
+        (async () => {
+          for (const _p of getEvmProviders()) {
+            try {
+              const _accs = await _p.request({ method: 'eth_accounts' });
+              if (_accs && _accs[0] && _accs[0].toLowerCase() === d.evm.address.toLowerCase()) {
+                window._evmProvider = _p;
+                const _info = providerInfo(_p);
+                window._evmWalletName = _info.name;
+                document.getElementById('evm-wallet-icon').textContent = _info.icon;
+                document.getElementById('evm-wallet-name').textContent = '(' + _info.name + ')';
+                break;
+              }
+            } catch(_) {}
+          }
+        })();
+      } else if (d.evm.source === 'envkey') {
+        document.getElementById('evm-wallet-icon').textContent = '🔐';
+        document.getElementById('evm-wallet-name').textContent = '(.env key)';
+      } else if (d.evm.source === 'privy') {
+        document.getElementById('evm-wallet-icon').textContent = '🔑';
+        document.getElementById('evm-wallet-name').textContent = '(Privy)';
+      }
+      document.getElementById('evm-expand-btn').style.display = 'inline';
       if (d.evm.source === 'envkey') {
-        setEnvkeyBtn('evm-btn', connectMetaMask, 'MetaMask');
+        setEnvkeyBtn('evm-btn', connectEvmWallet, 'Wallet');
       } else {
         const btn = document.getElementById('evm-btn');
         if (btn) { btn.textContent = 'Disconnect'; btn.className = 'btn btn-red'; btn.onclick = disconnectEvm; }
@@ -2059,8 +3400,11 @@ async function loadWalletStates() {
     // Solana
     if (d.solana) {
       connectedWallets.solana = true;
-      document.getElementById('sol-addr').textContent = shortenAddr(d.solana.address) + srcBadge(d.solana.source, 'phantom');
-      document.getElementById('sol-addr').style.color = srcColor(d.solana.source);
+      const _solEl = document.getElementById('sol-addr');
+      _solEl.textContent = shortenAddr(d.solana.address) + srcBadge(d.solana.source, 'phantom');
+      _solEl.dataset.full = d.solana.address;
+      _solEl.title = d.solana.address + ' (click to copy)';
+      _solEl.style.color = srcColor(d.solana.source);
       if (d.solana.source === 'envkey') {
         setEnvkeyBtn('sol-btn', connectPhantom, 'Phantom');
       } else {
@@ -2100,15 +3444,44 @@ async function loadWalletStates() {
       document.getElementById('privy-status-badge').style.color = 'var(--green)';
     }
 
+    // Track whether an envkey is configured for the "Use .env" button
+    _envKeyAvailable = !!(d.evm?.source === 'envkey' ||
+      (d.evm && await fetch('/api/wallet/envkey-status').then(r=>r.json()).then(d=>d.evm).catch(()=>false)));
+
     updateWalletCount();
     // Auto-fetch EVM balances for envkey/privy (no MetaMask event to trigger it)
     if (d.evm && (d.evm.source === 'envkey' || d.evm.source === 'privy')) fetchEvmBalances(d.evm.address);
+
+    // Show "Use .env" btn if MetaMask is active but envkey is also configured
+    if (d.evm?.source === 'metamask') {
+      try {
+        const ek = await fetch('/api/wallet/envkey-status').then(r=>r.json());
+        _envKeyAvailable = !!ek.evm;
+        const envBtn = document.getElementById('evm-envkey-btn');
+        if (envBtn) envBtn.style.display = ek.evm ? 'inline-flex' : 'none';
+      } catch(_) {}
+    }
   } catch (_) {}
 }
 
 function shortenAddr(addr) {
   if (!addr) return '';
   return addr.length > 12 ? addr.slice(0, 6) + '...' + addr.slice(-4) : addr;
+}
+
+function copyAddr(el) {
+  const full = el.dataset.full || el.textContent.replace(/[^\w.]/g, '');
+  if (!full || full === 'Not connected') return;
+  navigator.clipboard.writeText(full).then(() => {
+    const orig = el.textContent;
+    el.textContent = '✅ Copied!';
+    setTimeout(() => { el.textContent = orig; }, 1200);
+  }).catch(() => {
+    // Fallback
+    const ta = document.createElement('textarea');
+    ta.value = full; document.body.appendChild(ta); ta.select();
+    document.execCommand('copy'); document.body.removeChild(ta);
+  });
 }
 
 // ── EVM BALANCE FETCH ─────────────────────────────────────────
@@ -2130,6 +3503,8 @@ async function fetchEvmBalances(address) {
     }
     // Expose balances globally for combinations
     window._evmBalances = d.balances || {};
+    window._evmTokenBalances = d.tokenBalances || {};  // { chainPrefix: { TICKER: {raw,formatted,tokenAddr} } }
+    refreshChainBalanceDisplay(); // update chain balance grid if open
     if (d.rpcErrors?.length) {
       d.rpcErrors.forEach(e => addIssue('rpc', 'warning', `RPC Error: ${e.chain}`, e.message, { chain: e.chain }));
     }
@@ -2325,13 +3700,21 @@ connectWS();
 // (restarted/envkey took over), browser silently re-registers with no popup.
 (async function reannounceWallets() {
   try {
-    if (window.ethereum) {
-      const accounts = await window.ethereum.request({ method: 'eth_accounts' }); // no popup
-      if (accounts && accounts[0]) {
-        await fetch('/api/wallet/evm', { method: 'POST', headers: {'Content-Type':'application/json'},
-          body: JSON.stringify({ address: accounts[0] }) });
-        evmAddress = accounts[0];
-      }
+    // Try to silently re-detect the previously connected wallet (no popup)
+    const _providers = getEvmProviders();
+    for (const _p of _providers) {
+      try {
+        const accounts = await _p.request({ method: 'eth_accounts' }); // no popup
+        if (accounts && accounts[0]) {
+          window._evmProvider = _p;
+          const info = providerInfo(_p);
+          window._evmWalletName = info.name;
+          await fetch('/api/wallet/evm', { method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({ address: accounts[0] }) });
+          evmAddress = accounts[0];
+          break; // stop after first one that has accounts
+        }
+      } catch(_) {}
     }
   } catch(_) {}
   try {
