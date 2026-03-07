@@ -29,24 +29,56 @@ const garden = {
   getOrder:         (id)          => client.get(`/orders/${id}`).then(r => r.data),
   getOrders:        (f = {})      => client.get("/orders", { params: f }).then(r => r.data),
   createOrder:      (body)        => client.post("/orders", body).then(r => r.data),
-  patchOrder:       (id, action, txHash) => client.patch(`/orders/${id}`, { action, tx_hash: txHash }).then(r => r.data),
+  // txHashOrSig: pass tx_hash string for regular flow, or { signature } object for gasless EIP-712
+  patchOrder: (id, action, txHashOrSig) => {
+    const body = { action };
+    if (txHashOrSig) {
+      if (typeof txHashOrSig === 'object' && txHashOrSig.signature) {
+        body.signature = txHashOrSig.signature;   // gasless path
+      } else {
+        body.tx_hash = txHashOrSig;               // regular path
+      }
+    }
+    return client.patch(`/orders/${id}`, body).then(r => r.data);
+  },
   getRefundHash:    (id)          => client.get(`/orders/${id}/instant-refund-hash`).then(r => r.data),
   getVolume:        ()            => client.get("/volume").then(r => r.data),
   getFees:          ()            => client.get("/fees").then(r => r.data),
 
   // Poll order until status matches target or timeout
-  async pollOrder(orderId, targetStatus, timeoutMs = 600000, intervalMs = 5000) {
+  // Poll until order reaches targetStatus (substring match, case-insensitive)
+  // onProgress(status, order) called on every poll tick so caller can update UI
+  async pollOrder(orderId, targetStatus, timeoutMs = 600000, intervalMs = 5000, onProgress) {
+    // Garden's real lifecycle statuses (in order):
+    // Matched → InitiateDetected → Initiated → CounterPartyInitiateDetected
+    //   → CounterPartyInitiated → Redeemed/Completed/Expired/Refunded
+    const TERMINAL_FAIL = ["refunded", "expired", "failed", "cancelled"];
     const start = Date.now();
+    let lastStatus = "";
     while (Date.now() - start < timeoutMs) {
-      const res = await garden.getOrder(orderId);
-      const status = (res.result?.status || "").toLowerCase();
-      if (status.includes(targetStatus.toLowerCase()))
-        return { success: true, order: res.result, elapsed: Date.now() - start };
-      if (status.includes("refund") || status.includes("fail") || status.includes("expired"))
-        return { success: false, order: res.result, elapsed: Date.now() - start, reason: status };
+      let res;
+      try { res = await garden.getOrder(orderId); }
+      catch(e) { await new Promise(r => setTimeout(r, intervalMs)); continue; }
+
+      const order  = res.result || res;
+      const status = (order?.status || order?.order_status || "").toLowerCase().replace(/\s+/g, "");
+
+      if (status && status !== lastStatus) {
+        lastStatus = status;
+        if (onProgress) onProgress(status, order);
+      }
+
+      // Success condition
+      if (status.includes(targetStatus.toLowerCase().replace(/\s+/g, "")))
+        return { success: true, order, status, elapsed: Date.now() - start };
+
+      // Failure terminals
+      if (TERMINAL_FAIL.some(t => status.includes(t)))
+        return { success: false, order, status, elapsed: Date.now() - start, reason: status };
+
       await new Promise(r => setTimeout(r, intervalMs));
     }
-    return { success: false, order: null, elapsed: timeoutMs, reason: "timeout" };
+    return { success: false, order: null, status: lastStatus, elapsed: timeoutMs, reason: "timeout" };
   },
 };
 
