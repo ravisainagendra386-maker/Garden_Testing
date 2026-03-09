@@ -53,12 +53,37 @@ function getEvmAddress() {
 // legacy alias
 const getAddress = getEvmAddress;
 
+// Free public RPCs as last-resort fallback (same list as server.js)
+const FREE_RPCS_FALLBACK = {
+  'base_sepolia':     'https://sepolia.base.org',
+  'base':             'https://sepolia.base.org',
+  'ethereum_sepolia': 'https://rpc.sepolia.org',
+  'ethereum':         'https://rpc.sepolia.org',
+  'arbitrum_sepolia': 'https://sepolia-rollup.arbitrum.io/rpc',
+  'arbitrum':         'https://sepolia-rollup.arbitrum.io/rpc',
+  'bnbchain_testnet': 'https://data-seed-prebsc-1-s1.binance.org:8545',
+  'bnbchain':         'https://data-seed-prebsc-1-s1.binance.org:8545',
+  'hyperevm_testnet': 'https://rpc.hyperliquid-testnet.xyz/evm',
+  'hyperevm':         'https://rpc.hyperliquid-testnet.xyz/evm',
+  'monad_testnet':    'https://testnet-rpc.monad.xyz',
+  'monad':            'https://testnet-rpc.monad.xyz',
+  'citrea_testnet':   'https://rpc.testnet.citrea.xyz',
+  'alpen_testnet':    'https://rpc.testnet.alpen.xyz',
+  // numeric chain IDs
+  84532:  'https://sepolia.base.org',
+  11155111: 'https://rpc.sepolia.org',
+  421614: 'https://sepolia-rollup.arbitrum.io/rpc',
+  97:     'https://data-seed-prebsc-1-s1.binance.org:8545',
+};
+
 function getRpcForChain(chainIdOrKey) {
   if (_rpcs[chainIdOrKey]) return _rpcs[chainIdOrKey];
   const chainId = parseInt(chainIdOrKey);
   if (!isNaN(chainId)) {
     const chain = Object.values(config.chains).find(c => c.chainId === chainId);
     if (chain?.rpc) return chain.rpc;
+    // Free fallback by numeric id
+    if (FREE_RPCS_FALLBACK[chainId]) return FREE_RPCS_FALLBACK[chainId];
     for (const [key] of Object.entries(_rpcs)) {
       const cfgChain = Object.values(config.chains).find(c =>
         c.id && key.startsWith(c.id) && c.chainId === chainId
@@ -70,6 +95,10 @@ function getRpcForChain(chainIdOrKey) {
   for (const [key, url] of Object.entries(_rpcs)) {
     if (key.startsWith(strKey) || strKey.startsWith(key.split("_")[0])) return url;
   }
+  // Free fallback by string key
+  if (FREE_RPCS_FALLBACK[strKey]) return FREE_RPCS_FALLBACK[strKey];
+  const stripped = strKey.replace(/_sepolia|_testnet\d*|_mainnet/g, '');
+  if (FREE_RPCS_FALLBACK[stripped]) return FREE_RPCS_FALLBACK[stripped];
   const byId = Object.values(config.chains).find(c => c.id === strKey);
   if (byId?.rpc) return byId.rpc;
   throw new Error(`No RPC found for chain: ${chainIdOrKey}`);

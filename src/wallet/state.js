@@ -94,7 +94,7 @@ function connectBtc(address, wif, balance, source) {
     console.log(`[wallet] BTC ${src} ignored — ${store.btcSource} already connected`);
     return false;
   }
-  store.btc = { address, wif: wif || null, balance: balance || "unknown", source: src };
+  store.btc = { address, wif: wif || null, balance: balance || "unknown", pendingSats: 0, source: src };
   store.btcSource = src;
   console.log(`[wallet] BTC [${src}]: ${address}`);
   return true;
@@ -211,7 +211,7 @@ function getStatus() {
     suiSource:      store.suiSource,
     tronSource:     store.tronSource,
     evm:      store.evm      ? { address: store.evm.address,      source: store.evm.source,      tokenBalances: store.evm.tokenBalances || {} } : null,
-    btc:      store.btc      ? { address: store.btc.address,      source: store.btc.source,      balance: store.btc.balance }                   : null,
+    btc:      store.btc      ? { address: store.btc.address,      source: store.btc.source,      balance: store.btc.balance, pendingSats: store.btc.pendingSats || 0 }                   : null,
     solana:   store.solana   ? { address: store.solana.address,   source: store.solana.source,   balance: store.solana.balance }                : null,
     starknet: store.starknet ? { address: store.starknet.address, source: store.starknet.source }                                               : null,
     sui:      store.sui      ? { address: store.sui.address,      source: store.sui.source }                                                    : null,
@@ -233,4 +233,5 @@ module.exports = {
   connectEnvKeyStarknet, connectEnvKeySui, connectEnvKeyTron,
   // misc
   disconnect, setEvmBalances,
+  setBtcPending: (sats) => { if (store.btc) store.btc.pendingSats = sats; },
 };

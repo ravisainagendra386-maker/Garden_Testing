@@ -612,11 +612,16 @@ app.post("/api/wallet/btc", async (req, res) => {
   try {
     const net = config.isMainnet ? "" : "/testnet4";
     const r   = await axios.get(`https://mempool.space${net}/api/address/${address}`);
-    const s   = r.data?.chain_stats || {};
-    const sats = (s.funded_txo_sum || 0) - (s.spent_txo_sum || 0);
-    const balance = (sats / 1e8).toFixed(8);
+    const cs  = r.data?.chain_stats   || {};   // confirmed on-chain
+    const ms  = r.data?.mempool_stats || {};   // pending in mempool
+    const confirmedSats = (cs.funded_txo_sum || 0) - (cs.spent_txo_sum || 0);
+    const pendingSats   = (ms.funded_txo_sum || 0) - (ms.spent_txo_sum || 0);
+    const balance = (confirmedSats / 1e8).toFixed(8);
+    const balanceFull = pendingSats !== 0
+      ? `${balance} (+${(Math.abs(pendingSats)/1e8).toFixed(8)} pending)`
+      : balance;
     walletState.connectBtc(address, wif, balance);
-    res.json({ ok: true, address, balance });
+    res.json({ ok: true, address, balance, confirmedSats, pendingSats, balanceFull });
   } catch (_) {
     walletState.connectBtc(address, wif, "unknown");
     res.json({ ok: true, address, balance: "unknown" });
@@ -722,9 +727,15 @@ app.get("/api/wallet/balances", async (req, res) => {
     try {
       const net = config.isMainnet ? "" : "/testnet4";
       const r   = await axios.get(`https://mempool.space${net}/api/address/${btcAddr}`);
-      const s   = r.data?.chain_stats || {};
-      const sats = (s.funded_txo_sum || 0) - (s.spent_txo_sum || 0);
-      walletState.connectBtc(btcAddr, walletState.getBtcWif(), (sats / 1e8).toFixed(8));
+      const cs  = r.data?.chain_stats   || {};
+      const ms  = r.data?.mempool_stats || {};
+      const confirmedSats = (cs.funded_txo_sum || 0) - (cs.spent_txo_sum || 0);
+      const pendingSats   = (ms.funded_txo_sum || 0) - (ms.spent_txo_sum || 0);
+      const confirmedBtc  = (confirmedSats / 1e8).toFixed(8);
+      walletState.connectBtc(btcAddr, walletState.getBtcWif(), confirmedBtc);
+      if (pendingSats !== 0) {
+        walletState.setBtcPending && walletState.setBtcPending(pendingSats);
+      }
     } catch (_) {}
   }
   // Return wallet status but NEVER expose private keys or full addresses from .env

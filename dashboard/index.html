@@ -515,19 +515,6 @@
       </div>
       <p style="font-size:13px;color:var(--muted);margin-bottom:16px">Connect your wallets to enable test execution across all Garden Finance chains.</p>
 
-      <!-- Priority info box -->
-      <div style="background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.25);border-radius:10px;padding:12px 16px;margin-bottom:20px;font-size:12px">
-        <div style="font-weight:700;color:var(--yellow);margin-bottom:6px">&#x1F510; .env Key Priority</div>
-        <div style="color:var(--muted);line-height:1.7">
-          Wallet connections use this priority order:<br>
-          <span style="color:var(--green)">3. Browser extension</span> (MetaMask, Phantom…) — <b>highest — overrides everything</b><br>
-          <span style="color:var(--cyan)">2. Privy server wallet</span> — overrides .env keys<br>
-          <span style="color:var(--yellow)">1. .env private key</span> — auto-connects on startup, lowest priority<br>
-          <br>
-          Set <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">EVM_PRIVATE_KEY</code>, <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">BTC_PRIVATE_KEY_WIF</code>, <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">SOLANA_PRIVATE_KEY</code> etc in your <code style="background:var(--bg3);padding:1px 5px;border-radius:3px">.env</code> for automated signing.
-        </div>
-      </div>
-
       <!-- EVM GROUP -->
       <div class="wallet-group" id="wg-evm">
         <div class="wallet-group-header">
@@ -697,10 +684,17 @@
       </label>
       <p style="font-size:12px;color:var(--muted);margin-top:8px">When enabled, a prompt appears before each transaction is sent on-chain.</p>
 
-      <!-- .env key status notification -->
-      <div id="envkey-notice" style="margin-top:18px;background:rgba(245,158,11,.07);border:1px solid rgba(245,158,11,.3);border-radius:10px;padding:14px 16px">
-        <div style="font-weight:700;font-size:13px;color:var(--yellow);margin-bottom:8px">📄 .env Key Status</div>
-        <div id="envkey-notice-body" style="font-size:12px;color:var(--muted);line-height:1.7">
+      <!-- .env Priority + Status — moved below manual approve -->
+      <div class="divider" style="margin-top:20px"></div>
+      <div style="background:rgba(245,158,11,.05);border:1px solid rgba(245,158,11,.2);border-radius:12px;padding:16px;margin-top:4px">
+        <div style="font-weight:700;font-size:13px;color:var(--yellow);margin-bottom:10px">🔐 .env Key Configuration</div>
+        <div style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.7">
+          Priority order (highest wins):<br>
+          <span style="color:var(--green)">3. Browser extension</span> (MetaMask, Phantom…) — overrides everything<br>
+          <span style="color:var(--cyan)">2. Privy server wallet</span> — overrides .env keys<br>
+          <span style="color:var(--yellow)">1. .env private key</span> — auto-connects on startup, lowest priority
+        </div>
+        <div id="envkey-notice-body" style="font-size:12px;color:var(--muted);line-height:1.8">
           Loading .env key status…
         </div>
       </div>
@@ -902,28 +896,61 @@ async function updateEnvKeyNotice() {
   const el = document.getElementById('envkey-notice-body');
   if (!el) return;
   try {
-    const r = await fetch('/api/wallet/envkey-status');
-    const d = await r.json();
-    const rows = [];
+    // Fetch both what's in .env AND what's currently active as wallet source
+    const [ekRes, balRes] = await Promise.all([
+      fetch('/api/wallet/envkey-status').then(r => r.json()).catch(() => ({})),
+      fetch('/api/wallet/balances').then(r => r.json()).catch(() => ({})),
+    ]);
+
     const keys = [
-      { key: 'evm',      label: 'EVM (EVM_PRIVATE_KEY)',         varName: 'EVM_PRIVATE_KEY' },
-      { key: 'btc',      label: 'Bitcoin (BTC_PRIVATE_KEY_WIF)', varName: 'BTC_PRIVATE_KEY_WIF' },
-      { key: 'solana',   label: 'Solana (SOLANA_PRIVATE_KEY)',   varName: 'SOLANA_PRIVATE_KEY' },
-      { key: 'starknet', label: 'Starknet',                      varName: 'STARKNET_PRIVATE_KEY' },
-      { key: 'sui',      label: 'Sui (SUI_PRIVATE_KEY)',         varName: 'SUI_PRIVATE_KEY' },
-      { key: 'tron',     label: 'Tron (TRON_PRIVATE_KEY)',       varName: 'TRON_PRIVATE_KEY' },
+      { key: 'evm',      label: 'EVM',      varName: 'EVM_PRIVATE_KEY',       balKey: 'evm'      },
+      { key: 'btc',      label: 'Bitcoin',   varName: 'BTC_PRIVATE_KEY_WIF',   balKey: 'btc'      },
+      { key: 'solana',   label: 'Solana',    varName: 'SOLANA_PRIVATE_KEY',    balKey: 'solana'   },
+      { key: 'starknet', label: 'Starknet',  varName: 'STARKNET_PRIVATE_KEY',  balKey: 'starknet' },
+      { key: 'sui',      label: 'Sui',       varName: 'SUI_PRIVATE_KEY',       balKey: 'sui'      },
+      { key: 'tron',     label: 'Tron',      varName: 'TRON_PRIVATE_KEY',      balKey: 'tron'     },
     ];
-    for (const { key, label, varName } of keys) {
-      const v = d[key];
-      if (v && v.address) {
-        const addr = v.address;
-        const shortAddr = addr.length > 16 ? addr.slice(0,10)+'…'+addr.slice(-6) : addr;
-        rows.push(`<span style="color:var(--green)">✅ ${label}</span> — <code style="background:var(--bg3);padding:1px 5px;border-radius:3px;font-size:11px">${shortAddr}</code>`);
-      } else {
-        rows.push(`<span style="color:var(--muted)">⬜ ${label}</span> — <span style="color:var(--muted);font-size:11px">not set — add <code style="background:var(--bg3);padding:1px 4px;border-radius:3px">${varName}</code> to .env</span>`);
+
+    const rows = keys.map(({ key, label, varName, balKey }) => {
+      const envEntry  = ekRes[key];     // { address } if set in .env
+      const activeWal = balRes[balKey]; // { address, source } if currently active
+
+      if (!envEntry?.address) {
+        // Not set in .env at all
+        return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
+          <span style="color:var(--muted);font-size:16px">⬜</span>
+          <div>
+            <span style="color:var(--muted)">${label}</span>
+            <span style="font-size:11px;color:var(--muted);margin-left:6px">add <code style="background:var(--bg3);padding:1px 4px;border-radius:3px">${varName}</code> to .env</span>
+          </div>
+        </div>`;
       }
-    }
-    el.innerHTML = rows.join('<br>');
+
+      const addr = envEntry.address;
+      const shortAddr = addr.length > 16 ? addr.slice(0,10) + '…' + addr.slice(-6) : addr;
+      const isActive = activeWal?.source === 'envkey';
+      const overridden = activeWal && activeWal.source !== 'envkey';
+      const overrideSrc = activeWal?.source || '';
+
+      const statusIcon  = isActive ? '🔐' : overridden ? '🔀' : '✅';
+      const statusColor = isActive ? 'var(--yellow)' : overridden ? 'var(--cyan)' : 'var(--green)';
+      const statusText  = isActive
+        ? '<span style="color:var(--yellow);font-size:11px">● Active (no browser wallet override)</span>'
+        : overridden
+          ? `<span style="color:var(--cyan);font-size:11px">● Overridden by ${overrideSrc}</span>`
+          : '<span style="color:var(--green);font-size:11px">● Configured</span>';
+
+      return `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.04)">
+        <span style="font-size:16px">${statusIcon}</span>
+        <div style="flex:1">
+          <span style="color:${statusColor};font-weight:600">${label}</span>
+          <code style="background:var(--bg3);padding:1px 5px;border-radius:3px;font-size:11px;margin-left:8px">${shortAddr}</code>
+          <div style="margin-top:2px">${statusText}</div>
+        </div>
+      </div>`;
+    });
+
+    el.innerHTML = rows.join('');
   } catch(e) {
     el.textContent = 'Could not load .env key status.';
   }
@@ -1148,54 +1175,168 @@ function toggleIssueExpand(idx) {
 
 let _currentIssueFilter = 'all';
 
+// ─── Issue reasoning database ────────────────────────────────────────────────
+function getIssueReasoning(issue) {
+  const t = (issue.title || '').toLowerCase();
+  const d = (issue.detail || '').toLowerCase();
+  if (issue.type === 'rpc' || t.includes('rpc') || d.includes('rpc unreachable') || t.includes('balance unverifi')) {
+    return {
+      why: 'The RPC endpoint for this chain is unreachable, returning errors, or rate-limited. The test suite cannot read balances, submit transactions, or confirm on-chain state without a working RPC.',
+      fix: 'Click "Fix RPC" below to update the endpoint. Free public RPCs are pre-filled — or use Alchemy / Infura for higher reliability.',
+      canFixRpc: true
+    };
+  }
+  if (t.includes('insufficient balance') || issue.type === 'balance') {
+    return {
+      why: 'Your wallet has less than the required amount on the source chain. The order was blocked before creation to prevent stuck funds.',
+      fix: 'Top up your wallet on the source chain, or lower the swap amount in Trade Combinations.'
+    };
+  }
+  if (t.includes('no liquidity') || t.includes('liquidity')) {
+    return {
+      why: 'Garden Finance has no solver willing to fill this route at this amount right now. Solver liquidity is dynamic and varies by chain and time of day.',
+      fix: 'Try a smaller amount, wait for solvers to rebalance, or try a different asset pair.'
+    };
+  }
+  if (t.includes('unsupported pair') || t.includes('no order pair') || t.includes('no pair')) {
+    return {
+      why: 'The Garden API returned no supported order pair for this route. The pair may not be configured on testnet, or the assets are not bridgeable at this time.',
+      fix: 'Check Garden testnet docs for supported pairs. Run "Validate Pairs" in Trade Combinations to filter to working routes.'
+    };
+  }
+  if (t.includes('solver') || d.includes('counterparty') || d.includes('solver')) {
+    return {
+      why: 'The Garden solver did not initiate on the destination chain within the polling window. This happens if no solver currently has liquidity on the destination chain, or chain/network congestion caused delays.',
+      fix: 'Check the order on the Garden testnet explorer — the solver may still fulfil it. If the order expires, an instant-refund transaction becomes available.'
+    };
+  }
+  if (t.includes('erc20') || t.includes('approve') || t.includes('allowance')) {
+    return {
+      why: 'The ERC20 approval transaction failed or was rejected. The HTLC contract must be granted a spending allowance before it can lock your tokens.',
+      fix: 'Ensure you confirmed the approval in MetaMask and had enough ETH for gas. For .env key wallets, verify EVM_PRIVATE_KEY has gas on this chain.'
+    };
+  }
+  if (t.includes('rejected') || t.includes('user denied') || t.includes('metamask')) {
+    return {
+      why: 'The wallet rejected the transaction — the user declined, the wallet was locked, or the wrong network was selected.',
+      fix: 'Ensure MetaMask is unlocked and on the correct network, then re-run the test.'
+    };
+  }
+  if (t.includes('400') || t.includes('notify garden')) {
+    return {
+      why: 'Garden API returned 400 when notified of the initiation transaction — usually the tx was not yet confirmed on-chain at the time of the notification.',
+      fix: 'This is often transient. The runner now waits for on-chain confirmation before notifying. If it persists, check the RPC for the source chain.',
+      canFixRpc: true
+    };
+  }
+  if (t.includes('timeout')) {
+    return {
+      why: 'A step exceeded its maximum wait time. Common on testnet due to slow block production, chain congestion, or an unresponsive RPC.',
+      fix: 'Verify your RPC endpoints are healthy. Testnet chains can be 5–30× slower than mainnet.'
+    };
+  }
+  if (t.includes('health') || t.includes('api test')) {
+    return {
+      why: 'The Garden API server or local test server is not responding. All tests depend on this.',
+      fix: 'Ensure the server is running (`node src/server.js`), GARDEN_API_KEY is set in .env, and you have internet access.'
+    };
+  }
+  return null;
+}
+
 function renderIssues(filter = 'all') {
   _currentIssueFilter = filter;
   const list = document.getElementById('issueList');
   const filtered = filter === 'all' ? issues : issues.filter(i => i.type === filter || i.severity === filter);
-  if (!filtered.length) { list.innerHTML = '<div class="empty-state">No issues detected yet — run tests first</div>'; return; }
+  if (!filtered.length) {
+    list.innerHTML = '<div class="empty-state">No issues detected yet — run tests first</div>';
+    return;
+  }
+
   list.innerHTML = filtered.map((i, idx) => {
-    const expanded = _issueExpanded.has(idx);
-    // If issue has steps (linked to a test run), show them in the dropdown
-    const hasSteps = i.meta?.steps && i.meta.steps.length > 0;
-    const hasExtra = hasSteps || i.meta?.orderId || i.meta?.txHash;
+    const expanded  = _issueExpanded.has(idx);
+    const hasSteps  = Array.isArray(i.meta?.steps) && i.meta.steps.length > 0;
+    const reasoning = getIssueReasoning(i);
+    const hasExpand = hasSteps || reasoning || i.meta?.orderId;
 
-    const stepsHtml = hasSteps ? i.meta.steps.map(st => {
-      const icon = st.status === 'pass' ? '✅' : st.status === 'fail' ? '❌' : st.status === 'running' ? '⏳' : '⏸';
-      const col  = st.status === 'pass' ? 'var(--green)' : st.status === 'fail' ? 'var(--red)' : st.status === 'running' ? 'var(--yellow)' : 'var(--muted)';
-      const txLink = st.txHash && st.txHash.startsWith('0x') ? ` <a href="#" style="color:var(--cyan);font-size:10px" onclick="event.stopPropagation()">${st.txHash.slice(0,10)}…</a>` : '';
-      return `<div style="display:flex;align-items:flex-start;gap:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.04)">
-        <span style="flex-shrink:0;width:18px">${icon}</span>
-        <div style="flex:1">
-          <span style="font-weight:600;font-size:12px;color:${col}">${st.name}</span>${txLink}
-          ${st.detail ? `<div style="font-size:11px;color:var(--muted);margin-top:1px">${st.detail}</div>` : ''}
+    // Detect RPC chain: explicit meta.chain, or try to extract from detail
+    const rpcChain = i.meta?.chain || null;
+
+    // ── Trade flow steps ──────────────────────────────────────────────────────
+    const stepsHtml = hasSteps ? `
+      <div style="margin-bottom:12px">
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:8px;display:flex;align-items:center;gap:6px">
+          <span>⚡ Trade Flow</span>
+          ${i.meta.orderId ? `<code style="font-size:10px;color:var(--cyan);background:var(--bg2);padding:1px 6px;border-radius:4px">#${i.meta.orderId.slice(0,12)}…</code>` : ''}
         </div>
-        <span style="font-size:10px;color:var(--muted);flex-shrink:0">${st.ts ? st.ts.split('T')[1]?.slice(0,8) : ''}</span>
-      </div>`;
-    }).join('') : '';
+        <div style="border-left:2px solid rgba(255,255,255,.1);padding-left:10px">
+          ${i.meta.steps.map((st, si) => {
+            const icon = st.status === 'pass' ? '✅' : st.status === 'fail' ? '❌' : st.status === 'running' ? '⏳' : '○';
+            const col  = st.status === 'pass' ? 'var(--green)' : st.status === 'fail' ? 'var(--red)' : st.status === 'running' ? 'var(--yellow)' : 'var(--muted)';
+            const txLink = st.txHash?.startsWith?.('0x')
+              ? ` <a href="#" style="color:var(--cyan);font-size:10px;text-decoration:none" onclick="event.stopPropagation()">tx ${st.txHash.slice(0,8)}…</a>` : '';
+            const isFailed = st.status === 'fail';
+            return `<div style="display:flex;align-items:flex-start;gap:8px;padding:5px 0;${si < i.meta.steps.length-1 ? 'border-bottom:1px solid rgba(255,255,255,.04)' : ''}${isFailed ? ';background:rgba(239,68,68,.04);margin:-2px -6px;padding-left:6px;border-radius:4px' : ''}">
+              <span style="flex-shrink:0;width:16px;font-size:12px">${icon}</span>
+              <div style="flex:1;min-width:0">
+                <span style="font-weight:600;font-size:12px;color:${col}">${st.name}</span>${txLink}
+                ${st.detail ? `<div style="font-size:11px;color:var(--muted);margin-top:2px;line-height:1.45;word-break:break-word">${st.detail}</div>` : ''}
+              </div>
+              <span style="font-size:10px;color:var(--muted);flex-shrink:0;padding-top:1px">${st.ts ? st.ts.split('T')[1]?.slice(0,8) ?? '' : ''}</span>
+            </div>`;
+          }).join('')}
+        </div>
+      </div>` : (i.meta?.orderId ? `<div style="font-size:11px;color:var(--muted);margin-bottom:10px">Order: <code style="color:var(--cyan)">${i.meta.orderId}</code></div>` : '');
 
-    const extraHtml = i.meta?.orderId ? `<div style="font-size:11px;color:var(--muted);margin-top:6px">Order: <code style="color:var(--cyan)">${i.meta.orderId}</code></div>` : '';
+    // ── Reasoning ─────────────────────────────────────────────────────────────
+    const reasonHtml = reasoning ? `
+      <div style="margin-bottom:${rpcChain && reasoning.canFixRpc ? '10' : '0'}px">
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:6px">🔍 Why This Happened</div>
+        <div style="font-size:12px;color:var(--text);line-height:1.6;background:rgba(255,255,255,.025);border-radius:6px;padding:9px 11px;border:1px solid rgba(255,255,255,.06)">${reasoning.why}</div>
+        ${reasoning.fix ? `<div style="font-size:12px;line-height:1.5;margin-top:7px;padding:7px 11px;background:rgba(245,158,11,.06);border-radius:6px;border-left:2px solid var(--yellow)">
+          <span style="font-weight:700;color:var(--yellow)">How to fix: </span><span style="color:var(--text)">${reasoning.fix}</span>
+        </div>` : ''}
+      </div>` : '';
 
-    return `<div class="issue-item" style="cursor:${hasExtra?'pointer':'default'}" onclick="${hasExtra ? `toggleIssueExpand(${idx})` : ''}">
+    // ── RPC fix button (in dropdown, bigger) ──────────────────────────────────
+    const dropRpcBtn = rpcChain ? `
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.06)">
+        <button class="btn btn-ghost" onclick="event.stopPropagation();openRpcModal('${rpcChain}')"
+          style="font-size:12px;padding:6px 14px;border-color:var(--cyan);color:var(--cyan);width:100%;justify-content:center">
+          🔧 Fix RPC for ${rpcChain.replace(/_/g,' ')}
+        </button>
+      </div>` : (reasoning?.canFixRpc ? `
+      <div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(255,255,255,.06)">
+        <button class="btn btn-ghost" onclick="event.stopPropagation();openRpcModal('')"
+          style="font-size:12px;padding:6px 14px;border-color:var(--cyan);color:var(--cyan);width:100%;justify-content:center">
+          🔧 Open RPC Settings
+        </button>
+      </div>` : '');
+
+    // ── Header quick-fix button ───────────────────────────────────────────────
+    const headerRpcBtn = (i.type === 'rpc' || reasoning?.canFixRpc) && rpcChain
+      ? `<button class="btn btn-ghost" onclick="event.stopPropagation();openRpcModal('${rpcChain}')"
+           style="font-size:10px;padding:2px 8px;border-color:var(--cyan);color:var(--cyan)">🔧 Fix RPC</button>` : '';
+
+    return `<div class="issue-item" style="cursor:${hasExpand ? 'pointer' : 'default'}" onclick="${hasExpand ? `toggleIssueExpand(${idx})` : ''}">
       <div class="issue-header">
         <div style="display:flex;align-items:center;gap:6px;flex:1;min-width:0">
-          ${hasExtra ? `<span style="color:var(--muted);font-size:12px;transition:transform .2s;display:inline-block;transform:rotate(${expanded?90:0}deg)">▶</span>` : ''}
+          ${hasExpand ? `<span style="color:var(--muted);font-size:11px;display:inline-block;transform:rotate(${expanded ? 90 : 0}deg);transition:transform .18s;flex-shrink:0">▶</span>` : ''}
           <span class="issue-title" style="flex:1">${i.title}</span>
         </div>
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
-          ${i.type === 'rpc' && i.meta?.chain ? `<button class="btn btn-ghost" onclick="event.stopPropagation();openRpcModal('${i.meta.chain}')"
-            style="font-size:10px;padding:2px 8px;border-color:var(--cyan);color:var(--cyan)">🔧 Fix RPC</button>` : ''}
+          ${headerRpcBtn}
           <span class="badge sev-${i.severity}">${i.severity.toUpperCase()}</span>
         </div>
       </div>
       <div class="issue-detail">${i.detail}</div>
       <div style="font-size:11px;color:var(--muted);margin-top:4px">${i.type.toUpperCase()} · ${i.ts}</div>
-      ${expanded && hasExtra ? `<div style="margin-top:10px;background:var(--bg3);border-radius:8px;padding:10px 12px">
-        ${stepsHtml}${extraHtml}
+      ${expanded && hasExpand ? `<div style="margin-top:10px;background:var(--bg3);border-radius:10px;padding:12px 14px;border:1px solid rgba(255,255,255,.07)">
+        ${stepsHtml}${reasonHtml}${dropRpcBtn}
       </div>` : ''}
     </div>`;
   }).join('');
 }
-
 function filterIssues(f) { renderIssues(f); }
 
 // ── STATS ──
@@ -1665,20 +1806,45 @@ function renderDropdownList(side, query) {
     const chainAssets   = swAllAssets.filter(a => a.chainKey === ck);
     if (!chainAssets.length) continue;
 
-    html += `<div style="border-bottom:1px solid rgba(255,255,255,.05)">
+    // For 'from' side: check if the entire chain has any asset with balance
+    const balDataLoaded = Object.keys(window._evmBalances||{}).length > 0 || Object.keys(window._evmTokenBalances||{}).length > 0;
+    const chainHasAnyBalance = (() => {
+      if (side !== 'from' || !balDataLoaded) return true;
+      try {
+        const evmBals = window._evmBalances || {};
+        const evmTokBals = window._evmTokenBalances || {};
+        const chainBalsKey = Object.keys(evmBals).find(k =>
+          ck.startsWith(k.split('_')[0]) || k.startsWith(ck.split('_')[0]) || ck === k
+        );
+        if (!chainBalsKey) return false;
+        for (const a of chainAssets) {
+          const ticker = a.ticker.toUpperCase();
+          const tokBal = evmTokBals[chainBalsKey]?.[ticker];
+          if (tokBal && parseFloat(tokBal.formatted) > 0) return true;
+          const isNative = ['eth','bnb','bera','core','btcn'].includes(a.ticker.toLowerCase());
+          if (isNative && Number(evmBals[chainBalsKey] || 0) > 0) return true;
+        }
+        return false;
+      } catch(_) { return true; }
+    })();
+    const chainDisabled = side === 'from' && balDataLoaded && !chainHasAnyBalance;
+
+    html += `<div style="border-bottom:1px solid rgba(255,255,255,.05);${chainDisabled?'opacity:.4':''}">
       <!-- Chain header row -->
-      <div onclick="toggleChainSel('${side}','${ck}')"
-        style="display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;background:${chainSelected?'rgba(34,197,94,.06)':'none'};transition:background .12s"
-        onmouseenter="this.style.background='var(--bg3)'" onmouseleave="this.style.background='${chainSelected?'rgba(34,197,94,.06)':'none'}'">
-        <div style="width:18px;height:18px;border:2px solid ${chainSelected?'var(--accent)':'var(--border)'};border-radius:4px;background:${chainSelected?'var(--accent)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s">
-          ${chainSelected?'<span style="color:#000;font-size:11px;font-weight:900">✓</span>':''}
+      <div onclick="${chainDisabled ? '' : `toggleChainSel('${side}','${ck}')`}"
+        style="display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:${chainDisabled?'not-allowed':'pointer'};background:${chainSelected?'rgba(34,197,94,.06)':'none'};transition:background .12s"
+        ${!chainDisabled ? `onmouseenter="this.style.background='var(--bg3)'" onmouseleave="this.style.background='${chainSelected?'rgba(34,197,94,.06)':'none'}'"` : ''}>
+        <div style="width:18px;height:18px;border:2px solid ${chainSelected&&!chainDisabled?'var(--accent)':'var(--border)'};border-radius:4px;background:${chainSelected&&!chainDisabled?'var(--accent)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s">
+          ${chainSelected&&!chainDisabled?'<span style="color:#000;font-size:11px;font-weight:900">✓</span>':''}
         </div>
         <span style="font-size:18px">${cm.icon}</span>
         <div style="flex:1">
           <div style="font-weight:700;font-size:13px;color:var(--text)">${chainLabel}</div>
           <div style="font-size:10px;color:var(--muted)">${chainAssets.map(a=>a.ticker.toUpperCase()).join(' · ')}</div>
         </div>
-        <span style="font-size:11px;color:var(--muted)">${chainAssets.length} asset${chainAssets.length!==1?'s':''}</span>
+        ${chainDisabled
+          ? '<span style="font-size:10px;color:var(--muted);font-style:italic">no balance</span>'
+          : `<span style="font-size:11px;color:var(--muted)">${chainAssets.length} asset${chainAssets.length!==1?'s':''}</span>`}
       </div>
       <!-- Asset rows (only shown when chain selected) -->
       ${chainSelected ? chainAssets.map(a => {
@@ -3045,6 +3211,7 @@ async function switchEvmWallet() {
 
 async function disconnectEvm() {
   connectedWallets.evm = false; evmAddress = null;
+  setTimeout(updateEnvKeyNotice, 500); // re-check — envkey may re-activate
   await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'evm' }) });
 
   // Server re-activates envkey after disconnect — check if it did
@@ -3098,9 +3265,13 @@ async function saveBtcWallet() {
     const r = await fetch('/api/wallet/btc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, wif }) });
     const d = await r.json();
     connectedWallets.btc = true;
-    el.textContent = `✅ Saved — Balance: ${d.balance} BTC`;
+    const pendingLabel = d.pendingSats && d.pendingSats !== 0
+      ? ` <span style="color:var(--yellow);font-size:11px">(${d.pendingSats > 0 ? '+' : ''}${(d.pendingSats/1e8).toFixed(8)} unconfirmed)</span>`
+      : '';
+    el.innerHTML = `✅ Saved — Balance: <b>${d.balance} BTC</b> confirmed${pendingLabel}`;
     el.style.color = 'var(--green)';
-    document.getElementById('btc-balance').textContent = `${d.balance} BTC`;
+    const balEl = document.getElementById('btc-balance');
+    balEl.innerHTML = `${d.balance} BTC${d.pendingSats && d.pendingSats !== 0 ? ` <span style="color:var(--yellow);font-size:10px">(${d.pendingSats > 0 ? '+' : ''}${(d.pendingSats/1e8).toFixed(8)} pending)</span>` : ''}`;
     document.getElementById('btc-wif-input').value = ''; // clear key from UI
     if (wif) document.getElementById('btc-wif-input').placeholder = '•••••••• (saved in memory)';
     updateWalletCount();
@@ -3377,6 +3548,9 @@ async function loadWalletStates() {
       document.getElementById('evm-expand-btn').style.display = 'inline';
       if (d.evm.source === 'envkey') {
         setEnvkeyBtn('evm-btn', connectEvmWallet, 'Wallet');
+        // Also render chains and fetch balances so user sees balance grid
+        renderEvmChains(true, d.evm.address);
+        fetchEvmBalances(d.evm.address);
       } else {
         const btn = document.getElementById('evm-btn');
         if (btn) { btn.textContent = 'Disconnect'; btn.className = 'btn btn-red'; btn.onclick = disconnectEvm; }
@@ -3388,9 +3562,13 @@ async function loadWalletStates() {
     if (d.btc) {
       connectedWallets.btc = true;
       const btcSrc = d.btc.source === 'envkey' ? ' 🔐 .env key' : '';
-      document.getElementById('btc-status').textContent = '✅ ' + d.btc.address + ' — ' + d.btc.balance + ' BTC' + btcSrc;
+      const btcPendingLabel = d.btc.pendingSats && d.btc.pendingSats !== 0
+        ? ` · <span style="color:var(--yellow)">${d.btc.pendingSats > 0 ? '+' : ''}${(d.btc.pendingSats/1e8).toFixed(8)} pending</span>`
+        : '';
+      document.getElementById('btc-status').innerHTML = '✅ ' + d.btc.address + ' — <b>' + d.btc.balance + ' BTC</b>' + btcSrc + btcPendingLabel;
       document.getElementById('btc-status').style.color = srcColor(d.btc.source);
-      document.getElementById('btc-balance').textContent = d.btc.balance + ' BTC';
+      const btcBalEl = document.getElementById('btc-balance');
+      btcBalEl.innerHTML = d.btc.balance + ' BTC (confirmed)' + (d.btc.pendingSats && d.btc.pendingSats !== 0 ? ` <span style="color:var(--yellow);font-size:10px">${d.btc.pendingSats > 0 ? '+' : ''}${(d.btc.pendingSats/1e8).toFixed(8)} pending</span>` : '');
       if (d.btc.source === 'envkey') {
         document.getElementById('btc-address-input').value = d.btc.address;
         document.getElementById('btc-address-input').placeholder = 'From .env key (override by saving new address)';
@@ -3451,6 +3629,8 @@ async function loadWalletStates() {
     updateWalletCount();
     // Auto-fetch EVM balances for envkey/privy (no MetaMask event to trigger it)
     if (d.evm && (d.evm.source === 'envkey' || d.evm.source === 'privy')) fetchEvmBalances(d.evm.address);
+    // Sync .env notice panel
+    updateEnvKeyNotice();
 
     // Show "Use .env" btn if MetaMask is active but envkey is also configured
     if (d.evm?.source === 'metamask') {
