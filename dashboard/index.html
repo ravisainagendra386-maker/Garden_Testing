@@ -306,6 +306,26 @@
 
     <!-- TRADE COMBINATIONS PANEL -->
     <div class="panel" id="panel-combinations">
+      <!-- AI Arbitrage Bot summary (pinned to top of panel) -->
+      <div class="card" id="arbBotCard" style="margin-bottom:12px;padding:12px 14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <div>
+            <div style="font-size:13px;font-weight:700">🤖 AI Arbitrage Bot</div>
+            <div id="arbBotStatus" style="font-size:11px;color:var(--muted)">Scan for profitable round-trip routes across tradeable pairs.</div>
+          </div>
+          <div style="text-align:right;font-size:11px;color:var(--muted)">
+            PnL (est.): <span id="arbTotalPnl" style="font-weight:700;color:var(--green)">$0.00</span>
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+          <button class="btn btn-ghost" id="btnScanArb" onclick="scanArbitrage()" style="font-size:11px;padding:5px 10px">🔍 Scan Opportunities</button>
+          <button class="btn btn-green" id="btnExecTopArb" onclick="executeTopArb()" style="font-size:11px;padding:5px 10px" disabled>▶ Execute Top</button>
+        </div>
+        <div id="arbLastTrades" style="font-size:11px;color:var(--muted);max-height:120px;overflow-y:auto">
+          No arbitrage trades executed yet.
+        </div>
+      </div>
+
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
         <div>
           <h1 class="section-title" style="margin:0">⚡ Trade Combinations</h1>
@@ -688,14 +708,11 @@
       <div class="divider" style="margin-top:20px"></div>
       <div style="background:rgba(245,158,11,.05);border:1px solid rgba(245,158,11,.2);border-radius:12px;padding:16px;margin-top:4px">
         <div style="font-weight:700;font-size:13px;color:var(--yellow);margin-bottom:10px">🔐 .env Key Configuration</div>
-        <div style="font-size:12px;color:var(--muted);margin-bottom:12px;line-height:1.7">
+        <div style="font-size:12px;color:var(--muted);line-height:1.7">
           Priority order (highest wins):<br>
           <span style="color:var(--green)">3. Browser extension</span> (MetaMask, Phantom…) — overrides everything<br>
           <span style="color:var(--cyan)">2. Privy server wallet</span> — overrides .env keys<br>
           <span style="color:var(--yellow)">1. .env private key</span> — auto-connects on startup, lowest priority
-        </div>
-        <div id="envkey-notice-body" style="font-size:12px;color:var(--muted);line-height:1.8">
-          Loading .env key status…
         </div>
       </div>
     </div>
@@ -2173,7 +2190,42 @@ function logEvent(event, data) {
   const cls = event.includes('pass') || event.includes('end') ? 'log-pass'
             : event.includes('fail') || event.includes('error') ? 'log-fail'
             : event.includes('start') ? 'log-info' : 'log-warn';
-  const detail = typeof data === 'object' ? (data.label || data.message || data.event || '') : '';
+
+  let detail = '';
+  if (typeof data === 'object' && data) {
+    // Rich formatting for core test events so you see real step data.
+    if (event === 'test_step' && data.step) {
+      const s = data.step;
+      const label = data.label || '';
+      const base = `${s.name || 'Step'} [${s.status || 'unknown'}]`;
+      const extra = s.detail ? ` — ${s.detail}` : '';
+      detail = label ? `${label} · ${base}${extra}` : `${base}${extra}`;
+    } else if (event === 'test_start') {
+      const label = data.label || '';
+      const amt   = data.amount;
+      const pair  = data.fromAsset && data.toAsset ? `${data.fromAsset} → ${data.toAsset}` : '';
+      const bits  = [];
+      if (label) bits.push(label);
+      if (pair)  bits.push(pair);
+      if (amt)   bits.push(`amount=${amt}`);
+      detail = bits.join(' · ');
+    } else if (event === 'suite_routes') {
+      detail = `Total routes: ${data.count} · ${Array.isArray(data.routes) ? data.routes.slice(0,5).join(', ') + (data.routes.length>5?'…':'') : ''}`;
+    } else {
+      // Generic objects: prefer label/message, but fall back to JSON so you can see raw payloads.
+      detail = data.label || data.message || data.event || '';
+      if (!detail) {
+        try {
+          detail = JSON.stringify(data).slice(0, 200);
+        } catch(_) {
+          detail = '';
+        }
+      }
+    }
+  } else if (typeof data === 'string') {
+    detail = data;
+  }
+
   // Prepend so newest entries appear at top — no scrolling needed
   log.insertAdjacentHTML('afterbegin', `<div class="log-line ${cls}"><span class="log-ts">[${ts}]</span> ${event}${detail ? ' — ' + detail : ''}</div>`);
   // Cap at 2000 lines to prevent memory bloat
@@ -2224,8 +2276,40 @@ function filterRoutes(f) {
 
 // ── TRADE COMBINATIONS ────────────────────────────────────────
 
-let allCombos    = [];
+let allCombos     = [];
 let currentFilter = "all";
+let _arbScanResults = [];
+
+async function refreshArbSummary() {
+  try {
+    const r = await fetch('/api/arbitrage/summary');
+    const d = await r.json();
+    const totalEl = document.getElementById('arbTotalPnl');
+    const listEl  = document.getElementById('arbLastTrades');
+    if (!totalEl || !listEl || !d || !d.ok) return;
+    const pnl = Number(d.totalProfitUsd || 0);
+    const color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+    totalEl.textContent = `$${pnl.toFixed(2)}`;
+    totalEl.style.color = color;
+    const trades = d.trades || [];
+    if (!trades.length) {
+      listEl.textContent = 'No arbitrage trades executed yet.';
+    } else {
+      listEl.innerHTML = trades.slice(0, 10).map(t => {
+        const dir  = `${t.fromTicker || t.fromAssetId || ''} → ${t.toTicker || t.toAssetId || ''}`;
+        const sign = t.usdPnl >= 0 ? '+' : '';
+        const ts   = t.ts ? new Date(t.ts).toISOString().replace('T',' ').split('.')[0] : '';
+        return `<div style="margin-bottom:4px">
+          <span style="font-family:'JetBrains Mono',monospace">${dir}</span>
+          <span style="margin-left:6px;color:${t.usdPnl >= 0 ? 'var(--green)' : 'var(--red)'}">${sign}$${Number(t.usdPnl).toFixed(2)}</span>
+          <span style="font-size:10px;color:var(--muted);margin-left:6px">${ts}</span>
+        </div>`;
+      }).join('');
+    }
+  } catch(_) {
+    // Silent failure — bot is best-effort only
+  }
+}
 
 async function loadCombinations() {
   const grid    = document.getElementById("combosGrid");
@@ -2265,6 +2349,7 @@ async function loadCombinations() {
 
     loading.style.display = "none";
     renderCombos(currentFilter);
+    refreshArbSummary();
   } catch (err) {
     loading.innerHTML = `
       <div style="color:var(--yellow);padding:20px;text-align:center">
@@ -2445,6 +2530,97 @@ function renderCombos(filter) {
       </div>`}
     </div>`;
   }).join("");
+}
+
+async function scanArbitrage() {
+  const btn     = document.getElementById('btnScanArb');
+  const execBtn = document.getElementById('btnExecTopArb');
+  const status  = document.getElementById('arbBotStatus');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Scanning…';
+  if (execBtn) execBtn.disabled = true;
+  try {
+    // Ensure we have combinations loaded so the server sees current wallet state
+    if (!allCombos.length) {
+      await loadCombinations();
+    }
+    const r = await fetch('/api/arbitrage/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ minEdgeBps: 10, maxRoutes: 40 }),
+    });
+    const d = await r.json();
+    _arbScanResults = d.opportunities || [];
+    if (status) {
+      if (!_arbScanResults.length) {
+        status.textContent = 'No profitable arbitrage opportunities found at current prices.';
+      } else {
+        const top = _arbScanResults[0];
+        status.textContent = `${_arbScanResults.length} opportunities found. Top edge ~${(top.edge * 100).toFixed(2)}%`;
+      }
+    }
+    if (execBtn) execBtn.disabled = !_arbScanResults.length;
+  } catch (e) {
+    if (status) status.textContent = `Scan failed: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '🔍 Scan Opportunities';
+    refreshArbSummary();
+  }
+}
+
+async function executeTopArb() {
+  if (!_arbScanResults.length) return;
+  const top = _arbScanResults[0];
+  const btn = document.getElementById('btnExecTopArb');
+  const status = document.getElementById('arbBotStatus');
+  if (!btn || !top || !top.from || !top.to) return;
+  const amount = Number(top.amount || 0);
+  const fromLabel = top.from.name || top.from.assetId;
+  const toLabel   = top.to.name   || top.to.assetId;
+  if (!amount || amount <= 0) return;
+
+  if (!confirm(`Execute arbitrage trade?\n\n${fromLabel} → ${toLabel}\nAmount (atomic): ${amount.toLocaleString()}\nEstimated edge: ${(top.edge * 100).toFixed(2)}%\n\nThis will initiate a real transaction.`)) {
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Executing…';
+  try {
+    const payload = {
+      fromAssetId:    top.from.assetId,
+      toAssetId:      top.to.assetId,
+      fromWalletType: top.from.walletType,
+      toWalletType:   top.to.walletType,
+      amount,
+      minEdgeBps: Math.max(5, Math.round((top.edge || 0) * 10000) - 5),
+    };
+    const r = await fetch('/api/arbitrage/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      const reason = d.reason || d.error || 'Execution blocked by verification.';
+      alert(reason);
+      if (status) status.textContent = reason;
+    } else {
+      showPanel('dashboard');
+      const stopBtn = document.getElementById('btnStop');
+      if (stopBtn) stopBtn.style.display = 'inline-flex';
+      document.getElementById('lastRunLabel').textContent = '⏳ Arbitrage trade running…';
+      if (status) status.textContent = 'Arbitrage trade started. Watch Active Test.';
+    }
+  } catch (e) {
+    alert('Execution failed: ' + e.message);
+    if (status) status.textContent = `Execution failed: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '▶ Execute Top';
+    refreshArbSummary();
+  }
 }
 
 function filterCombos(filter) {
@@ -3266,12 +3442,12 @@ async function saveBtcWallet() {
     const d = await r.json();
     connectedWallets.btc = true;
     const pendingLabel = d.pendingSats && d.pendingSats !== 0
-      ? ` <span style="color:var(--yellow);font-size:11px">(${d.pendingSats > 0 ? '+' : ''}${(d.pendingSats/1e8).toFixed(8)} unconfirmed)</span>`
+      ? ` <span style="color:var(--yellow);font-size:11px">(${d.pendingSats > 0 ? '+' : ''}${(d.pendingSats/1e8).toFixed(8)} pending in mempool)</span>`
       : '';
     el.innerHTML = `✅ Saved — Balance: <b>${d.balance} BTC</b> confirmed${pendingLabel}`;
     el.style.color = 'var(--green)';
     const balEl = document.getElementById('btc-balance');
-    balEl.innerHTML = `${d.balance} BTC${d.pendingSats && d.pendingSats !== 0 ? ` <span style="color:var(--yellow);font-size:10px">(${d.pendingSats > 0 ? '+' : ''}${(d.pendingSats/1e8).toFixed(8)} pending)</span>` : ''}`;
+    balEl.innerHTML = `${d.balance} BTC${d.pendingSats && d.pendingSats !== 0 ? ` <span style="color:var(--yellow);font-size:10px">(${d.pendingSats > 0 ? '+' : ''}${(d.pendingSats/1e8).toFixed(8)} pending in mempool)</span>` : ''}`;
     document.getElementById('btc-wif-input').value = ''; // clear key from UI
     if (wif) document.getElementById('btc-wif-input').placeholder = '•••••••• (saved in memory)';
     updateWalletCount();
@@ -3563,12 +3739,12 @@ async function loadWalletStates() {
       connectedWallets.btc = true;
       const btcSrc = d.btc.source === 'envkey' ? ' 🔐 .env key' : '';
       const btcPendingLabel = d.btc.pendingSats && d.btc.pendingSats !== 0
-        ? ` · <span style="color:var(--yellow)">${d.btc.pendingSats > 0 ? '+' : ''}${(d.btc.pendingSats/1e8).toFixed(8)} pending</span>`
+        ? ` · <span style="color:var(--yellow)">${d.btc.pendingSats > 0 ? '+' : ''}${(d.btc.pendingSats/1e8).toFixed(8)} pending in mempool</span>`
         : '';
       document.getElementById('btc-status').innerHTML = '✅ ' + d.btc.address + ' — <b>' + d.btc.balance + ' BTC</b>' + btcSrc + btcPendingLabel;
       document.getElementById('btc-status').style.color = srcColor(d.btc.source);
       const btcBalEl = document.getElementById('btc-balance');
-      btcBalEl.innerHTML = d.btc.balance + ' BTC (confirmed)' + (d.btc.pendingSats && d.btc.pendingSats !== 0 ? ` <span style="color:var(--yellow);font-size:10px">${d.btc.pendingSats > 0 ? '+' : ''}${(d.btc.pendingSats/1e8).toFixed(8)} pending</span>` : '');
+      btcBalEl.innerHTML = d.btc.balance + ' BTC (confirmed)' + (d.btc.pendingSats && d.btc.pendingSats !== 0 ? ` <span style="color:var(--yellow);font-size:10px">${d.btc.pendingSats > 0 ? '+' : ''}${(d.btc.pendingSats/1e8).toFixed(8)} pending in mempool</span>` : '');
       if (d.btc.source === 'envkey') {
         document.getElementById('btc-address-input').value = d.btc.address;
         document.getElementById('btc-address-input').placeholder = 'From .env key (override by saving new address)';

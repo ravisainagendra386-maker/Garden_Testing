@@ -44,6 +44,8 @@ const { initiateEvm, redeemEvm } = require("../htlc/evm");
 const envkey = require("../wallet/envkey");
 const { initiateHtlc }           = require("../wallet/btc");
 const walletState = require("../wallet/state");
+const routeOptimizerAgent        = require("../agents/routeOptimizerAgent");
+const tradeHistory               = require("../agents/tradeHistory");
 
 let _emit = null;
 let _approvalQueue = [];
@@ -856,6 +858,24 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     if (slippagePct > 1.5) throw new Error(`Slippage ${slippagePct.toFixed(2)}% exceeds 1.5%`);
     step("Amount Verification", "pass", `Received: ${received} (slippage: ${slippagePct.toFixed(3)}%)`);
 
+    // Record into shared trade history so optimizers / agents can learn
+    try {
+      tradeHistory.record({
+        testId,
+        status:      "pass",
+        fromAssetId: fromAsset,
+        toAssetId:   toAsset,
+        fromChain,
+        toChain,
+        amount:      safeAmount,
+        outputAmount: received,
+        usdIn:       Number(bestQuote?.source?.value ?? bestQuote?.source?.usd ?? 0),
+        usdOut:      Number(bestQuote?.destination?.value ?? bestQuote?.destination?.usd ?? 0),
+        slippagePct,
+        durationSec: elapsed,
+        ts:          new Date().toISOString(),
+      });
+    } catch (_) {}
 
     emit("test_end", { testId, label, status: "pass", steps, duration: elapsed });
     _activeTests.delete(testId);
@@ -865,7 +885,25 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     const failStep = { name: "Error", status: "fail", detail: err.message, ts: new Date().toISOString() };
     steps.push(failStep);
     emit("test_step", { testId, label, step: failStep });
-    emit("test_end",  { testId, label, status: err.message.includes("aborted") ? "aborted" : "fail", error: err.message, steps });
+    const finalStatus = err.message.includes("aborted") ? "aborted" : "fail";
+    emit("test_end",  { testId, label, status: finalStatus, error: err.message, steps });
+    try {
+      tradeHistory.record({
+        testId,
+        status:      finalStatus,
+        fromAssetId: fromAsset,
+        toAssetId:   toAsset,
+        fromChain,
+        toChain,
+        amount,
+        outputAmount: 0,
+        usdIn:       0,
+        usdOut:      0,
+        slippagePct: 0,
+        durationSec: 0,
+        ts:          new Date().toISOString(),
+      });
+    } catch (_) {}
     _activeTests.delete(testId);
     return { testId, label, status: "fail", error: err.message, steps };
   }
@@ -959,7 +997,16 @@ async function buildRoutes(amountOverrides = {}) {
       });
     }
   }
-  return routes;
+
+  // Let the Route Optimizer Agent reorder and trim the list
+  // to prioritize high-signal pairs (BTC↔BTC, stables, ETH) and
+  // keep the overall suite size manageable.
+  try {
+    return routeOptimizerAgent.optimizeRoutes(routes, { maxTotal: 160, perPairLimit: 3 });
+  } catch (_) {
+    // Fallback to original ordering if the agent fails for any reason
+    return routes;
+  }
 }
 
 // ── RUN ALL ───────────────────────────────────────────────────

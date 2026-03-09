@@ -5,11 +5,12 @@ const WebSocket  = require("ws");
 const cors       = require("cors");
 const path       = require("path");
 const axios      = require("axios");
-const config     = require("./config");
-const runner     = require("./tests/runner");
-const garden     = require("./api/garden");
+const config      = require("./config");
+const runner      = require("./tests/runner");
+const garden      = require("./api/garden");
 const walletState = require("./wallet/state");
 const envkey      = require("./wallet/envkey");
+const arbitrageAgent = require("./agents/arbitrageAgent");
 
 const app = express();
 app.use(cors());
@@ -28,9 +29,27 @@ runner.setEmitter(broadcast);
 // ── HEALTH ────────────────────────────────────────────────────
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
-// ── CORE TEST ROUTES ──────────────────────────────────────────
+// ── CORE TEST ROUTES / BOT STATE ─────────────────────────────
 // Amount overrides from trade-size modal (set before running)
 let _amountOverrides = {};
+
+// In-memory summary of arbitrage bot performance (estimated USD PnL).
+let _arbSummary = {
+  totalProfitUsd: 0,
+  trades: [], // { fromAssetId,toAssetId,amount,usdPnl,edgeBps,ts,fromTicker,toTicker }
+};
+
+function recordArbTrade(entry) {
+  const usdPnl = Number(entry.usdPnl || 0);
+  if (!Number.isFinite(usdPnl)) return;
+  _arbSummary.totalProfitUsd += usdPnl;
+  _arbSummary.trades.unshift({
+    ...entry,
+    usdPnl,
+    ts: entry.ts || new Date().toISOString(),
+  });
+  if (_arbSummary.trades.length > 50) _arbSummary.trades.pop();
+}
 
 app.post("/api/run/set-amounts", (req, res) => {
   _amountOverrides = req.body.amounts || {};
@@ -249,138 +268,147 @@ app.get("/api/assets", async (req, res) => {
 });
 
 // ── TRADE COMBINATIONS ────────────────────────────────────────
+async function buildCombinationsResponse() {
+  const wallets = walletState.getStatus();
+  const ar      = await garden.getAssets();
+  const assets  = ar.result || ar.assets || ar || [];
+  if (!assets.length) return { ok: true, total: 0, combinations: [], pairsValidated: false, totalBeforeFilter: 0 };
+
+  // Dynamic wallet type — auto-supports new Garden networks.
+  // Only rejects non-wallet chains: alpen_signet, litecoin, spark, xrpl.
+  function getWalletType(asset) {
+    const chain   = (asset.chain || "").toLowerCase();
+    const prefix  = (asset.id    || "").split(":")[0].toLowerCase();
+    if (chain.startsWith("evm"))      return "evm";
+    if (chain.startsWith("solana"))   return "solana";
+    if (chain.startsWith("starknet")) return "starknet";
+    if (chain.startsWith("tron"))     return "tron";
+    if (chain.startsWith("sui"))      return "sui";
+    if (chain === "bitcoin") {
+      if (/^bitcoin_(testnet|mainnet|signet)$/.test(prefix)) return "bitcoin";
+      return null; // alpen_signet, litecoin_testnet, spark_regtest etc.
+    }
+    return null;
+  }
+
+  function isWalletConnected(t) {
+    return { evm: !!wallets.evm, bitcoin: !!wallets.btc, solana: !!wallets.solana,
+             starknet: !!wallets.starknet, sui: !!wallets.sui, tron: !!wallets.tron }[t] || false;
+  }
+
+  const supported = assets.filter(a => getWalletType(a) !== null);
+  console.log(`[combinations] assets: ${assets.length}, supported: ${supported.length}, wallets:`, JSON.stringify({evm:!!wallets.evm,btc:!!wallets.btc}));
+  const combinations = [];
+
+  // Build all pairs — use asset min/max directly, no policy call needed
+  // Pre-filter: skip obviously unsupported cross-family pairs to reduce noise
+  function assetFamily(asset) {
+    const t = (asset.name || asset.id || '').toLowerCase().split(':').pop();
+    if (/btc$|^btc|wbtc|cbtc|cbbtc|sbtc|hbtc|btcn|lbtc|tbtc|pbtc|rbtc/.test(t)) return 'btc';
+    if (/^eth$|^weth$/.test(t)) return 'eth';
+    if (/usdc|usdt|dai|busd/.test(t)) return 'stable';
+    return 'other_' + t;
+  }
+  function isPairPlausible(from, to) {
+    const ff = assetFamily(from), tf = assetFamily(to);
+    // Same family always plausible
+    if (ff === tf) return true;
+    // BTC ↔ wrapped-BTC is the core Garden use-case
+    if (ff === 'btc' && tf === 'btc') return true;
+    // BTC → stable or BTC → ETH: Garden currently has no solver for these
+    if (ff === 'btc' && tf !== 'btc') return false;
+    if (tf === 'btc' && ff !== 'btc') return false;
+    // Otherwise allow (ETH↔stable etc. may have solvers)
+    return true;
+  }
+
+  for (const from of supported) {
+    for (const to of supported) {
+      if (from.id === to.id) continue;
+      if (!isPairPlausible(from, to)) continue; // skip cross-family
+      const fromType      = getWalletType(from);
+      const toType        = getWalletType(to);
+      const fromConnected = isWalletConnected(fromType);
+      const toConnected   = isWalletConnected(toType);
+      const minAmount     = parseInt(from.min_amount || 50000);
+      const maxAmount     = parseInt(from.max_amount || 1000000);
+
+      // Balance check per wallet type
+      let walletBalance = null;
+      let canAfford     = null; // null=unknown, true=ok, false=insufficient
+
+      if (fromType === "bitcoin" && wallets.btc?.balance && wallets.btc.balance !== "unknown") {
+        walletBalance = Math.floor(parseFloat(wallets.btc.balance) * 1e8); // BTC → sats
+        canAfford = walletBalance >= minAmount;
+      } else if (fromType === "solana" && wallets.solana?.balance) {
+        walletBalance = parseFloat(wallets.solana.balance);
+        canAfford = walletBalance >= minAmount;
+      } else if (fromType === "evm" && wallets.evm?.address) {
+        // Use cached EVM balance if available (populated by /api/wallet/evm/balance)
+        const evmBal = wallets.evm?.tokenBalances?.[from.id];
+        if (evmBal !== undefined) {
+          walletBalance = evmBal;
+          canAfford = walletBalance >= minAmount;
+        }
+        // else remains null = unknown
+      }
+
+      const suggested = (walletBalance !== null && canAfford !== false)
+        ? Math.max(minAmount, Math.min(walletBalance, maxAmount))
+        : minAmount;
+
+      const balanceKnown = walletBalance !== null;
+      // canTrade: both wallets connected AND balance not confirmed insufficient
+      // NOTE: balanceUnknown (EVM) is treated as runnable — runner does its own check
+      const canTrade = fromConnected && toConnected && (canAfford !== false);
+
+      combinations.push({
+        id: `${from.id}->${to.id}`,
+        from: { assetId: from.id, name: from.name, chain: from.chain, icon: from.icon, walletType: fromType, decimals: from.decimals },
+        to:   { assetId: to.id,   name: to.name,   chain: to.chain,   icon: to.icon,   walletType: toType,   decimals: to.decimals },
+        minAmount, maxAmount, suggestedAmount: suggested,
+        fromWalletConnected: fromConnected,
+        toWalletConnected:   toConnected,
+        canTrade,
+        canAfford,       // null=unknown, true=ok, false=insufficient
+        balanceKnown,    // false for EVM (need RPC), true for BTC/SOL
+        walletBalance,
+      });
+    }
+  }
+
+  // Filter out known-invalid pairs using cache (if populated)
+  const validPairsSet = _validPairsCache.env === config.env
+    ? _validPairsCache.pairs
+    : null;
+
+  const finalCombos = validPairsSet
+    ? combinations.filter(c => validPairsSet.has(`${c.from.assetId}::${c.to.assetId}`))
+    : combinations;
+
+  finalCombos.sort((a, b) => {
+    if (a.canTrade && !b.canTrade) return -1;
+    if (!a.canTrade && b.canTrade) return 1;
+    const ap = a.fromWalletConnected || a.toWalletConnected;
+    const bp = b.fromWalletConnected || b.toWalletConnected;
+    if (ap && !bp) return -1;
+    if (!ap && bp) return 1;
+    return a.from.name.localeCompare(b.from.name);
+  });
+
+  return {
+    ok: true,
+    total: finalCombos.length,
+    combinations: finalCombos,
+    pairsValidated: validPairsSet !== null,
+    totalBeforeFilter: combinations.length,
+  };
+}
+
 app.get("/api/combinations", async (req, res) => {
   try {
-    const wallets = walletState.getStatus();
-    const ar      = await garden.getAssets();
-    const assets  = ar.result || ar.assets || ar || [];
-    if (!assets.length) return res.json({ ok: true, total: 0, combinations: [] });
-
-    // Dynamic wallet type — auto-supports new Garden networks.
-    // Only rejects non-wallet chains: alpen_signet, litecoin, spark, xrpl.
-    function getWalletType(asset) {
-      const chain   = (asset.chain || "").toLowerCase();
-      const prefix  = (asset.id    || "").split(":")[0].toLowerCase();
-      if (chain.startsWith("evm"))      return "evm";
-      if (chain.startsWith("solana"))   return "solana";
-      if (chain.startsWith("starknet")) return "starknet";
-      if (chain.startsWith("tron"))     return "tron";
-      if (chain.startsWith("sui"))      return "sui";
-      if (chain === "bitcoin") {
-        if (/^bitcoin_(testnet|mainnet|signet)$/.test(prefix)) return "bitcoin";
-        return null; // alpen_signet, litecoin_testnet, spark_regtest etc.
-      }
-      return null;
-    }
-
-    function isWalletConnected(t) {
-      return { evm: !!wallets.evm, bitcoin: !!wallets.btc, solana: !!wallets.solana,
-               starknet: !!wallets.starknet, sui: !!wallets.sui, tron: !!wallets.tron }[t] || false;
-    }
-
-    const supported = assets.filter(a => getWalletType(a) !== null);
-    console.log(`[combinations] assets: ${assets.length}, supported: ${supported.length}, wallets:`, JSON.stringify({evm:!!wallets.evm,btc:!!wallets.btc}));
-    const combinations = [];
-
-    // Build all pairs — use asset min/max directly, no policy call needed
-    // Pre-filter: skip obviously unsupported cross-family pairs to reduce noise
-    function assetFamily(asset) {
-      const t = (asset.name || asset.id || '').toLowerCase().split(':').pop();
-      if (/btc$|^btc|wbtc|cbtc|cbbtc|sbtc|hbtc|btcn|lbtc|tbtc|pbtc|rbtc/.test(t)) return 'btc';
-      if (/^eth$|^weth$/.test(t)) return 'eth';
-      if (/usdc|usdt|dai|busd/.test(t)) return 'stable';
-      return 'other_' + t;
-    }
-    function isPairPlausible(from, to) {
-      const ff = assetFamily(from), tf = assetFamily(to);
-      // Same family always plausible
-      if (ff === tf) return true;
-      // BTC ↔ wrapped-BTC is the core Garden use-case
-      if (ff === 'btc' && tf === 'btc') return true;
-      // BTC → stable or BTC → ETH: Garden currently has no solver for these
-      if (ff === 'btc' && tf !== 'btc') return false;
-      if (tf === 'btc' && ff !== 'btc') return false;
-      // Otherwise allow (ETH↔stable etc. may have solvers)
-      return true;
-    }
-
-    for (const from of supported) {
-      for (const to of supported) {
-        if (from.id === to.id) continue;
-        if (!isPairPlausible(from, to)) continue; // skip cross-family
-        const fromType      = getWalletType(from);
-        const toType        = getWalletType(to);
-        const fromConnected = isWalletConnected(fromType);
-        const toConnected   = isWalletConnected(toType);
-        const minAmount     = parseInt(from.min_amount || 50000);
-        const maxAmount     = parseInt(from.max_amount || 1000000);
-
-        // Balance check per wallet type
-        let walletBalance = null;
-        let canAfford     = null; // null=unknown, true=ok, false=insufficient
-
-        if (fromType === "bitcoin" && wallets.btc?.balance && wallets.btc.balance !== "unknown") {
-          walletBalance = Math.floor(parseFloat(wallets.btc.balance) * 1e8); // BTC → sats
-          canAfford = walletBalance >= minAmount;
-        } else if (fromType === "solana" && wallets.solana?.balance) {
-          walletBalance = parseFloat(wallets.solana.balance);
-          canAfford = walletBalance >= minAmount;
-        } else if (fromType === "evm" && wallets.evm?.address) {
-          // Use cached EVM balance if available (populated by /api/wallet/evm/balance)
-          const evmBal = wallets.evm?.tokenBalances?.[from.id];
-          if (evmBal !== undefined) {
-            walletBalance = evmBal;
-            canAfford = walletBalance >= minAmount;
-          }
-          // else remains null = unknown
-        }
-
-        const suggested = (walletBalance !== null && canAfford !== false)
-          ? Math.max(minAmount, Math.min(walletBalance, maxAmount))
-          : minAmount;
-
-        const balanceKnown = walletBalance !== null;
-        // canTrade: both wallets connected AND balance not confirmed insufficient
-        // NOTE: balanceUnknown (EVM) is treated as runnable — runner does its own check
-        const canTrade = fromConnected && toConnected && (canAfford !== false);
-
-        combinations.push({
-          id: `${from.id}->${to.id}`,
-          from: { assetId: from.id, name: from.name, chain: from.chain, icon: from.icon, walletType: fromType, decimals: from.decimals },
-          to:   { assetId: to.id,   name: to.name,   chain: to.chain,   icon: to.icon,   walletType: toType,   decimals: to.decimals },
-          minAmount, maxAmount, suggestedAmount: suggested,
-          fromWalletConnected: fromConnected,
-          toWalletConnected:   toConnected,
-          canTrade,
-          canAfford,       // null=unknown, true=ok, false=insufficient
-          balanceKnown,    // false for EVM (need RPC), true for BTC/SOL
-          walletBalance,
-        });
-      }
-    }
-
-    // Filter out known-invalid pairs using cache (if populated)
-    const validPairsSet = _validPairsCache.env === config.env
-      ? _validPairsCache.pairs
-      : null;
-
-    const finalCombos = validPairsSet
-      ? combinations.filter(c => validPairsSet.has(`${c.from.assetId}::${c.to.assetId}`))
-      : combinations;
-
-    finalCombos.sort((a, b) => {
-      if (a.canTrade && !b.canTrade) return -1;
-      if (!a.canTrade && b.canTrade) return 1;
-      const ap = a.fromWalletConnected || a.toWalletConnected;
-      const bp = b.fromWalletConnected || b.toWalletConnected;
-      if (ap && !bp) return -1;
-      if (!ap && bp) return 1;
-      return a.from.name.localeCompare(b.from.name);
-    });
-
-    res.json({ ok: true, total: finalCombos.length, combinations: finalCombos,
-      pairsValidated: validPairsSet !== null,
-      totalBeforeFilter: combinations.length });
+    const payload = await buildCombinationsResponse();
+    res.json(payload);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -454,6 +482,82 @@ app.get("/api/valid-pairs", async (req, res) => {
 app.post("/api/valid-pairs/clear", (req, res) => {
   _validPairsCache = { env: null, ts: 0, pairs: new Set() };
   res.json({ ok: true });
+});
+
+// ── ARBITRAGE BOT ENDPOINTS ────────────────────────────────────
+
+app.post("/api/arbitrage/scan", async (req, res) => {
+  try {
+    const combosPayload = await buildCombinationsResponse();
+    const combinations  = combosPayload.combinations || [];
+    const { minEdgeBps, maxRoutes } = req.body || {};
+    const opportunities = await arbitrageAgent.scanOpportunities(combinations, {
+      minEdgeBps,
+      maxRoutes,
+    });
+    res.json({ ok: true, total: opportunities.length, opportunities });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/arbitrage/execute", async (req, res) => {
+  const { fromAssetId, toAssetId, fromWalletType, toWalletType, amount, minEdgeBps } = req.body || {};
+  if (!fromAssetId || !toAssetId || !fromWalletType || !toWalletType || !amount) {
+    return res.status(400).json({ ok: false, error: "fromAssetId, toAssetId, fromWalletType, toWalletType, amount required" });
+  }
+
+  try {
+    const verification = await arbitrageAgent.verifyOpportunity(
+      { fromAssetId, toAssetId, amount },
+      { minEdgeBps: minEdgeBps ?? 5 }
+    );
+
+    if (!verification.profitable) {
+      return res.json({ ok: false, reason: "Not profitable at current prices", verification });
+    }
+
+    res.json({ ok: true, started: true, verification });
+
+    // Fire-and-forget execution via existing automation engine
+    runner.runRoute({
+      fromChain: fromWalletType,
+      toChain:   toWalletType,
+      fromAsset: fromAssetId,
+      toAsset:   toAssetId,
+      amount:    verification.amount,
+      label:     `Arb: ${fromAssetId} → ${toAssetId}`,
+    }).then(result => {
+      if (result && result.status === "pass") {
+        recordArbTrade({
+          fromAssetId,
+          toAssetId,
+          amount: verification.amount,
+          usdPnl: verification.usdPnl,
+          edgeBps: verification.edgeBps,
+        });
+        broadcast("arb_trade", {
+          fromAssetId,
+          toAssetId,
+          amount: verification.amount,
+          usdPnl: verification.usdPnl,
+          edgeBps: verification.edgeBps,
+        });
+      }
+    }).catch(err => {
+      broadcast("error", { message: `Arbitrage execution failed: ${err.message}` });
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/arbitrage/summary", (req, res) => {
+  res.json({
+    ok: true,
+    totalProfitUsd: _arbSummary.totalProfitUsd,
+    trades: _arbSummary.trades,
+  });
 });
 
 // Run a confirmed trade from the combinations panel
