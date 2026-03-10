@@ -29,14 +29,19 @@ const garden = {
   getOrder:         (id)          => client.get(`/orders/${id}`).then(r => r.data),
   getOrders:        (f = {})      => client.get("/orders", { params: f }).then(r => r.data),
   createOrder:      (body)        => client.post("/orders", body).then(r => r.data),
-  // txHashOrSig: pass tx_hash string for regular flow, or { signature } object for gasless EIP-712
-  patchOrder: (id, action, txHashOrSig) => {
+  // txPayload:
+  // - string: tx_hash for initiate()
+  // - { signature }: gasless EIP-712 initiate
+  // - { secret }: redeem() action
+  patchOrder: (id, action, txPayload) => {
     const body = { action };
-    if (txHashOrSig) {
-      if (typeof txHashOrSig === 'object' && txHashOrSig.signature) {
-        body.signature = txHashOrSig.signature;   // gasless path
-      } else {
-        body.tx_hash = txHashOrSig;               // regular path
+    if (txPayload) {
+      if (typeof txPayload === 'object' && txPayload.signature) {
+        body.signature = txPayload.signature;   // gasless path
+      } else if (typeof txPayload === 'object' && txPayload.secret) {
+        body.secret = txPayload.secret;         // redeem path
+      } else if (typeof txPayload === 'string') {
+        body.tx_hash = txPayload;               // regular initiate path
       }
     }
     return client.patch(`/orders/${id}`, body).then(r => r.data);

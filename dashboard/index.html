@@ -205,7 +205,7 @@
       Garden Finance Test Suite
     </div>
     <div class="header-right">
-      <span id="envLabel" style="font-size:12px;color:var(--muted)">TESTNET</span>
+      <span id="envLabel" style="font-size:12px;color:var(--muted)">Environment</span>
       <div class="env-toggle">
         <button class="env-btn active" id="btnTestnet" onclick="switchEnv('testnet')">Testnet</button>
         <button class="env-btn" id="btnMainnet" onclick="switchEnv('mainnet')">Mainnet</button>
@@ -262,15 +262,15 @@
       </div>
 
       <div class="stats-grid">
-        <div class="card">
+        <div class="card" onclick="showPanel('routes'); filterRoutes('all');" style="cursor:pointer">
           <div class="card-title">Total Routes</div>
           <div class="card-value" id="statTotal">—</div>
         </div>
-        <div class="card">
+        <div class="card" onclick="showPanel('routes'); filterRoutes('pass');" style="cursor:pointer">
           <div class="card-title">Passed</div>
           <div class="card-value" id="statPassed" style="color:var(--green)">—</div>
         </div>
-        <div class="card">
+        <div class="card" onclick="showPanel('routes'); filterRoutes('fail');" style="cursor:pointer">
           <div class="card-title">Failed</div>
           <div class="card-value" id="statFailed" style="color:var(--red)">—</div>
         </div>
@@ -333,8 +333,7 @@
         </div>
         <div style="display:flex;gap:10px;align-items:center">
           <span id="comboStats" style="font-size:12px;color:var(--muted)"></span>
-          <button class="btn btn-ghost" onclick="loadCombinations()" style="font-size:12px">🔄 Refresh</button>
-          <button class="btn btn-ghost" id="btnValidatePairs" onclick="validatePairs()" style="font-size:12px" title="Test all pairs via Garden /quote — filters out unsupported routes">🔍 Validate Pairs</button>
+          <button class="btn btn-ghost" id="btnValidatePairs" onclick="validatePairs()" style="font-size:12px" title="Refresh routes and validate supported pairs">🔄 Refresh</button>
           <span id="validationStatus" style="font-size:11px;color:var(--muted)"></span>
           <button class="btn btn-green" id="btnRunTradeable" onclick="runAllTradeable()" style="font-size:12px">▶ Run All Tradeable</button>
           <button class="btn" id="btnStopTradeable" onclick="stopAll()" style="display:none;font-size:12px;background:rgba(239,68,68,.15);color:#ef4444;border:1px solid rgba(239,68,68,.3)">⏹ Stop</button>
@@ -363,9 +362,11 @@
       <div class="matrix-header">
         <h1 class="section-title" style="margin:0">Route Matrix — Active Assets</h1>
         <div style="display:flex;gap:8px;align-items:center">
-          <button class="btn btn-ghost" onclick="refreshRouteGrid()" style="font-size:11px;padding:5px 10px">🔄 Refresh Assets</button>
-          <button class="btn btn-ghost" id="btnFilterAll"  onclick="filterRoutes('all')"  style="font-size:11px;padding:5px 10px">All</button>
-          <button class="btn btn-ghost" id="btnFilterFail" onclick="filterRoutes('fail')" style="font-size:11px;padding:5px 10px">Failed</button>
+          <button class="btn btn-ghost" id="btnFilterAll"  onclick="filterRoutes('all')"    style="font-size:11px;padding:5px 10px">All</button>
+          <button class="btn btn-ghost" id="btnFilterPass" onclick="filterRoutes('pass')"   style="font-size:11px;padding:5px 10px">Success</button>
+          <button class="btn btn-ghost" id="btnFilterSkip" onclick="filterRoutes('skipped')"style="font-size:11px;padding:5px 10px">Skipped</button>
+          <button class="btn btn-ghost" id="btnFilterFail" onclick="filterRoutes('fail')"   style="font-size:11px;padding:5px 10px">Failed</button>
+          <button class="btn btn-ghost" onclick="refreshRouteGrid()" style="font-size:11px;padding:5px 10px">🔄</button>
         </div>
       </div>
       <div class="route-grid" id="routeGrid">
@@ -835,7 +836,7 @@ function handleTestEnd({ label, status, error, steps }) {
     suiteStats.passed++;
   } else if (status === 'fail') {
     suiteStats.failed++;
-    addIssue('tech', 'critical', `Failed: ${label}`, error || 'See step log', { steps, orderId: data.orderId });
+    addIssue('tech', 'critical', `Failed: ${label}`, error || 'See step log', { steps });
   } else {
     suiteStats.skipped++;
     // Log meaningful skips to issues (not wallet-not-connected noise)
@@ -862,6 +863,12 @@ function handleTestEnd({ label, status, error, steps }) {
     document.getElementById('lastRunLabel').textContent =
       `${status === 'pass' ? '✅' : status === 'fail' ? '❌' : '⏭'} ${label} — ${status.toUpperCase()}`;
   }
+}
+function handleSuiteAborted(data) {
+  document.getElementById('lastRunLabel').textContent = `⏹ Aborted — ${data.stopped || 0} completed, ${data.remaining || 0} skipped`;
+  document.getElementById('btnRunAll').disabled = false;
+  document.getElementById('btnRunAll').innerHTML = '▶ Run All Tests';
+  document.getElementById('btnStop').style.display = 'none';
 }
 
 function handleSuiteEnd(d) {
@@ -1368,38 +1375,26 @@ function updateStats() {
 
 // ── ACTIONS ──
 async function runAll() {
-  // First load combinations to build the trade size modal
   const btn  = document.getElementById('btnRunAll');
-  const stop = document.getElementById('btnStop');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Loading…';
+  btn.innerHTML = '<span class="spinner"></span> Checking readiness…';
 
   try {
-    // Load combinations if not already loaded
-    if (!allCombos.length) {
-      const r = await fetch('/api/combinations');
-      const d = await r.json();
-      allCombos = d.combinations || [];
-    }
-    const tradeable = allCombos.filter(c => c.canTrade);
+    const r = await fetch('/api/route-readiness');
+    const readiness = await r.json();
+    btn.disabled = false;
+    btn.innerHTML = '▶ Run All Tests';
 
-    if (!tradeable.length) {
-      // No tradeable combos — launch directly, runner will skip non-wallet routes
-      btn.disabled = false;
-      btn.innerHTML = '▶ Run All Tests';
+    if (readiness.error) {
+      alert('Failed to check readiness: ' + readiness.error);
       _launchRunAll();
       return;
     }
-
-    // Show modal for trade sizes, then launch
-    btn.disabled = false;
-    btn.innerHTML = '▶ Run All Tests';
-    _runAllAfterModal = true;  // flag so modal knows to call _launchRunAll
-    showTradeSizeModal(tradeable);
+    showReadinessModal(readiness);
   } catch(e) {
     btn.disabled = false;
     btn.innerHTML = '▶ Run All Tests';
-    _launchRunAll(); // if combinations fail to load, just run with defaults
+    if (confirm('Could not check route readiness. Run anyway?')) _launchRunAll();
   }
 }
 
@@ -1427,7 +1422,7 @@ function switchEnv(env) {
   if (!confirm(`Switch to ${env.toUpperCase()}? The server must be restarted manually after.`)) return;
   fetch('/api/switch-env', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ env }) })
     .then(r => r.json()).then(d => alert(d.message));
-  document.getElementById('envLabel').textContent = env.toUpperCase();
+  document.getElementById('envLabel').textContent = 'Environment';
   document.getElementById('btnTestnet').classList.toggle('active', env === 'testnet');
   document.getElementById('btnMainnet').classList.toggle('active', env === 'mainnet');
 }
@@ -1447,6 +1442,184 @@ function toggleManualApprove() {
   alert(`Manual approve mode ${on ? 'ENABLED' : 'DISABLED'}.\n\nSet MANUAL_APPROVE=${on} in your .env and restart server.`);
 }
 
+function showReadinessModal(readiness) {
+  const existing = document.getElementById('readinessOverlay');
+  if (existing) existing.remove();
+
+  const { assets, totalRoutes, runnableRoutes, readinessPct, flowChains } = readiness;
+  const barColor = readinessPct >= 80 ? 'var(--green)' : readinessPct >= 30 ? 'var(--yellow)' : 'var(--red)';
+
+  // Count categories
+  const seedAssets = assets.filter(a => a.isChainStart);
+  const chainFunded = assets.filter(a => a.reason === 'chain_funded');
+  const fundedSeeds = seedAssets.filter(a => a.sufficient);
+  const unknownAssets = assets.filter(a => a.reason === 'balance_unknown');
+  const insufficientAssets = assets.filter(a => !a.sufficient && a.reason !== 'balance_unknown' && a.reason !== 'chain_funded');
+
+  // Can run if ANY seed has sufficient balance
+  const hasAnyFundedChain = fundedSeeds.length > 0;
+  const canRun = hasAnyFundedChain || readinessPct >= 100;
+
+  const assetRows = assets.map(a => {
+    const balStr = a.balance !== null ? Number(a.balance).toLocaleString() : '—';
+    const isChainFunded = a.reason === 'chain_funded';
+    const reqStr = isChainFunded ? '0 (chain-funded)' : Number(a.required).toLocaleString();
+
+    const icon = a.sufficient
+      ? (isChainFunded ? '<span style="color:var(--cyan)">🔗</span>' : '<span style="color:var(--green)">✅</span>')
+      : a.reason === 'balance_unknown'
+        ? '<span style="color:var(--yellow)">❓</span>'
+        : '<span style="color:var(--red)">❌</span>';
+
+    const reasonText = a.sufficient
+      ? (isChainFunded
+        ? '<span style="color:var(--cyan);font-size:10px">Funded by previous trade output</span>'
+        : '')
+      : a.reason === 'balance_unknown'
+        ? '<span style="color:var(--yellow);font-size:10px">Balance not cached — will check at runtime</span>'
+        : a.reason === 'insufficient_gas'
+          ? '<span style="color:var(--red);font-size:10px">Insufficient native gas for tx fees</span>'
+          : a.reason === 'insufficient_balance'
+            ? '<span style="color:var(--red);font-size:10px">Balance below minimum trade amount</span>'
+            : '';
+
+    const balColor = a.balance === null ? 'var(--muted)' : a.sufficient ? 'var(--green)' : 'var(--red)';
+
+    // Chain-reaction badges
+    const chainBadge = a.isChainStart
+      ? `<span style="background:rgba(34,197,94,.15);color:var(--green);font-size:9px;padding:1px 6px;border-radius:8px;margin-left:6px">⚡ Chain Start → ${a.chainLength} hops</span>`
+      : isChainFunded
+        ? '<span style="background:rgba(6,182,212,.1);color:var(--cyan);font-size:9px;padding:1px 6px;border-radius:8px;margin-left:6px">🔗 Chain-funded</span>'
+        : '';
+
+    return `<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.04);${!a.sufficient && !isChainFunded ? 'opacity:.7' : ''}">
+      <span style="flex-shrink:0;width:20px;text-align:center">${icon}</span>
+      ${a.icon ? `<img src="${a.icon}" style="width:20px;height:20px;border-radius:50%;flex-shrink:0" onerror="this.style.display='none'">` : ''}
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600;font-size:13px">${a.ticker} <span style="color:var(--muted);font-weight:400;font-size:11px">on ${(a.chainRaw||a.chain||'').replace(/_/g,' ')}</span>${chainBadge}</div>
+        <div style="display:flex;gap:12px;font-size:11px;margin-top:2px">
+          <span style="color:var(--muted)">Balance: <span style="color:${balColor};font-family:'JetBrains Mono',monospace">${balStr}</span></span>
+          <span style="color:var(--muted)">Required: <span style="font-family:'JetBrains Mono',monospace">${reqStr}</span></span>
+        </div>
+        ${reasonText ? `<div style="margin-top:3px">${reasonText}</div>` : ''}
+      </div>
+      <div style="text-align:right;flex-shrink:0">
+        <div style="font-size:12px;font-weight:600;color:var(--muted)">${a.routeCount} route${a.routeCount!==1?'s':''}</div>
+      </div>
+    </div>`;
+  }).join('');
+
+  // Flow chain summary
+  const chainSummary = (flowChains && flowChains.length)
+    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(6,182,212,.04)">
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--cyan);margin-bottom:6px">⚡ Chain-Reaction Flows</div>
+        ${flowChains.map((fc, i) => {
+          const assetLabels = (fc.assets || []).map(a => {
+            const t = a.split(':').pop()?.toUpperCase() || a;
+            const c = a.split(':')[0]?.replace(/_.*/, '') || '';
+            return `${t}<span style="color:var(--muted);font-size:9px">(${c})</span>`;
+          }).join(' → ');
+          const gasOk = fc.feasible !== false;
+          return `<div style="font-size:11px;margin-bottom:4px;line-height:1.6">
+            <span style="color:${gasOk ? 'var(--green)' : 'var(--yellow)'}">Chain ${i+1}:</span> ${assetLabels}
+            <span style="color:var(--muted);margin-left:6px">(${fc.length} hops${!gasOk ? ', ⚠️ gas issue' : ''})</span>
+          </div>`;
+        }).join('')}
+      </div>`
+    : '';
+
+  const runBtnStyle = canRun
+    ? 'background:var(--green);color:#000;cursor:pointer'
+    : 'background:var(--bg3);color:var(--muted);cursor:not-allowed;border:1px solid var(--border);pointer-events:none';
+  const runBtnText = canRun
+    ? `▶ Run ${runnableRoutes} Routes (${fundedSeeds.length} seed${fundedSeeds.length!==1?'s':''})`
+    : `🔒 ${readinessPct}% Ready — Fund seed assets to unlock`;
+
+  document.body.insertAdjacentHTML('beforeend', `
+    <div id="readinessOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;z-index:200">
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:16px;width:620px;max-width:95vw;max-height:90vh;display:flex;flex-direction:column;overflow:hidden">
+        <div style="padding:20px 24px 16px;border-bottom:1px solid var(--border)">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+            <div style="font-size:17px;font-weight:700">🚀 Route Readiness — Chain Reaction</div>
+            <button onclick="document.getElementById('readinessOverlay').remove()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0 4px">×</button>
+          </div>
+          <div style="margin-bottom:12px">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+              <span style="font-size:12px;color:var(--muted)">Balance Coverage</span>
+              <span style="font-size:14px;font-weight:700;color:${barColor}">${readinessPct}%</span>
+            </div>
+            <div style="background:var(--bg3);border-radius:8px;height:12px;overflow:hidden;border:1px solid var(--border)">
+              <div style="height:100%;width:0%;background:${barColor};border-radius:7px;transition:width 1s ease-out" id="readinessBar"></div>
+            </div>
+          </div>
+          <div style="display:flex;gap:12px;font-size:12px;flex-wrap:wrap">
+            <span style="color:var(--green)">⚡ ${fundedSeeds.length} seed${fundedSeeds.length!==1?'s':''} funded</span>
+            <span style="color:var(--cyan)">🔗 ${chainFunded.length} chain-funded</span>
+            ${unknownAssets.length > 0 ? `<span style="color:var(--yellow)">❓ ${unknownAssets.length} unknown</span>` : ''}
+            ${insufficientAssets.length > 0 ? `<span style="color:var(--red)">❌ ${insufficientAssets.length} insufficient</span>` : ''}
+            <span style="color:var(--muted);margin-left:auto">${runnableRoutes}/${totalRoutes} routes runnable</span>
+          </div>
+        </div>
+        ${chainSummary}
+        <div style="flex:1;overflow-y:auto;max-height:400px">
+          ${assets.length ? assetRows : '<div style="text-align:center;padding:40px;color:var(--muted)">No routes found — connect wallets first</div>'}
+        </div>
+        <div style="padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center">
+          <button onclick="document.getElementById('readinessOverlay').remove();showPanel('wallets')" class="btn btn-ghost" style="font-size:13px">💳 Wallets</button>
+          <button onclick="document.getElementById('readinessOverlay').remove()" class="btn btn-ghost" style="font-size:13px">Cancel</button>
+          <div style="flex:1"></div>
+          <div style="display:flex;flex-direction:column;gap:6px;min-width:220px;max-width:300px">
+            <button id="readinessRunBtn"
+              onclick="document.getElementById('readinessOverlay').remove();_proceedToTradeSizeModal()"
+              style="padding:10px 20px;border-radius:10px;font-size:14px;font-weight:700;border:none;width:100%;${runBtnStyle}"
+              ${canRun ? '' : 'disabled'}>
+              ${runBtnText}
+            </button>
+            <div style="position:relative;background:var(--bg3);border-radius:6px;height:8px;overflow:hidden;border:1px solid var(--border)">
+              <div id="readinessRunBar" style="height:100%;width:0%;border-radius:5px;transition:width 1.2s ease-out;background:${barColor}"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted)">
+              <span>${fundedSeeds.length}/${seedAssets.length} seeds funded</span>
+              <span>${runnableRoutes}/${totalRoutes} routes</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>`);
+
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      const bar = document.getElementById('readinessBar');
+      if (bar) bar.style.width = readinessPct + '%';
+      const runBar = document.getElementById('readinessRunBar');
+      if (runBar) runBar.style.width = readinessPct + '%';
+    }, 50);
+  });
+}
+
+async function _proceedToTradeSizeModal() {
+  const btn = document.getElementById('btnRunAll');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Loading…';
+  try {
+    if (!allCombos.length) {
+      const r = await fetch('/api/combinations');
+      const d = await r.json();
+      allCombos = d.combinations || [];
+    }
+    const tradeable = allCombos.filter(c => c.canTrade || c.fromWalletConnected);
+    btn.disabled = false;
+    btn.innerHTML = '▶ Run All Tests';
+    if (!tradeable.length) { _launchRunAll(); return; }
+    _runAllAfterModal = true;
+    showTradeSizeModal(tradeable);
+  } catch(e) {
+    btn.disabled = false;
+    btn.innerHTML = '▶ Run All Tests';
+    _launchRunAll();
+  }
+}
+
 // ── CHATBOT ──
 // ═══════════════════════════════════════════════════════════
 // SWAP ENGINE v3 — Chain-first multi-select
@@ -1454,50 +1627,52 @@ function toggleManualApprove() {
 
 const CHAIN_META = {
   // key must match the normalised chain prefix from Garden API
-  bitcoin:    { icon: '₿',  label: 'Bitcoin Testnet' },
-  litecoin:   { icon: 'Ł',  label: 'Litecoin Testnet' },
-  ethereum:   { icon: '⬡',  label: 'Ethereum Sepolia' },
-  arbitrum:   { icon: '🔵', label: 'Arbitrum Sepolia' },
-  base:       { icon: '🔷', label: 'Base Sepolia' },
-  bnbchain:   { icon: '🟡', label: 'BNB Testnet' },
-  solana:     { icon: '◎',  label: 'Solana Devnet' },
-  starknet:   { icon: '🌐', label: 'Starknet Testnet' },
-  sui:        { icon: '💧', label: 'Sui Testnet' },
-  tron:       { icon: '🔴', label: 'Tron Testnet' },
-  hyperevm:   { icon: '⚡', label: 'HyperEVM Testnet' },
-  megaeth:    { icon: '🚀', label: 'MegaETH Testnet' },
-  berachain:  { icon: '🐻', label: 'Berachain Testnet' },
-  unichain:   { icon: '🦄', label: 'Unichain Sepolia' },
-  corn:       { icon: '🌽', label: 'Corn Testnet' },
-  botanix:    { icon: '🌿', label: 'Botanix Testnet' },
-  core:       { icon: '⚙️', label: 'Core Testnet' },
-  citrea:     { icon: '🟠', label: 'Citrea Testnet' },
-  alpen:      { icon: '🏔️', label: 'Alpen Signet' },
-  monad:      { icon: '🟣', label: 'Monad Testnet' },
+  bitcoin:   { icon: '₿',  label: 'Bitcoin Testnet',   logo: 'https://cryptologos.cc/logos/bitcoin-btc-logo.png' },
+  litecoin:  { icon: 'Ł',  label: 'Litecoin Testnet',  logo: 'https://cryptologos.cc/logos/litecoin-ltc-logo.png' },
+  ethereum:  { icon: '⬡',  label: 'Ethereum Sepolia',  logo: 'https://cryptologos.cc/logos/ethereum-eth-logo.png' },
+  arbitrum:  { icon: '🔵', label: 'Arbitrum Sepolia',  logo: 'https://cryptologos.cc/logos/arbitrum-arb-logo.png' },
+  base:      { icon: '🔷', label: 'Base Sepolia',      logo: 'https://cryptologos.cc/logos/base-base-logo.png' },
+  bnbchain:  { icon: '🟡', label: 'BNB Testnet',       logo: 'https://cryptologos.cc/logos/bnb-bnb-logo.png' },
+  solana:    { icon: '◎',  label: 'Solana Devnet',     logo: 'https://cryptologos.cc/logos/solana-sol-logo.png' },
+  starknet:  { icon: '🌐', label: 'Starknet Testnet' },
+  sui:       { icon: '💧', label: 'Sui Testnet' },
+  tron:      { icon: '🔴', label: 'Tron Testnet',      logo: 'https://cryptologos.cc/logos/tron-trx-logo.png' },
+  hyperevm:  { icon: '⚡', label: 'HyperEVM Testnet' },
+  megaeth:   { icon: '🚀', label: 'MegaETH Testnet' },
+  berachain: { icon: '🐻', label: 'Berachain Testnet' },
+  unichain:  { icon: '🦄', label: 'Unichain Sepolia' },
+  corn:      { icon: '🌽', label: 'Corn Testnet' },
+  botanix:   { icon: '🌿', label: 'Botanix Testnet' },
+  core:      { icon: '⚙️', label: 'Core Testnet' },
+  citrea:    { icon: '🟠', label: 'Citrea Testnet' },
+  alpen:     { icon: '🏔️', label: 'Alpen Signet' },
+  monad:     { icon: '🟣', label: 'Monad Testnet' },
 };
 
 const ASSET_META = {
-  btc:   { icon: '₿',  color: '#f7931a', name: 'Bitcoin',             coingeckoId: 'bitcoin' },
-  ltc:   { icon: 'Ł',  color: '#345d9d', name: 'Litecoin',            coingeckoId: 'litecoin' },
-  wbtc:  { icon: '🔶', color: '#f09242', name: 'Wrapped BTC',         coingeckoId: 'wrapped-bitcoin' },
-  cbtc:  { icon: '🟧', color: '#e8703a', name: 'Canonical BTC',       coingeckoId: 'bitcoin' },
-  cbbtc: { icon: '🔵', color: '#0052ff', name: 'Coinbase Wrapped BTC',coingeckoId: 'coinbase-wrapped-btc' },
-  sbtc:  { icon: '🟫', color: '#c0883d', name: 'Synthetic BTC',       coingeckoId: 'bitcoin' },
-  lbtc:  { icon: '🟪', color: '#7c3aed', name: 'Liquid BTC',          coingeckoId: 'bitcoin' },
-  eth:   { icon: '⬡',  color: '#627eea', name: 'Ethereum',            coingeckoId: 'ethereum' },
-  weth:  { icon: '🔷', color: '#627eea', name: 'Wrapped ETH',         coingeckoId: 'ethereum' },
-  usdc:  { icon: '💵', color: '#2775ca', name: 'USD Coin',            coingeckoId: 'usd-coin' },
-  usdt:  { icon: '💚', color: '#26a17b', name: 'Tether',              coingeckoId: 'tether' },
-  bnb:   { icon: '🟡', color: '#f0b90b', name: 'BNB',                 coingeckoId: 'binancecoin' },
-  sol:   { icon: '◎',  color: '#9945ff', name: 'Solana',              coingeckoId: 'solana' },
-  sui:   { icon: '💧', color: '#4da2ff', name: 'Sui',                 coingeckoId: 'sui' },
-  trx:   { icon: '🔴', color: '#eb0029', name: 'Tron',                coingeckoId: 'tron' },
-  cbltc: { icon: '🔷', color: '#0052ff', name: 'Coinbase Wrapped LTC', coingeckoId: 'litecoin' },
-  wltc:  { icon: 'Ł',  color: '#345d9d', name: 'Wrapped Litecoin',     coingeckoId: 'litecoin' },
+  btc:   { icon: '₿',  color: '#f7931a', name: 'Bitcoin',              coingeckoId: 'bitcoin',              logo: 'https://cryptologos.cc/logos/bitcoin-btc-logo.png' },
+  ltc:   { icon: 'Ł',  color: '#345d9d', name: 'Litecoin',             coingeckoId: 'litecoin',             logo: 'https://cryptologos.cc/logos/litecoin-ltc-logo.png' },
+  wbtc:  { icon: '🔶', color: '#f09242', name: 'Wrapped BTC',          coingeckoId: 'wrapped-bitcoin',      logo: 'https://cryptologos.cc/logos/wrapped-bitcoin-wbtc-logo.png' },
+  cbtc:  { icon: '🟧', color: '#e8703a', name: 'Canonical BTC',        coingeckoId: 'bitcoin' },
+  cbbtc: { icon: '🔵', color: '#0052ff', name: 'Coinbase Wrapped BTC', coingeckoId: 'coinbase-wrapped-btc' },
+  sbtc:  { icon: '🟫', color: '#c0883d', name: 'Synthetic BTC',        coingeckoId: 'bitcoin' },
+  lbtc:  { icon: '🟪', color: '#7c3aed', name: 'Liquid BTC',           coingeckoId: 'bitcoin' },
   xbtc:  { icon: '🟠', color: '#ff6b35', name: 'xBTC',                 coingeckoId: 'bitcoin' },
   hbtc:  { icon: '🟡', color: '#f0b90b', name: 'Huobi BTC',            coingeckoId: 'bitcoin' },
   tbtc:  { icon: '🟤', color: '#7b4f2e', name: 'tBTC',                 coingeckoId: 'tbtc' },
   rbtc:  { icon: '🔶', color: '#e8703a', name: 'RBTC',                 coingeckoId: 'bitcoin' },
+  ibtc:  { icon: '🟠', color: '#f7931a', name: 'iBTC',                 coingeckoId: 'bitcoin' },
+  wcbtc: { icon: '🟠', color: '#f97316', name: 'Wrapped Citrea BTC',   coingeckoId: 'bitcoin' },
+  eth:   { icon: '⬡',  color: '#627eea', name: 'Ethereum',             coingeckoId: 'ethereum',             logo: 'https://cryptologos.cc/logos/ethereum-eth-logo.png' },
+  weth:  { icon: '🔷', color: '#627eea', name: 'Wrapped ETH',          coingeckoId: 'ethereum' },
+  usdc:  { icon: '💵', color: '#2775ca', name: 'USD Coin',             coingeckoId: 'usd-coin',             logo: 'https://cryptologos.cc/logos/usd-coin-usdc-logo.png' },
+  usdt:  { icon: '💚', color: '#26a17b', name: 'Tether',               coingeckoId: 'tether',               logo: 'https://cryptologos.cc/logos/tether-usdt-logo.png' },
+  bnb:   { icon: '🟡', color: '#f0b90b', name: 'BNB',                  coingeckoId: 'binancecoin',          logo: 'https://cryptologos.cc/logos/bnb-bnb-logo.png' },
+  sol:   { icon: '◎',  color: '#9945ff', name: 'Solana',               coingeckoId: 'solana',               logo: 'https://cryptologos.cc/logos/solana-sol-logo.png' },
+  sui:   { icon: '💧', color: '#4da2ff', name: 'Sui',                  coingeckoId: 'sui' },
+  trx:   { icon: '🔴', color: '#eb0029', name: 'Tron',                 coingeckoId: 'tron',                 logo: 'https://cryptologos.cc/logos/tron-trx-logo.png' },
+  cbltc: { icon: '🔷', color: '#0052ff', name: 'Coinbase Wrapped LTC', coingeckoId: 'litecoin' },
+  wltc:  { icon: 'Ł',  color: '#345d9d', name: 'Wrapped Litecoin',     coingeckoId: 'litecoin' },
 };
 
 // Maps Garden API chain IDs → our CHAIN_META key
@@ -1618,9 +1793,19 @@ function buildSwapData() {
     if (!ticker || !chainKey) continue;
     const m  = ASSET_META[ticker] || {};
     const cm = CHAIN_META[chainKey] || { icon: '🔘', label: chainKey.replace(/_/g,' ').replace(/\w/g,c=>c.toUpperCase()) };
-    swAllAssets.push({ id: a.id, rawChain, chainKey, chainLabel: cm.label,
-      ticker, name: m.name || a.name || a.asset_name || ticker.toUpperCase(), icon: m.icon || '🔸',
-      color: m.color || '#888', chainIcon: cm.icon, raw: a });
+    swAllAssets.push({
+      id: a.id,
+      rawChain,
+      chainKey,
+      chainLabel: cm.label,
+      ticker,
+      name: m.name || a.name || a.asset_name || ticker.toUpperCase(),
+      icon: m.icon || '🔸',
+      logo: m.logo || cm.logo || null,
+      color: m.color || '#888',
+      chainIcon: cm.icon,
+      raw: a
+    });
     if (!seenChains.has(chainKey)) { seenChains.add(chainKey); swChainKeys.push(chainKey); }
   }
   console.log('[swap] built', swAllAssets.length, 'assets across', swChainKeys.length, 'chains:', swChainKeys);
@@ -1823,10 +2008,14 @@ function renderDropdownList(side, query) {
     const chainAssets   = swAllAssets.filter(a => a.chainKey === ck);
     if (!chainAssets.length) continue;
 
-    // For 'from' side: check if the entire chain has any asset with balance
+    // For 'from' side: check if the entire chain has any asset with balance.
+    // EVM chains use live EVM balances; non-EVM chains (bitcoin, solana, etc.) currently
+    // rely on their own wallet panels and are always selectable here.
+    const isEvmChain = ['ethereum','arbitrum','base','bnbchain','berachain','unichain','hyperevm','corn','botanix','core','megaeth'].includes(ck);
     const balDataLoaded = Object.keys(window._evmBalances||{}).length > 0 || Object.keys(window._evmTokenBalances||{}).length > 0;
     const chainHasAnyBalance = (() => {
       if (side !== 'from' || !balDataLoaded) return true;
+      if (!isEvmChain) return true;
       try {
         const evmBals = window._evmBalances || {};
         const evmTokBals = window._evmTokenBalances || {};
@@ -1844,7 +2033,10 @@ function renderDropdownList(side, query) {
         return false;
       } catch(_) { return true; }
     })();
-    const chainDisabled = side === 'from' && balDataLoaded && !chainHasAnyBalance;
+    const chainDisabled = side === 'from' && balDataLoaded && isEvmChain && !chainHasAnyBalance;
+    const chainIconHtml = cm.logo
+      ? `<img src="${cm.logo}" style="width:18px;height:18px;border-radius:50%;object-fit:cover;display:block" onerror="this.style.display='none'">`
+      : cm.icon;
 
     html += `<div style="border-bottom:1px solid rgba(255,255,255,.05);${chainDisabled?'opacity:.4':''}">
       <!-- Chain header row -->
@@ -1854,7 +2046,7 @@ function renderDropdownList(side, query) {
         <div style="width:18px;height:18px;border:2px solid ${chainSelected&&!chainDisabled?'var(--accent)':'var(--border)'};border-radius:4px;background:${chainSelected&&!chainDisabled?'var(--accent)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s">
           ${chainSelected&&!chainDisabled?'<span style="color:#000;font-size:11px;font-weight:900">✓</span>':''}
         </div>
-        <span style="font-size:18px">${cm.icon}</span>
+        <span style="font-size:18px;display:flex;align-items:center;justify-content:center">${chainIconHtml}</span>
         <div style="flex:1">
           <div style="font-weight:700;font-size:13px;color:var(--text)">${chainLabel}</div>
           <div style="font-size:10px;color:var(--muted)">${chainAssets.map(a=>a.ticker.toUpperCase()).join(' · ')}</div>
@@ -1912,13 +2104,16 @@ function renderDropdownList(side, query) {
         // If no EVM balance data loaded yet, fall back to showing (don't hide until we have data)
         const balDataLoaded = Object.keys(window._evmBalances||{}).length > 0 || Object.keys(window._evmTokenBalances||{}).length > 0;
         const disableRow = side === 'from' && balDataLoaded && !hasBalance;
+        const assetIconHtml = a.logo
+          ? `<img src="${a.logo}" style="width:18px;height:18px;border-radius:50%;object-fit:cover;display:block" onerror="this.style.display='none'">`
+          : a.icon;
         return `<div onclick="${disableRow ? '' : `toggleAssetSel('${side}','${a.id}')`}"
           style="display:flex;align-items:center;gap:10px;padding:8px 14px 8px 44px;cursor:${disableRow?'not-allowed':'pointer'};background:${aSelected?'rgba(34,197,94,.04)':'none'};opacity:${disableRow?'0.35':'1'};transition:background .12s"
           ${!disableRow ? `onmouseenter="this.style.background='var(--bg3)'" onmouseleave="this.style.background='${aSelected?'rgba(34,197,94,.04)':'none'}'"` : ''}>
           <div style="width:16px;height:16px;border:2px solid ${aSelected?'var(--accent)':'var(--border)'};border-radius:3px;background:${aSelected?'rgba(34,197,94,.2)':'transparent'};flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .15s">
             ${aSelected?'<span style="color:var(--accent);font-size:10px;font-weight:900">✓</span>':''}
           </div>
-          <span style="font-size:18px">${a.icon}</span>
+          <span style="font-size:18px;display:flex;align-items:center;justify-content:center">${assetIconHtml}</span>
           <div style="flex:1">
             <div style="font-weight:600;font-size:12px;color:var(--text)">${a.name}</div>
             <div style="font-size:10px;color:var(--muted)">${a.ticker.toUpperCase()}</div>
@@ -1991,15 +2186,40 @@ function renderSideSelector(side) {
   const iconEl = document.getElementById(`sw-${side}-token-icon`);
   const nameEl = document.getElementById(`sw-${side}-token-name`);
   const chainEl = document.getElementById(`sw-${side}-chain-label`);
+  if (!iconEl || !nameEl || !chainEl) return;
+
+  function setIconForAsset(asset) {
+    const logo = asset.logo;
+    const icon = asset.icon || '🔸';
+    if (logo) {
+      iconEl.innerHTML = `<img src="${logo}" style="width:20px;height:20px;border-radius:50%;object-fit:cover;display:block" onerror="this.style.display='none'">`;
+    } else {
+      iconEl.textContent = icon;
+    }
+  }
+
+  function setIconForChain(chainKey) {
+    const cm = CHAIN_META[chainKey] || { icon: '🔘' };
+    if (cm.logo) {
+      iconEl.innerHTML = `<img src="${cm.logo}" style="width:20px;height:20px;border-radius:50%;object-fit:cover;display:block" onerror="this.style.display='none'">`;
+    } else {
+      iconEl.textContent = cm.icon;
+    }
+  }
+
   if (!st.chains.size) {
-    iconEl.textContent = '🔘'; nameEl.textContent = 'Select token'; chainEl.textContent = 'Choose chain';
+    iconEl.textContent = '🔘';
+    nameEl.textContent = 'Select token';
+    chainEl.textContent = 'Choose chain';
   } else if (fromPairs.length === 1) {
     const a = fromPairs[0];
-    iconEl.textContent = a.icon; nameEl.textContent = a.ticker.toUpperCase(); chainEl.textContent = a.chainLabel;
+    setIconForAsset(a);
+    nameEl.textContent = a.ticker.toUpperCase();
+    chainEl.textContent = a.chainLabel;
   } else if (st.chains.size === 1) {
     const ck = [...st.chains][0];
     const cm = CHAIN_META[ck] || { icon: '🔘', label: ck };
-    iconEl.textContent = cm.icon;
+    setIconForChain(ck);
     nameEl.textContent = st.assets.size ? `${st.assets.size} assets` : `All assets`;
     chainEl.textContent = cm.label;
   } else {
@@ -2242,7 +2462,7 @@ async function loadConfig() {
   if (cfg.env) {
     document.getElementById('btnTestnet').classList.toggle('active', cfg.env === 'testnet');
     document.getElementById('btnMainnet').classList.toggle('active', cfg.env === 'mainnet');
-    document.getElementById('envLabel').textContent = cfg.env.toUpperCase();
+    document.getElementById('envLabel').textContent = 'Environment';
   }
   if (cfg.manualApprove !== undefined) {
     document.getElementById('manualApproveToggle').checked = cfg.manualApprove;
@@ -2332,14 +2552,7 @@ async function loadCombinations() {
     const partial = allCombos.filter(c => !c.canTrade && (c.fromWalletConnected || c.toWalletConnected)).length;
 
     subtitle.textContent = `${allCombos.length} active asset pairs found`;
-    // Show validation hint if pairs haven't been validated yet
-    if (!d.pairsValidated) {
-      const hint = document.getElementById('validationStatus');
-      if (hint && !hint.textContent) {
-        hint.textContent = '⚠️ Click "Validate Pairs" to filter out unsupported routes';
-        hint.style.color = 'var(--yellow)';
-      }
-    }
+    // Normal stats line (no extra hint message)
     stats.textContent    = `${ready} ready · ${partial} partial`;
 
     // Update badge
@@ -2366,9 +2579,14 @@ async function loadCombinations() {
 async function validatePairs() {
   const btn    = document.getElementById('btnValidatePairs');
   const status = document.getElementById('validationStatus');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Starting…';
-  status.textContent = 'Contacting Garden API…';
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Refreshing…';
+  }
+  if (status) {
+    status.textContent = 'Refreshing routes and validating pairs…';
+    status.style.color = 'var(--muted)';
+  }
   status.style.color = 'var(--muted)';
 
   try {
@@ -2416,7 +2634,7 @@ async function handleValidateDone({ total, valid, error }) {
     // Reload combinations to apply the new filter
     await loadCombinations();
   }
-  if (btn) { btn.disabled = false; btn.innerHTML = '🔍 Validate Pairs'; }
+  if (btn) { btn.disabled = false; btn.innerHTML = '🔄 Refresh'; }
 }
 
 function assetLabel(a) {
@@ -2435,10 +2653,17 @@ function renderCombos(filter) {
   const grid  = document.getElementById("combosGrid");
   const empty = document.getElementById("combosEmpty");
 
-  let filtered = allCombos;
-  if (filter === "ready")   filtered = allCombos.filter(c => c.canTrade);
-  if (filter === "partial") filtered = allCombos.filter(c => !c.canTrade && (c.fromWalletConnected || c.toWalletConnected));
-  if (filter === "no")      filtered = allCombos.filter(c => !c.fromWalletConnected && !c.toWalletConnected);
+  // Remove combinations whose source chain has a broken RPC
+  const badRpcs = window._badRpcChains || [];
+  const healthy = allCombos.filter(c => {
+    const chainKey = (c.from.chain || "").toLowerCase();
+    return !badRpcs.some(b => chainKey.startsWith(b.split("_")[0]) || b.startsWith(chainKey.split("_")[0]));
+  });
+
+  let filtered = healthy;
+  if (filter === "ready")   filtered = healthy.filter(c => c.canTrade);
+  if (filter === "partial") filtered = healthy.filter(c => !c.canTrade && (c.fromWalletConnected || c.toWalletConnected));
+  if (filter === "no")      filtered = healthy.filter(c => !c.fromWalletConnected && !c.toWalletConnected);
 
   if (filtered.length === 0) {
     grid.style.display  = "none";
@@ -2481,13 +2706,11 @@ function renderCombos(filter) {
     const fromIcon   = c.from.icon ? `<img src="${c.from.icon}" style="width:18px;height:18px;border-radius:50%;margin-right:5px;vertical-align:middle" onerror="this.style.display='none'">` : '';
     const toIcon     = c.to.icon   ? `<img src="${c.to.icon}"   style="width:18px;height:18px;border-radius:50%;margin-right:5px;vertical-align:middle" onerror="this.style.display='none'">` : '';
 
-    // Balance info line
+    // Balance info line (keep minimal, no instructions)
     let balanceLine = "";
     if (c.walletBalance !== null) {
       const balColor = balanceLow ? "var(--red)" : "var(--green)";
-      balanceLine = `· Balance: <span style="color:${balColor}">${Number(c.walletBalance).toLocaleString()}</span>`;
-    } else if (c.from.walletType === "evm") {
-      balanceLine = `· <span style="color:var(--yellow)">Balance: check in wallet</span>`;
+      balanceLine = `· <span style="color:${balColor}">Balance: ${Number(c.walletBalance).toLocaleString()}</span>`;
     }
 
     // Amount input — use minAmount from policy (correct per asset decimals)
@@ -2522,11 +2745,10 @@ function renderCombos(filter) {
           style="font-size:11px;padding:5px 12px">▶ Run</button>
       </div>` : `
       <div style="font-size:11px;color:var(--muted)">
-        ${balanceLow ? `Insufficient balance — need ${Number(c.minAmount).toLocaleString()} ${fromTicker}` :
-          balanceUnknown ? `Balance unverified — <a onclick="fetchEvmBalances('${evmAddress||''}')" style="color:var(--accent);cursor:pointer">refresh balances</a>` :
-          !c.fromWalletConnected ? `Connect ${c.from.walletType} wallet to send` :
-          `Connect ${c.to.walletType} wallet to receive`}
-        ${!balanceLow && !balanceUnknown ? `<a onclick="showPanel('wallets')" style="color:var(--accent);cursor:pointer;margin-left:4px">→ Connect</a>` : ""}
+        ${!c.fromWalletConnected ? `Connect ${c.from.walletType} wallet to send` :
+          !c.toWalletConnected ? `Connect ${c.to.walletType} wallet to receive` :
+          `Route not tradeable (RPC/solver limits)`}
+        <a onclick="showPanel('wallets')" style="color:var(--accent);cursor:pointer;margin-left:4px">→ Connect</a>
       </div>`}
     </div>`;
   }).join("");
@@ -2864,9 +3086,31 @@ async function confirmTradeSizeModal() {
 }
 
 async function runAllTradeable() {
-  const tradeable = allCombos.filter(c => c.canTrade);
-  if (!tradeable.length) { alert("No tradeable combinations. Connect wallets first."); return; }
-  showTradeSizeModal(tradeable);
+  const btn = document.getElementById('btnRunTradeable');
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Checking readiness…'; }
+
+  try {
+    const r = await fetch('/api/route-readiness');
+    const readiness = await r.json();
+    if (btn) { btn.disabled = false; btn.innerHTML = '▶ Run All Tradeable'; }
+
+    if (readiness.error) {
+      alert('Failed to check readiness: ' + readiness.error);
+      // Fallback: skip readiness gate
+      const tradeable = allCombos.filter(c => c.canTrade);
+      if (!tradeable.length) { alert("No tradeable combinations. Connect wallets first."); return; }
+      showTradeSizeModal(tradeable);
+      return;
+    }
+    showReadinessModal(readiness);
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.innerHTML = '▶ Run All Tradeable'; }
+    if (confirm('Could not check route readiness. Run anyway?')) {
+      const tradeable = allCombos.filter(c => c.canTrade);
+      if (!tradeable.length) { alert("No tradeable combinations. Connect wallets first."); return; }
+      showTradeSizeModal(tradeable);
+    }
+  }
 }
 
 // Load combinations when panel opens
@@ -3722,15 +3966,18 @@ async function loadWalletStates() {
         document.getElementById('evm-wallet-name').textContent = '(Privy)';
       }
       document.getElementById('evm-expand-btn').style.display = 'inline';
+      // Always render chains for the connected EVM wallet
+      renderEvmChains(true, d.evm.address);
+      // Configure connect/disconnect button
       if (d.evm.source === 'envkey') {
         setEnvkeyBtn('evm-btn', connectEvmWallet, 'Wallet');
-        // Also render chains and fetch balances so user sees balance grid
-        renderEvmChains(true, d.evm.address);
-        fetchEvmBalances(d.evm.address);
       } else {
         const btn = document.getElementById('evm-btn');
         if (btn) { btn.textContent = 'Disconnect'; btn.className = 'btn btn-red'; btn.onclick = disconnectEvm; }
-        renderEvmChains(true, d.evm.address);
+      }
+      // Always fetch balances so swap/combos can grey out chains & assets with no funds
+      if (d.evm.address && d.evm.address.startsWith('0x')) {
+        fetchEvmBalances(d.evm.address);
       }
     }
 
@@ -3803,8 +4050,6 @@ async function loadWalletStates() {
       (d.evm && await fetch('/api/wallet/envkey-status').then(r=>r.json()).then(d=>d.evm).catch(()=>false)));
 
     updateWalletCount();
-    // Auto-fetch EVM balances for envkey/privy (no MetaMask event to trigger it)
-    if (d.evm && (d.evm.source === 'envkey' || d.evm.source === 'privy')) fetchEvmBalances(d.evm.address);
     // Sync .env notice panel
     updateEnvKeyNotice();
 
@@ -3860,6 +4105,8 @@ async function fetchEvmBalances(address) {
     // Expose balances globally for combinations
     window._evmBalances = d.balances || {};
     window._evmTokenBalances = d.tokenBalances || {};  // { chainPrefix: { TICKER: {raw,formatted,tokenAddr} } }
+    // Track chains whose RPC failed so we can hide them from "send" assets & combos
+    window._badRpcChains = (d.rpcErrors || []).map(e => (e.chain || '').toLowerCase());
     refreshChainBalanceDisplay(); // update chain balance grid if open
     if (d.rpcErrors?.length) {
       d.rpcErrors.forEach(e => addIssue('rpc', 'warning', `RPC Error: ${e.chain}`, e.message, { chain: e.chain }));

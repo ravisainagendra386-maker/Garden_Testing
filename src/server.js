@@ -30,13 +30,11 @@ runner.setEmitter(broadcast);
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
 // ── CORE TEST ROUTES / BOT STATE ─────────────────────────────
-// Amount overrides from trade-size modal (set before running)
 let _amountOverrides = {};
 
-// In-memory summary of arbitrage bot performance (estimated USD PnL).
 let _arbSummary = {
   totalProfitUsd: 0,
-  trades: [], // { fromAssetId,toAssetId,amount,usdPnl,edgeBps,ts,fromTicker,toTicker }
+  trades: [],
 };
 
 function recordArbTrade(entry) {
@@ -60,7 +58,7 @@ app.post("/api/run/set-amounts", (req, res) => {
 app.post("/api/run", async (req, res) => {
   res.json({ started: true, env: config.env });
   const overrides = Object.assign({}, _amountOverrides);
-  _amountOverrides = {}; // clear after capture
+  _amountOverrides = {};
   runner.runAll(overrides).catch(err => broadcast("error", { message: err.message }));
 });
 
@@ -92,7 +90,6 @@ app.post("/api/approve", (req, res) => {
   res.json({ ok: true });
 });
 
-// Gasless: dashboard posts EIP-712 signature back after eth_signTypedData_v4
 app.post("/api/evm-sign-response", (req, res) => {
   const { id, signature } = req.body;
   if (!id) return res.status(400).json({ error: "id required" });
@@ -106,44 +103,63 @@ app.post("/api/evm-tx-response", (req, res) => {
 });
 
 app.get("/api/chains", (req, res) => {
-  res.json(Object.values(config.chains).map(c => ({ id: c.id, name: c.name, type: c.type, rpc: c.rpc, explorer: c.explorer, asset: c.asset })));
+  res.json(Object.values(config.chains).map(c => ({
+    id: c.id, name: c.name, type: c.type, rpc: c.rpc, explorer: c.explorer, asset: c.asset
+  })));
 });
 
 app.get("/api/config", (req, res) => {
-  res.json({ env: config.env, isMainnet: config.isMainnet, manualApprove: config.manualApprove, chainCount: Object.keys(config.chains).length });
+  res.json({
+    env: config.env, isMainnet: config.isMainnet,
+    manualApprove: config.manualApprove,
+    chainCount: Object.keys(config.chains).length
+  });
 });
 
 app.post("/api/switch-env", (req, res) => {
   const { env } = req.body;
   if (!["testnet", "mainnet"].includes(env)) return res.status(400).json({ error: "Invalid env" });
   process.env.GARDEN_ENV = env;
+  // Clear all caches on env switch
+  _cachedAssets = null;
+  _validPairsCache = { env: null, ts: 0, pairs: null };
   res.json({ ok: true, message: `Switched to ${env}. Restart the server.` });
 });
 
 // ── Asset ID resolver ─────────────────────────────────────────
-// The swap window sends simplified IDs like "base:wbtc" or "bitcoin:btc".
-// Garden's API needs the full asset ID e.g. "base_sepolia:wbtc".
-// This function resolves simplified → full ID using the live asset list.
+// CHANGE: No long-lived cache — always fetch fresh assets
 let _cachedAssets = null;
+let _cachedAssetsTs = 0;
+const ASSET_CACHE_TTL = 30 * 1000; // 30 seconds max (was 5 min)
+
 async function getAssets() {
-  if (_cachedAssets) return _cachedAssets;
-  try { _cachedAssets = await garden.getAssets(); } catch(_) { _cachedAssets = []; }
-  // Expire cache after 5 min
-  setTimeout(() => { _cachedAssets = null; }, 5 * 60 * 1000);
+  const now = Date.now();
+  // Short TTL to avoid hammering API on rapid calls, but effectively "fresh"
+  if (_cachedAssets && (now - _cachedAssetsTs) < ASSET_CACHE_TTL) return _cachedAssets;
+  try {
+    _cachedAssets = await garden.getAssets();
+    _cachedAssetsTs = now;
+  } catch (_) {
+    _cachedAssets = [];
+  }
   return _cachedAssets;
 }
 
-// Input: "base:wbtc" → output: { assetId: "base_sepolia:wbtc", walletType: "evm", meta: {...} }
+// Force-clear asset cache (called before route building)
+function clearAssetCache() {
+  _cachedAssets = null;
+  _cachedAssetsTs = 0;
+}
+
 async function resolveAssetId(simplified) {
   if (!simplified) return null;
   const parts = simplified.split(":");
-  const chainHint  = parts[0].toLowerCase();  // e.g. "base", "bitcoin", "base_sepolia"
-  const tickerHint = (parts[1] || "").toLowerCase(); // e.g. "wbtc", "btc", "cbltc"
+  const chainHint  = parts[0].toLowerCase();
+  const tickerHint = (parts[1] || "").toLowerCase();
 
   const assets = await getAssets();
   const list = assets.result || assets.assets || (Array.isArray(assets) ? assets : []);
 
-  // 1. Try exact ID match first (e.g. "base_sepolia:cbltc" passed directly from swap)
   const exactMatch = list.find(a => (a.id || "").toLowerCase() === simplified.toLowerCase());
   if (exactMatch) {
     const walletType = (() => {
@@ -158,32 +174,27 @@ async function resolveAssetId(simplified) {
     return { assetId: exactMatch.id, walletType, meta: exactMatch };
   }
 
-  // 2. Score each asset: higher = better match
   let best = null, bestScore = -1;
   for (const a of list) {
     const id      = (a.id || "").toLowerCase();
     const chain   = (a.chain || id.split(":")[0] || "").toLowerCase();
     const ticker  = (a.asset || a.ticker || id.split(":")[1] || "").toLowerCase();
 
-    // Chain must match (prefix match — "base" matches "base_sepolia", and "base_sepolia" matches too)
     const chainMatch = chain === chainHint
       || chain.startsWith(chainHint + "_")
       || chainHint.startsWith(chain + "_")
       || chain.split("_")[0] === chainHint.split("_")[0];
     if (!chainMatch) continue;
 
-    // Ticker must match
     const tickerMatch = !tickerHint || ticker === tickerHint || ticker.includes(tickerHint) || tickerHint.includes(ticker);
     if (!tickerMatch) continue;
 
-    // Prefer exact matches
     const score = (chain === chainHint ? 2 : 1) + (ticker === tickerHint ? 2 : 1);
     if (score > bestScore) { bestScore = score; best = a; }
   }
 
   if (!best) return null;
 
-  // Determine wallet type from the resolved asset
   const walletType = (() => {
     const c = (best.chain || best.id?.split(":")[0] || "").toLowerCase();
     if (c.startsWith("bitcoin")) return "bitcoin";
@@ -202,17 +213,14 @@ app.post("/api/quote", async (req, res) => {
   if (!fromChain || !toChain) return res.status(400).json({ error: "fromChain and toChain required" });
 
   try {
-    // Support both old format ("bitcoin") and new swap format ("base:wbtc")
     let fromAssetId, toAssetId;
     if (fromChain.includes(":") || toChain.includes(":")) {
-      // New swap window format
       const [fromRes, toRes] = await Promise.all([resolveAssetId(fromChain), resolveAssetId(toChain)]);
       if (!fromRes) return res.status(400).json({ error: `Unknown asset: ${fromChain}` });
       if (!toRes)   return res.status(400).json({ error: `Unknown asset: ${toChain}` });
       fromAssetId = fromRes.assetId;
       toAssetId   = toRes.assetId;
     } else {
-      // Legacy format — chain key like "bitcoin", "base"
       const from = config.chains[fromChain]; const to = config.chains[toChain];
       if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
       fromAssetId = from.asset; toAssetId = to.asset;
@@ -229,7 +237,6 @@ app.post("/api/trade", async (req, res) => {
     let fromAssetId, toAssetId, fromWalletType, toWalletType, label;
 
     if (fromChain.includes(":") || toChain.includes(":")) {
-      // New swap window format: "base:wbtc" → resolve to full asset ID
       const [fromRes, toRes] = await Promise.all([resolveAssetId(fromChain), resolveAssetId(toChain)]);
       if (!fromRes) return res.status(400).json({ error: `Unknown asset: ${fromChain}` });
       if (!toRes)   return res.status(400).json({ error: `Unknown asset: ${toChain}` });
@@ -239,7 +246,6 @@ app.post("/api/trade", async (req, res) => {
       toWalletType   = toRes.walletType;
       label = `Swap: ${fromChain} → ${toChain}`;
     } else {
-      // Legacy format
       const from = config.chains[fromChain]; const to = config.chains[toChain];
       if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
       fromAssetId    = from.asset;
@@ -261,21 +267,174 @@ app.post("/api/trade", async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── ASSETS ────────────────────────────────────────────────────
+// ── ASSETS — always fresh ─────────────────────────────────────
 app.get("/api/assets", async (req, res) => {
-  try { res.json(await garden.getAssets()); }
-  catch (err) { res.status(500).json({ error: err.message }); }
+  try {
+    // CHANGE: Force fresh fetch
+    clearAssetCache();
+    res.json(await getAssets());
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// ── HELPER: Get connected wallet types ────────────────────────
+function getConnectedWalletTypes() {
+  const wallets = walletState.getStatus();
+  const types = new Set();
+  if (wallets.evm)      types.add("evm");
+  if (wallets.btc)      types.add("bitcoin");
+  if (wallets.solana)   types.add("solana");
+  if (wallets.starknet) types.add("starknet");
+  if (wallets.sui)      types.add("sui");
+  if (wallets.tron)     types.add("tron");
+  return types;
+}
+
+// ── HELPER: Determine wallet type for a Garden asset ──────────
+function getWalletTypeForAsset(asset) {
+  const chain  = (asset.chain || "").toLowerCase();
+  const prefix = (asset.id    || "").split(":")[0].toLowerCase();
+  if (chain.startsWith("evm"))      return "evm";
+  if (chain.startsWith("solana"))   return "solana";
+  if (chain.startsWith("starknet")) return "starknet";
+  if (chain.startsWith("tron"))     return "tron";
+  if (chain.startsWith("sui"))      return "sui";
+  if (chain === "bitcoin") {
+    if (/^bitcoin_(testnet|mainnet|signet)$/.test(prefix)) return "bitcoin";
+    return null;
+  }
+  return null;
+}
+
+// ── HELPER: Asset family classification ───────────────────────
+function assetFamily(asset) {
+  const t = (asset.name || asset.id || '').toLowerCase().split(':').pop();
+  if (/btc$|^btc|wbtc|cbtc|cbbtc|sbtc|hbtc|btcn|lbtc|tbtc|pbtc|rbtc/.test(t)) return 'btc';
+  if (/^eth$|^weth$/.test(t)) return 'eth';
+  if (/usdc|usdt|dai|busd/.test(t)) return 'stable';
+  if (/^ltc$|^wltc$|^cbltc$/.test(t)) return 'ltc';
+  return 'other_' + t;
+}
+
+// ── HELPER: Check if pair is plausible per Garden route policy ─
+// Per docs: /policy returns isolation_groups and blacklist_pairs
+// BTC family only trades with BTC family (isolation group)
+function isPairPlausible(from, to) {
+  const ff = assetFamily(from), tf = assetFamily(to);
+  if (ff === tf) return true;
+  if (ff === 'btc' && tf !== 'btc') return false;
+  if (tf === 'btc' && ff !== 'btc') return false;
+  return true;
+}
+
+// ── HELPER: Build routes from assets + connected wallets ──────
+// CHANGE: Always fresh — no valid-pairs cache filtering
+async function buildRoutesForReadiness() {
+  const connectedTypes = getConnectedWalletTypes();
+  if (connectedTypes.size === 0) return { routes: [], connectedTypes };
+
+  // Always fetch fresh assets
+  clearAssetCache();
+  const ar = await getAssets();
+  const assets = ar.result || ar.assets || ar || [];
+  if (!assets.length) return { routes: [], connectedTypes };
+
+  // CHANGE: Only include assets whose wallet type is connected
+  const supported = assets.filter(a => {
+    const wt = getWalletTypeForAsset(a);
+    return wt && connectedTypes.has(wt);
+  });
+
+  const routes = [];
+  for (const from of supported) {
+    for (const to of supported) {
+      if (from.id === to.id) continue;
+      if (!isPairPlausible(from, to)) continue;
+      routes.push({
+        fromAsset: from.id,
+        toAsset:   to.id,
+        fromChain: getWalletTypeForAsset(from),
+        toChain:   getWalletTypeForAsset(to),
+        amount:    parseInt(from.min_amount || 50000),
+        fromMeta:  from,
+        toMeta:    to,
+        label:     `${from.name} → ${to.name}`,
+      });
+    }
+  }
+
+  return { routes, connectedTypes, supported };
+}
+
+// ── HELPER: Gather balances for readiness calculation ─────────
+async function gatherBalances(connectedTypes, supported) {
+  const wallets = walletState.getStatus();
+  const balanceMap = new Map();
+  const gasMap     = new Map();
+
+  // Cached token balances from wallet panel
+  const cached = wallets.evm?.tokenBalances || {};
+  for (const [assetId, bal] of Object.entries(cached)) {
+    balanceMap.set(assetId, Number(bal));
+  }
+
+  // BTC balance
+  if (wallets.btc?.balance && wallets.btc.balance !== 'unknown') {
+    const sats = Math.floor(parseFloat(wallets.btc.balance) * 1e8);
+    for (const a of (supported || [])) {
+      if (getWalletTypeForAsset(a) === 'bitcoin') balanceMap.set(a.id, sats);
+    }
+  }
+
+  // EVM native gas balances
+  const evmAddress = wallets.evm?.address;
+  if (evmAddress) {
+    const { ethers } = require('ethers');
+    const chainConf = require('./config').chains || {};
+    const RPC_FALLBACK = {
+      base:'https://sepolia.base.org', ethereum:'https://rpc.sepolia.org',
+      arbitrum:'https://sepolia-rollup.arbitrum.io/rpc',
+      bnbchain:'https://data-seed-prebsc-1-s1.binance.org:8545',
+      hyperevm:'https://rpc.hyperliquid-testnet.xyz/evm',
+      monad:'https://testnet-rpc.monad.xyz',
+      citrea:'https://rpc.testnet.citrea.xyz', alpen:'https://rpc.testnet.alpen.xyz',
+    };
+
+    const evmChainKeys = new Set();
+    for (const a of (supported || [])) {
+      if (getWalletTypeForAsset(a) === 'evm') {
+        evmChainKeys.add(a.id.split(':')[0].replace(
+          /_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, ''
+        ));
+      }
+    }
+
+    await Promise.all([...evmChainKeys].map(async (ck) => {
+      try {
+        const rpc = chainConf[ck]?.rpc || RPC_FALLBACK[ck];
+        if (!rpc) return;
+        const provider = new ethers.JsonRpcProvider(rpc);
+        const bal = await Promise.race([
+          provider.getBalance(evmAddress),
+          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000)),
+        ]);
+        gasMap.set(ck, BigInt(bal.toString()));
+      } catch (_) {}
+    }));
+  }
+
+  return { balanceMap, gasMap };
+}
 
 // ── TRADE COMBINATIONS ────────────────────────────────────────
 async function buildCombinationsResponse() {
   const wallets = walletState.getStatus();
-  const ar      = await garden.getAssets();
+
+  // CHANGE: Always fresh assets
+  clearAssetCache();
+  const ar      = await getAssets();
   const assets  = ar.result || ar.assets || ar || [];
   if (!assets.length) return { ok: true, total: 0, combinations: [], pairsValidated: false, totalBeforeFilter: 0 };
 
-  // Dynamic wallet type — auto-supports new Garden networks.
-  // Only rejects non-wallet chains: alpen_signet, litecoin, spark, xrpl.
   function getWalletType(asset) {
     const chain   = (asset.chain || "").toLowerCase();
     const prefix  = (asset.id    || "").split(":")[0].toLowerCase();
@@ -286,7 +445,7 @@ async function buildCombinationsResponse() {
     if (chain.startsWith("sui"))      return "sui";
     if (chain === "bitcoin") {
       if (/^bitcoin_(testnet|mainnet|signet)$/.test(prefix)) return "bitcoin";
-      return null; // alpen_signet, litecoin_testnet, spark_regtest etc.
+      return null;
     }
     return null;
   }
@@ -296,36 +455,20 @@ async function buildCombinationsResponse() {
              starknet: !!wallets.starknet, sui: !!wallets.sui, tron: !!wallets.tron }[t] || false;
   }
 
-  const supported = assets.filter(a => getWalletType(a) !== null);
-  console.log(`[combinations] assets: ${assets.length}, supported: ${supported.length}, wallets:`, JSON.stringify({evm:!!wallets.evm,btc:!!wallets.btc}));
-  const combinations = [];
+  // CHANGE: Filter out assets whose wallet is not connected
+  const supported = assets.filter(a => {
+    const wt = getWalletType(a);
+    return wt && isWalletConnected(wt);
+  });
 
-  // Build all pairs — use asset min/max directly, no policy call needed
-  // Pre-filter: skip obviously unsupported cross-family pairs to reduce noise
-  function assetFamily(asset) {
-    const t = (asset.name || asset.id || '').toLowerCase().split(':').pop();
-    if (/btc$|^btc|wbtc|cbtc|cbbtc|sbtc|hbtc|btcn|lbtc|tbtc|pbtc|rbtc/.test(t)) return 'btc';
-    if (/^eth$|^weth$/.test(t)) return 'eth';
-    if (/usdc|usdt|dai|busd/.test(t)) return 'stable';
-    return 'other_' + t;
-  }
-  function isPairPlausible(from, to) {
-    const ff = assetFamily(from), tf = assetFamily(to);
-    // Same family always plausible
-    if (ff === tf) return true;
-    // BTC ↔ wrapped-BTC is the core Garden use-case
-    if (ff === 'btc' && tf === 'btc') return true;
-    // BTC → stable or BTC → ETH: Garden currently has no solver for these
-    if (ff === 'btc' && tf !== 'btc') return false;
-    if (tf === 'btc' && ff !== 'btc') return false;
-    // Otherwise allow (ETH↔stable etc. may have solvers)
-    return true;
-  }
+  console.log(`[combinations] assets: ${assets.length}, connected+supported: ${supported.length}`);
+  const combinations = [];
 
   for (const from of supported) {
     for (const to of supported) {
       if (from.id === to.id) continue;
-      if (!isPairPlausible(from, to)) continue; // skip cross-family
+      if (!isPairPlausible(from, to)) continue;
+
       const fromType      = getWalletType(from);
       const toType        = getWalletType(to);
       const fromConnected = isWalletConnected(fromType);
@@ -333,24 +476,21 @@ async function buildCombinationsResponse() {
       const minAmount     = parseInt(from.min_amount || 50000);
       const maxAmount     = parseInt(from.max_amount || 1000000);
 
-      // Balance check per wallet type
       let walletBalance = null;
-      let canAfford     = null; // null=unknown, true=ok, false=insufficient
+      let canAfford     = null;
 
       if (fromType === "bitcoin" && wallets.btc?.balance && wallets.btc.balance !== "unknown") {
-        walletBalance = Math.floor(parseFloat(wallets.btc.balance) * 1e8); // BTC → sats
+        walletBalance = Math.floor(parseFloat(wallets.btc.balance) * 1e8);
         canAfford = walletBalance >= minAmount;
       } else if (fromType === "solana" && wallets.solana?.balance) {
         walletBalance = parseFloat(wallets.solana.balance);
         canAfford = walletBalance >= minAmount;
       } else if (fromType === "evm" && wallets.evm?.address) {
-        // Use cached EVM balance if available (populated by /api/wallet/evm/balance)
         const evmBal = wallets.evm?.tokenBalances?.[from.id];
         if (evmBal !== undefined) {
           walletBalance = evmBal;
           canAfford = walletBalance >= minAmount;
         }
-        // else remains null = unknown
       }
 
       const suggested = (walletBalance !== null && canAfford !== false)
@@ -358,9 +498,7 @@ async function buildCombinationsResponse() {
         : minAmount;
 
       const balanceKnown = walletBalance !== null;
-      // canTrade: both wallets connected AND balance not confirmed insufficient
-      // NOTE: balanceUnknown (EVM) is treated as runnable — runner does its own check
-      const canTrade = fromConnected && toConnected && (canAfford !== false);
+      const canTrade = fromConnected && toConnected;
 
       combinations.push({
         id: `${from.id}->${to.id}`,
@@ -370,23 +508,15 @@ async function buildCombinationsResponse() {
         fromWalletConnected: fromConnected,
         toWalletConnected:   toConnected,
         canTrade,
-        canAfford,       // null=unknown, true=ok, false=insufficient
-        balanceKnown,    // false for EVM (need RPC), true for BTC/SOL
+        canAfford,
+        balanceKnown,
         walletBalance,
       });
     }
   }
 
-  // Filter out known-invalid pairs using cache (if populated)
-  const validPairsSet = _validPairsCache.env === config.env
-    ? _validPairsCache.pairs
-    : null;
-
-  const finalCombos = validPairsSet
-    ? combinations.filter(c => validPairsSet.has(`${c.from.assetId}::${c.to.assetId}`))
-    : combinations;
-
-  finalCombos.sort((a, b) => {
+  // CHANGE: No valid-pairs cache filtering — always show all connected combos
+  combinations.sort((a, b) => {
     if (a.canTrade && !b.canTrade) return -1;
     if (!a.canTrade && b.canTrade) return 1;
     const ap = a.fromWalletConnected || a.toWalletConnected;
@@ -398,9 +528,9 @@ async function buildCombinationsResponse() {
 
   return {
     ok: true,
-    total: finalCombos.length,
-    combinations: finalCombos,
-    pairsValidated: validPairsSet !== null,
+    total: combinations.length,
+    combinations,
+    pairsValidated: false,
     totalBeforeFilter: combinations.length,
   };
 }
@@ -413,17 +543,44 @@ app.get("/api/combinations", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-// ── VALID PAIR CACHE ─────────────────────────────────────────
-// Pre-validates pairs by calling /quote. Cached for 10min per env.
-let _validPairsCache = { env: null, ts: 0, pairs: new Set() };
 
+// ── ROUTE READINESS — chain-reaction aware ───────────────────
+app.get("/api/route-readiness", async (req, res) => {
+  try {
+    const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
+
+    if (!routes.length) {
+      return res.json({
+        assets: [], totalRoutes: 0, runnableRoutes: 0, readinessPct: 100,
+        flowChains: [], clusters: [], walletCoverage: null,
+      });
+    }
+
+    const { balanceMap, gasMap } = await gatherBalances(connectedTypes, supported);
+
+    // CHANGE: Pass connectedWalletTypes so optimizer filters disconnected assets
+    const routeOptimizerAgent = require('./agents/routeOptimizerAgent');
+    res.json(routeOptimizerAgent.getRouteReadiness(routes, {
+      balances: balanceMap,
+      gasBalances: gasMap,
+      connectedWalletTypes: connectedTypes,
+    }));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── VALID PAIR CACHE — kept but never blocks route building ──
+// CHANGE: This is now optional — routes are NEVER filtered by this cache
+// It only serves the UI "Validate Pairs" button for informational purposes
+let _validPairsCache = { env: null, ts: 0, pairs: null };
 let _validatingInProgress = false;
 
 app.get("/api/valid-pairs", async (req, res) => {
   const now = Date.now();
   const CACHE_MS = 10 * 60 * 1000;
 
-  if (_validPairsCache.env === config.env && now - _validPairsCache.ts < CACHE_MS) {
+  if (_validPairsCache.env === config.env && _validPairsCache.pairs && now - _validPairsCache.ts < CACHE_MS) {
     return res.json({ ok: true, pairs: [..._validPairsCache.pairs], cached: true,
       age: Math.round((now - _validPairsCache.ts) / 1000) });
   }
@@ -431,12 +588,12 @@ app.get("/api/valid-pairs", async (req, res) => {
     return res.json({ ok: true, pairs: [], inProgress: true });
   }
 
-  // Respond immediately — validation runs async with WS progress updates
   res.json({ ok: true, pairs: [], started: true });
 
   _validatingInProgress = true;
   try {
-    const ar     = await garden.getAssets();
+    clearAssetCache();
+    const ar     = await getAssets();
     const assets = ar.result || ar.assets || ar || [];
     if (!assets.length) { _validatingInProgress = false; return; }
 
@@ -467,8 +624,7 @@ app.get("/api/valid-pairs", async (req, res) => {
     }
 
     _validPairsCache = { env: config.env, ts: Date.now(), pairs: validPairs };
-    // Also share with runner
-    runner.setValidPairsCache(validPairs);
+    // CHANGE: Do NOT pass to runner — runner builds fresh routes every time
     broadcast("validate_done", { total: toCheck.length, valid: validPairs.size });
     console.log(`[valid-pairs] ${validPairs.size} / ${toCheck.length} valid`);
   } catch (err) {
@@ -478,9 +634,8 @@ app.get("/api/valid-pairs", async (req, res) => {
   }
 });
 
-// Invalidate valid-pairs cache (call after switching env)
 app.post("/api/valid-pairs/clear", (req, res) => {
-  _validPairsCache = { env: null, ts: 0, pairs: new Set() };
+  _validPairsCache = { env: null, ts: 0, pairs: null };
   res.json({ ok: true });
 });
 
@@ -519,7 +674,6 @@ app.post("/api/arbitrage/execute", async (req, res) => {
 
     res.json({ ok: true, started: true, verification });
 
-    // Fire-and-forget execution via existing automation engine
     runner.runRoute({
       fromChain: fromWalletType,
       toChain:   toWalletType,
@@ -560,8 +714,6 @@ app.get("/api/arbitrage/summary", (req, res) => {
   });
 });
 
-// Run a confirmed trade from the combinations panel
-// fromWalletType and toWalletType are the wallet types (evm/bitcoin/solana etc)
 app.post("/api/run/combination", async (req, res) => {
   const { fromAssetId, toAssetId, fromWalletType, toWalletType, amount } = req.body;
   if (!fromAssetId || !toAssetId || !amount)
@@ -601,8 +753,7 @@ app.post("/api/wallet/evm", (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
-// ── WALLET: EVM BALANCE (free public RPCs) ───────────────────
-// Fetches native ETH balance + known ERC20 token balances per chain
+// ── WALLET: EVM BALANCE ──────────────────────────────────────
 const FREE_RPCS = {
   ethereum_sepolia:  "https://rpc.sepolia.org",
   arbitrum_sepolia:  "https://sepolia-rollup.arbitrum.io/rpc",
@@ -614,19 +765,21 @@ const FREE_RPCS = {
   alpen_testnet:     "https://rpc.testnet.alpen.xyz",
 };
 
-// ERC20 balanceOf ABI (minimal)
-const ERC20_BALANCE_ABI = ["function balanceOf(address owner) view returns (uint256)", "function decimals() view returns (uint8)", "function symbol() view returns (string)"];
+const ERC20_BALANCE_ABI = [
+  "function balanceOf(address owner) view returns (uint256)",
+  "function decimals() view returns (uint8)",
+  "function symbol() view returns (string)"
+];
 
 app.post("/api/wallet/evm/balances", async (req, res) => {
   const { address } = req.body;
   if (!address) return res.status(400).json({ error: "address required" });
 
-  const results = {};       // chainPrefix → native wei (BigInt serialized as string)
-  const tokenResults = {};  // chainPrefix → { TICKER: formattedBalance }
+  const results = {};
+  const tokenResults = {};
   const rpcErrors = [];
 
-  // Build per-chain ERC20 token map from cached garden assets
-  const chainTokenMap = {}; // chainPrefix → [{id, ticker, token_address}]
+  const chainTokenMap = {};
   const rawAssets = await getAssets().catch(() => null);
   const assetList = (rawAssets?.result || rawAssets?.assets || (Array.isArray(rawAssets) ? rawAssets : []));
   for (const a of assetList) {
@@ -634,11 +787,9 @@ app.post("/api/wallet/evm/balances", async (req, res) => {
     const tokenAddr = a.token_address || a.tokenAddress;
     const ticker = (a.asset || a.ticker || a.id?.split(':')[1] || '').toLowerCase();
     if (!tokenAddr || tokenAddr === 'native' || tokenAddr === '0x0000000000000000000000000000000000000000') continue;
-    // Match chain to FREE_RPCS key
     const rpcKey = Object.keys(FREE_RPCS).find(k => chainId.startsWith(k.split('_')[0]) || k.startsWith(chainId.split('_')[0]));
     if (!rpcKey) continue;
     if (!chainTokenMap[rpcKey]) chainTokenMap[rpcKey] = [];
-    // Avoid duplicates
     if (!chainTokenMap[rpcKey].find(t => t.tokenAddr === tokenAddr)) {
       chainTokenMap[rpcKey].push({ id: a.id, ticker, tokenAddr });
     }
@@ -648,7 +799,6 @@ app.post("/api/wallet/evm/balances", async (req, res) => {
 
   await Promise.all(Object.entries(FREE_RPCS).map(async ([chainPrefix, rpcUrl]) => {
     try {
-      // Native balance
       const r = await axios.post(rpcUrl, {
         jsonrpc: "2.0", id: 1, method: "eth_getBalance",
         params: [address, "latest"]
@@ -657,7 +807,6 @@ app.post("/api/wallet/evm/balances", async (req, res) => {
       if (hex) results[chainPrefix] = String(parseInt(hex, 16));
       else rpcErrors.push({ chain: chainPrefix, message: "No result from RPC" });
 
-      // ERC20 token balances for this chain
       const tokens = chainTokenMap[chainPrefix] || [];
       if (tokens.length && hex) {
         const provider = new ethers.JsonRpcProvider(rpcUrl);
@@ -696,14 +845,13 @@ app.post("/api/rpc/update", async (req, res) => {
     }, { timeout: 5000 });
     if (!test.data?.result) throw new Error("No result from RPC");
     const blockNumber = parseInt(test.data.result, 16);
-    if (!testOnly) { FREE_RPCS[chain] = url; envkey.setRpc(chain, url); } // only persist if not test-only
+    if (!testOnly) { FREE_RPCS[chain] = url; envkey.setRpc(chain, url); }
     res.json({ ok: true, chain, url, blockNumber, saved: !testOnly });
   } catch(err) {
     res.status(400).json({ error: `RPC test failed: ${err.message}` });
   }
 });
 
-// List current RPCs
 app.get("/api/rpc/list", (req, res) => {
   res.json({ rpcs: FREE_RPCS });
 });
@@ -712,20 +860,16 @@ app.get("/api/rpc/list", (req, res) => {
 app.post("/api/wallet/btc", async (req, res) => {
   const { address, wif } = req.body;
   if (!address) return res.status(400).json({ error: "address required" });
-  // Manual entry overrides envkey
   try {
     const net = config.isMainnet ? "" : "/testnet4";
     const r   = await axios.get(`https://mempool.space${net}/api/address/${address}`);
-    const cs  = r.data?.chain_stats   || {};   // confirmed on-chain
-    const ms  = r.data?.mempool_stats || {};   // pending in mempool
+    const cs  = r.data?.chain_stats   || {};
+    const ms  = r.data?.mempool_stats || {};
     const confirmedSats = (cs.funded_txo_sum || 0) - (cs.spent_txo_sum || 0);
     const pendingSats   = (ms.funded_txo_sum || 0) - (ms.spent_txo_sum || 0);
     const balance = (confirmedSats / 1e8).toFixed(8);
-    const balanceFull = pendingSats !== 0
-      ? `${balance} (+${(Math.abs(pendingSats)/1e8).toFixed(8)} pending)`
-      : balance;
     walletState.connectBtc(address, wif, balance);
-    res.json({ ok: true, address, balance, confirmedSats, pendingSats, balanceFull });
+    res.json({ ok: true, address, balance, confirmedSats, pendingSats });
   } catch (_) {
     walletState.connectBtc(address, wif, "unknown");
     res.json({ ok: true, address, balance: "unknown" });
@@ -750,7 +894,6 @@ app.post("/api/wallet/disconnect", (req, res) => {
   const type = req.body.type;
   walletState.disconnect(type);
 
-  // After disconnect, fall back to envkey for that chain type (if available)
   try {
     if ((type === 'evm' || type === 'metamask' || type === 'privy') && envkey.isEvmAvailable()) {
       const addr = envkey.getEvmAddress();
@@ -777,7 +920,6 @@ app.post("/api/wallet/disconnect", (req, res) => {
       const addr = envkey.getTronAddress();
       if (addr) { const ok = walletState.connectEnvKeyTron(addr); if (ok) console.log(`[disconnect] Tron fell back to envkey: ${addr}`); }
     }
-    // Privy also affects Solana
     if (type === 'privy' && envkey.isSolanaAvailable()) {
       const addr = envkey.getSolanaAddress();
       if (addr) walletState.connectEnvKeySolana(addr);
@@ -787,7 +929,6 @@ app.post("/api/wallet/disconnect", (req, res) => {
   res.json({ ok: true });
 });
 
-// Returns which chain types have an .env key configured
 app.get("/api/wallet/envkey-status", (req, res) => {
   res.json({
     evm:      envkey.isEvmAvailable()      ? { address: envkey.getEvmAddress()      } : null,
@@ -799,7 +940,6 @@ app.get("/api/wallet/envkey-status", (req, res) => {
   });
 });
 
-// Force-switch a chain type to use the .env key (overrides MetaMask/Privy)
 app.post("/api/wallet/use-envkey", (req, res) => {
   const { type } = req.body;
   try {
@@ -842,51 +982,24 @@ app.get("/api/wallet/balances", async (req, res) => {
       }
     } catch (_) {}
   }
-  // Return wallet status but NEVER expose private keys or full addresses from .env
+
   const status = walletState.getStatus();
   const safeStatus = JSON.parse(JSON.stringify(status));
-  // Redact: replace env-sourced addresses with shortened form so keys can't be harvested
   for (const key of ['evm','btc','solana','starknet','sui','tron']) {
     if (safeStatus[key]?.source === 'envkey' && safeStatus[key]?.address) {
       const addr = safeStatus[key].address;
       safeStatus[key].address = addr.slice(0,6) + '…' + addr.slice(-4);
       safeStatus[key].addressRedacted = true;
     }
-    // Never expose wif key
     if (safeStatus[key]?.wif) delete safeStatus[key].wif;
   }
   res.json(safeStatus);
 });
 
-// ── START ─────────────────────────────────────────────────────
-server.listen(config.port, () => {
-  console.log(`\n✅  Garden Test Suite running`);
-  console.log(`   Dashboard:   http://localhost:${config.port}`);
-  console.log(`   Environment: ${config.env.toUpperCase()}`);
-  console.log(`   Manual Approve: ${config.manualApprove ? "ON ✋" : "OFF 🤖"}`);
-  console.log(`   Chains: ${Object.keys(config.chains).length}`);
-
-  // Auto-connect .env private keys as lowest-priority signers for each chain type
-  function tryEnvKey(label, checker, addrFn, connectFn) {
-    if (!checker()) return;
-    try {
-      const addr = addrFn();
-      if (addr) { const ok = connectFn(addr); if (ok) console.log(`   ${label}: ${addr}`); }
-    } catch(e) { console.error(`   ⚠️  ${label} key invalid: ${e.message}`); }
-  }
-
-  tryEnvKey("EVM (.env)",      envkey.isEvmAvailable,      envkey.getEvmAddress,      walletState.connectEnvKeyEvm);
-  tryEnvKey("BTC (.env)",      envkey.isBtcAvailable,      envkey.getBtcAddress,      (addr) => walletState.connectEnvKeyBtc(addr, envkey.getBtcWif()));
-  tryEnvKey("Solana (.env)",   envkey.isSolanaAvailable,   envkey.getSolanaAddress,   walletState.connectEnvKeySolana);
-  tryEnvKey("Starknet (.env)", envkey.isStarknetAvailable, envkey.getStarknetAddress, walletState.connectEnvKeyStarknet);
-  tryEnvKey("Sui (.env)",      envkey.isSuiAvailable,      envkey.getSuiAddress,      walletState.connectEnvKeySui);
-  tryEnvKey("Tron (.env)",     envkey.isTronAvailable,     envkey.getTronAddress,     walletState.connectEnvKeyTron);
-  console.log("");
-});
-
-// ── DEBUG: raw quote response ─────────────────────────────────
+// ── DEBUG ─────────────────────────────────────────────────────
 app.get("/api/debug/assets", async (req, res) => {
   try {
+    clearAssetCache();
     const raw = await garden.getAssets();
     res.json(raw);
   } catch(err) { res.status(500).json({ error: err.message }); }
@@ -903,9 +1016,7 @@ app.get("/api/debug/quote", async (req, res) => {
   }
 });
 
-module.exports = { server, broadcast };
-
-// ── STUCK ORDERS: list and retry ─────────────────────────────
+// ── STUCK ORDERS ─────────────────────────────────────────────
 app.get("/api/orders/stuck", async (req, res) => {
   try {
     const wallets = walletState.getStatus();
@@ -923,7 +1034,6 @@ app.get("/api/orders/stuck", async (req, res) => {
       } catch (_) {}
     }
 
-    // Filter stuck: initiated but not completed/refunded, older than 5min
     const cutoff = Date.now() - 5 * 60 * 1000;
     const stuck = allOrders.filter(o => {
       const status = (o.status || "").toLowerCase();
@@ -938,20 +1048,22 @@ app.get("/api/orders/stuck", async (req, res) => {
   }
 });
 
+// Per Garden docs v2.0.15: instant-refund requires `signatures` array (not `signature` string)
 app.post("/api/orders/cancel/:id", async (req, res) => {
   const id = req.params.id;
   try {
-    // 1. Try instant refund first (works before timelock — needs solver signature)
+    // 1. Try instant refund first (needs solver signature)
     try {
       const hashRes = await garden.getRefundHash(id);
       const refundHash = hashRes.result?.refund_hash || hashRes.result;
       if (refundHash) {
-        const r = await garden.patchOrder(id, "instant-refund", refundHash);
+        // Per v2.0.15 changelog: action=instant-refund requires { signatures: [...] }
+        const r = await garden.patchOrder(id, "instant-refund", { signatures: [refundHash] });
         return res.json({ ok: true, method: "instant-refund", result: r });
       }
-    } catch (_) { /* instant-refund not available — fall through to regular refund */ }
+    } catch (_) {}
 
-    // 2. Regular refund (works after timelock expires)
+    // 2. Regular refund (after timelock expires)
     const r = await garden.patchOrder(id, "refund", null);
     res.json({ ok: true, method: "refund", result: r });
   } catch (err) {
@@ -959,7 +1071,6 @@ app.post("/api/orders/cancel/:id", async (req, res) => {
   }
 });
 
-// Get instant-refund hash only (for manual flows)
 app.get("/api/orders/:id/refund-hash", async (req, res) => {
   try {
     const r = await garden.getRefundHash(req.params.id);
@@ -969,14 +1080,40 @@ app.get("/api/orders/:id/refund-hash", async (req, res) => {
   }
 });
 
-// Redeem an order on destination chain (after solver has locked)
 app.post("/api/orders/:id/redeem", async (req, res) => {
   const { secret } = req.body;
   if (!secret) return res.status(400).json({ error: "secret required" });
   try {
-    const r = await garden.patchOrder(req.params.id, "redeem", secret);
+    const r = await garden.patchOrder(req.params.id, "redeem", { secret });
     res.json({ ok: true, result: r });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// ── START ─────────────────────────────────────────────────────
+server.listen(config.port, () => {
+  console.log(`\n✅  Garden Test Suite running`);
+  console.log(`   Dashboard:   http://localhost:${config.port}`);
+  console.log(`   Environment: ${config.env.toUpperCase()}`);
+  console.log(`   Manual Approve: ${config.manualApprove ? "ON ✋" : "OFF 🤖"}`);
+  console.log(`   Chains: ${Object.keys(config.chains).length}`);
+
+  function tryEnvKey(label, checker, addrFn, connectFn) {
+    if (!checker()) return;
+    try {
+      const addr = addrFn();
+      if (addr) { const ok = connectFn(addr); if (ok) console.log(`   ${label}: ${addr}`); }
+    } catch(e) { console.error(`   ⚠️  ${label} key invalid: ${e.message}`); }
+  }
+
+  tryEnvKey("EVM (.env)",      envkey.isEvmAvailable,      envkey.getEvmAddress,      walletState.connectEnvKeyEvm);
+  tryEnvKey("BTC (.env)",      envkey.isBtcAvailable,      envkey.getBtcAddress,      (addr) => walletState.connectEnvKeyBtc(addr, envkey.getBtcWif()));
+  tryEnvKey("Solana (.env)",   envkey.isSolanaAvailable,   envkey.getSolanaAddress,   walletState.connectEnvKeySolana);
+  tryEnvKey("Starknet (.env)", envkey.isStarknetAvailable, envkey.getStarknetAddress, walletState.connectEnvKeyStarknet);
+  tryEnvKey("Sui (.env)",      envkey.isSuiAvailable,      envkey.getSuiAddress,      walletState.connectEnvKeySui);
+  tryEnvKey("Tron (.env)",     envkey.isTronAvailable,     envkey.getTronAddress,     walletState.connectEnvKeyTron);
+  console.log("");
+});
+
+module.exports = { server, broadcast };
