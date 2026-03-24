@@ -11,7 +11,16 @@ const client = axios.create({
 client.interceptors.response.use(
   (r) => r,
   (err) => {
-    const msg = err.response?.data?.error || err.message || "Garden API error";
+    const data = err.response?.data;
+    let msg = err.message || "Garden API error";
+    if (data != null) {
+      if (typeof data === "string") msg = data;
+      else if (typeof data.error === "string") msg = data.error;
+      else if (typeof data.message === "string") msg = data.message;
+      else if (data.error != null)
+        msg = typeof data.error === "object" ? JSON.stringify(data.error) : String(data.error);
+    }
+    if (!String(msg).trim()) msg = "Garden API error";
     const e = new Error(`[Garden ${err.response?.status || 0}] ${msg}`);
     e.status = err.response?.status;
     e.raw = err.response?.data;

@@ -3,6 +3,15 @@
 // Fetches from CoinGecko, caches for TTL, falls back to hardcoded estimates.
 const axios = require('axios');
 
+/** Map Garden asset suffixes not in CoinGecko list to a priced ticker (e.g. ibtc → btc). */
+const TICKER_ALIASES = {
+  ibtc: 'btc',
+  wcbtc: 'wbtc',
+  pbtc: 'btc',
+  bbtc: 'btc',
+  dbtc: 'btc',
+};
+
 const COINGECKO_IDS = {
   btc:   'bitcoin',
   wbtc:  'wrapped-bitcoin',
@@ -31,6 +40,7 @@ const FALLBACK_PRICES = {
   btc: 95000, wbtc: 95000, cbtc: 95000, cbbtc: 95000,
   sbtc: 95000, lbtc: 95000, hbtc: 95000, tbtc: 95000,
   xbtc: 95000, rbtc: 95000,
+  ibtc: 95000, wcbtc: 95000, pbtc: 95000, bbtc: 95000, dbtc: 95000,
   eth: 3200, weth: 3200,
   usdc: 1, usdt: 1, dai: 1,
   bnb: 600, sol: 140, sui: 2,
@@ -76,15 +86,22 @@ async function fetchPrices() {
   }
 }
 
+function normalizeTicker(ticker) {
+  const t = (ticker || '').toLowerCase();
+  return TICKER_ALIASES[t] || t;
+}
+
 function getPrice(ticker) {
-  return _cache[ticker?.toLowerCase()] || FALLBACK_PRICES[ticker?.toLowerCase()] || 0;
+  const key = normalizeTicker(ticker);
+  return _cache[key] || FALLBACK_PRICES[key] || 0;
 }
 
 // Convert atomic units → USD value
 function atomicToUsd(atomicAmount, ticker) {
   const t = (ticker || '').toLowerCase();
-  const decimals = TOKEN_DECIMALS[t] ?? 8;
-  const price    = getPrice(t);
+  const key = normalizeTicker(ticker);
+  const decimals = TOKEN_DECIMALS[t] ?? TOKEN_DECIMALS[key] ?? 8;
+  const price = getPrice(ticker);
   if (!price) return 0;
   return (Number(atomicAmount) / Math.pow(10, decimals)) * price;
 }
@@ -100,7 +117,9 @@ function usdToAtomic(usd, ticker) {
 
 // Get decimals for a ticker
 function getDecimals(ticker) {
-  return TOKEN_DECIMALS[(ticker || '').toLowerCase()] ?? 8;
+  const t = (ticker || '').toLowerCase();
+  const key = normalizeTicker(ticker);
+  return TOKEN_DECIMALS[t] ?? TOKEN_DECIMALS[key] ?? 8;
 }
 
 // Invalidate cache (force fresh fetch)

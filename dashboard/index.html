@@ -263,8 +263,9 @@
 
       <div class="stats-grid">
         <div class="card" onclick="showPanel('routes'); filterRoutes('all');" style="cursor:pointer">
-          <div class="card-title">Total Routes</div>
+          <div class="card-title">Executed Routes</div>
           <div class="card-value" id="statTotal">—</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:6px" id="statRouteMeta">Planned: — · Discovered: —</div>
         </div>
         <div class="card" onclick="showPanel('routes'); filterRoutes('pass');" style="cursor:pointer">
           <div class="card-title">Passed</div>
@@ -530,6 +531,8 @@
         <h1 class="section-title" style="margin:0">💳 Connected Wallets</h1>
         <div style="display:flex;align-items:center;gap:10px">
           <span id="walletSummary" style="font-size:12px;color:var(--muted)">0/7 wallets connected</span>
+          <button id="walletRpcScanBtn" onclick="scanAllRpcs()" class="btn btn-ghost"
+            style="font-size:11px;padding:5px 12px" title="Scan all configured RPC endpoints">📡 Scan RPCs</button>
           <button id="walletRefreshBtn" onclick="refreshAllWalletBalances()" class="btn btn-ghost"
             style="font-size:11px;padding:5px 12px" title="Refresh all wallet balances">🔄 Refresh Balances</button>
         </div>
@@ -753,6 +756,7 @@ let routeStates = {};
 let issues = [];
 let allChains = [];
 let suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
+let routeMetrics = { discovered: 0, planned: 0 };
 
 // ── WEBSOCKET ──
 let _wsRetryDelay = 1000;
@@ -798,6 +802,7 @@ function handleWsMessage({ event, data }) {
   if (event === 'test_step')       handleTestStep(data);
   if (event === 'test_end')        handleTestEnd(data);
   if (event === 'suite_end')       handleSuiteEnd(data);
+  if (event === 'suite_routes')    handleSuiteRoutes(data);
   if (event === 'approval_request') handleApprovalRequest(data);
   if (event === 'api_tests_done')   handleApiTestsDone(data);
   if (event === 'evm_tx_request')   handleEvmTxRequest(data);
@@ -811,8 +816,14 @@ function handleWsMessage({ event, data }) {
 // ── EVENT HANDLERS ──
 function handleSuiteStart(d) {
   suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
+  routeMetrics.planned = 0;
   updateStats();
   document.getElementById('lastRunLabel').textContent = `Running… (${d.env.toUpperCase()})`;
+}
+
+function handleSuiteRoutes(data) {
+  routeMetrics.planned = Number(data?.count || 0);
+  updateStats();
 }
 
 function handleTestStart({ testId, label }) {
@@ -831,12 +842,17 @@ function handleTestStep({ label, step }) {
 
 function handleTestEnd({ label, status, error, steps }) {
   if (routeStates[label]) routeStates[label].status = status;
-  suiteStats.total++;
+  // Count as "executed" only after a route is committed past early gates (not wallet/quote skips).
+  if (status === 'pass' || status === 'fail' || status === 'aborted') {
+    suiteStats.total++;
+  }
   if (status === 'pass') {
     suiteStats.passed++;
-  } else if (status === 'fail') {
+  } else if (status === 'fail' || status === 'aborted') {
     suiteStats.failed++;
-    addIssue('tech', 'critical', `Failed: ${label}`, error || 'See step log', { steps });
+    if (status === 'fail') {
+      addIssue('tech', 'critical', `Failed: ${label}`, error || 'See step log', { steps });
+    }
   } else {
     suiteStats.skipped++;
     // Log meaningful skips to issues (not wallet-not-connected noise)
@@ -872,9 +888,12 @@ function handleSuiteAborted(data) {
 }
 
 function handleSuiteEnd(d) {
+  const executed = typeof d.executed === 'number'
+    ? d.executed
+    : ((d.passed || 0) + (d.failed || 0) + (d.aborted || 0));
   const msg = d.total === 0
     ? `No routes ran — ${d.message || 'connect wallets first'}`
-    : `Last run: ${new Date().toLocaleTimeString()} — ${d.passed}/${d.total} passed`;
+    : `Last run: ${new Date().toLocaleTimeString()} — ${d.passed || 0}/${executed} passed · ${d.skipped || 0} skipped (pre-trade)`;
   document.getElementById('lastRunLabel').textContent = msg;
   document.getElementById('btnRunAll').disabled = false;
   document.getElementById('btnRunAll').innerHTML = '▶ Run All Tests';
@@ -1032,6 +1051,20 @@ async function handleEvmTxRequest({ id, orderId, label, to, data, value, chainId
 
     logEvent('info', { label: `🔏 ${window._evmWalletName || 'Wallet'}: sign EVM HTLC for ${label} on ${chainName}` });
     const accounts = await provider.request({ method: 'eth_requestAccounts' });
+    let feeParams = {};
+    try {
+      const latest = await provider.request({ method: 'eth_getBlockByNumber', params: ['latest', false] });
+      const baseFeeHex = latest?.baseFeePerGas;
+      if (baseFeeHex) {
+        const base = BigInt(baseFeeHex);
+        const priority = 2n * 10n ** 9n; // 2 gwei
+        const max = (base * 2n) + priority; // keep safely above base fee spikes
+        feeParams = {
+          maxPriorityFeePerGas: '0x' + priority.toString(16),
+          maxFeePerGas: '0x' + max.toString(16),
+        };
+      }
+    } catch (_) {}
     const txHash = await provider.request({
       method: 'eth_sendTransaction',
       params: [{
@@ -1039,7 +1072,8 @@ async function handleEvmTxRequest({ id, orderId, label, to, data, value, chainId
         to,
         data,
         value: value || '0x0',
-        gas:   gasLimit || '0x493e0',
+        ...(gasLimit ? { gas: gasLimit } : {}),
+        ...feeParams,
       }]
     });
     await fetch('/api/evm-tx-response', { method:'POST', headers:{'Content-Type':'application/json'},
@@ -1365,7 +1399,12 @@ function filterIssues(f) { renderIssues(f); }
 
 // ── STATS ──
 function updateStats() {
-  document.getElementById('statTotal').textContent  = suiteStats.total || '—';
+  const executed = Number(suiteStats.total || 0);
+  const planned = Number(routeMetrics.planned || 0);
+  const discovered = Number(routeMetrics.discovered || 0);
+  document.getElementById('statTotal').textContent  = executed || '—';
+  const meta = document.getElementById('statRouteMeta');
+  if (meta) meta.textContent = `Planned: ${planned || '—'} · Discovered: ${discovered || '—'}`;
   document.getElementById('statPassed').textContent = suiteStats.passed || '—';
   document.getElementById('statFailed').textContent = suiteStats.failed || '—';
   const rate = suiteStats.total ? Math.round(suiteStats.passed / suiteStats.total * 100) + '%' : '—';
@@ -1380,7 +1419,7 @@ async function runAll() {
   btn.innerHTML = '<span class="spinner"></span> Checking readiness…';
 
   try {
-    const r = await fetch('/api/route-readiness');
+    const r = await fetch(`/api/route-readiness?mode=${encodeURIComponent(_selectedRunMode)}`);
     const readiness = await r.json();
     btn.disabled = false;
     btn.innerHTML = '▶ Run All Tests';
@@ -1399,8 +1438,10 @@ async function runAll() {
 }
 
 let _runAllAfterModal = false;
+let _selectedRunMode = 'allTests';
 
-function _launchRunAll() {
+function _launchRunAll(mode = _selectedRunMode || 'allTests') {
+  _selectedRunMode = mode === 'allChains' ? 'allChains' : 'allTests';
   const btn  = document.getElementById('btnRunAll');
   const stop = document.getElementById('btnStop');
   btn.disabled = true;
@@ -1411,11 +1452,68 @@ function _launchRunAll() {
   issues = [];
   renderIssues();
   document.getElementById('lastRunLabel').textContent = '⏳ Running tests…';
-  fetch('/api/run', { method: 'POST' });
+  fetch('/api/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: _selectedRunMode })
+  })
+    .then(async (r) => {
+      if (!r.ok) {
+        let msg = 'Run rejected by strict readiness gate.';
+        try {
+          const d = await r.json();
+          if (d?.reason) msg = d.reason;
+        } catch (_) {}
+        throw new Error(msg);
+      }
+      return r.json();
+    })
+    .catch((e) => {
+      btn.disabled = false;
+      btn.innerHTML = '▶ Run All Tests';
+      stop.style.display = 'none';
+      document.getElementById('lastRunLabel').textContent = '⚠️ Run blocked';
+      alert(e.message || 'Run blocked by strict mode');
+    });
 }
 
 function runApiOnly() {
   fetch('/api/run/api-tests', { method: 'POST' });
+}
+
+async function scanAllRpcs() {
+  const btn = document.getElementById('walletRpcScanBtn');
+  const oldText = btn?.innerHTML || '📡 Scan RPCs';
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spinner"></span> Scanning…';
+  }
+  document.getElementById('lastRunLabel').textContent = '⏳ Scanning chain RPC health…';
+
+  try {
+    const r = await fetch('/api/rpc/scan');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'RPC scan failed');
+
+    const failedChecks = (d.checks || []).filter(c => !c.ok);
+    failedChecks.forEach(c => addIssue('rpc', 'warning', `RPC Error: ${c.chain}`, c.error || 'RPC failed', { chain: c.chain }));
+
+    if (failedChecks.length) {
+      const names = failedChecks.map(c => c.chain).join(', ');
+      document.getElementById('lastRunLabel').textContent = `⚠️ RPC scan: ${d.healthy}/${d.total} healthy. Failed: ${names}`;
+    } else {
+      document.getElementById('lastRunLabel').textContent = `✅ RPC scan: all ${d.total} chains healthy`;
+    }
+  } catch (e) {
+    document.getElementById('lastRunLabel').textContent = `❌ RPC scan failed: ${e.message}`;
+    addIssue('rpc', 'warning', 'RPC Scan Failed', e.message, {});
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = oldText;
+    }
+    renderIssues();
+  }
 }
 
 function switchEnv(env) {
@@ -1446,24 +1544,63 @@ function showReadinessModal(readiness) {
   const existing = document.getElementById('readinessOverlay');
   if (existing) existing.remove();
 
-  const { assets, totalRoutes, runnableRoutes, readinessPct, flowChains } = readiness;
-  const barColor = readinessPct >= 80 ? 'var(--green)' : readinessPct >= 30 ? 'var(--yellow)' : 'var(--red)';
-
+  const {
+    assets, totalRoutes, runnableRoutes, readinessPct, flowChains,
+    chainPairMatrix, beamHopTotal, beamHopRunnable,
+    requiredAmountSufficient, requiredAmountSummary, topThreeConditions,
+    seedAllowlistSize, builtChains, canInitiate, rawPlannedRoutes, executablePlannedRoutes,
+    consolidation, hasQualifiedChainStart, executablePlanCount,
+  } = readiness;
+  const isAllChains = _selectedRunMode === 'allChains';
   // Count categories
   const seedAssets = assets.filter(a => a.isChainStart);
+  const fundedSeedFallback = assets.filter(a => a.sufficient && !a.isChainFundedSource);
   const chainFunded = assets.filter(a => a.reason === 'chain_funded');
   const fundedSeeds = seedAssets.filter(a => a.sufficient);
+  const effectiveFundedSeeds = fundedSeeds.length ? fundedSeeds : fundedSeedFallback;
   const unknownAssets = assets.filter(a => a.reason === 'balance_unknown');
   const insufficientAssets = assets.filter(a => !a.sufficient && a.reason !== 'balance_unknown' && a.reason !== 'chain_funded');
 
-  // Can run if ANY seed has sufficient balance
-  const hasAnyFundedChain = fundedSeeds.length > 0;
-  const canRun = hasAnyFundedChain || readinessPct >= 100;
+  // Beam-start mode: run when selected mode has executable planned routes.
+  const hasAnyFundedChain = effectiveFundedSeeds.length > 0;
+  const canRun = canInitiate === true;
+  const seedReadinessPct = seedAssets.length
+    ? Math.round((effectiveFundedSeeds.length / seedAssets.length) * 100)
+    : 0;
+  const planReadinessPct = (rawPlannedRoutes > 0 && Number.isFinite(executablePlannedRoutes))
+    ? Math.min(100, Math.round((executablePlannedRoutes / rawPlannedRoutes) * 100))
+    : 0;
+  /* allChains: headline bar = ready-to-execute when strict gate passes, else funded-seeds / chain-start rows.
+     The API readinessPct is hop-level (runnable consecutive hops / total hops in ALL beams) — often single-digit. */
+  const displayReadinessPct = isAllChains
+    ? (canRun ? 100 : seedReadinessPct)
+    : readinessPct;
+  const barColor = displayReadinessPct >= 80 ? 'var(--green)' : displayReadinessPct >= 30 ? 'var(--yellow)' : 'var(--red)';
+  const coverageTitle = isAllChains
+    ? (canRun ? 'Run readiness (strict gate open)' : 'Seed funding (chain-start wallets)')
+    : 'Balance coverage';
+  const matrix =
+    isAllChains && chainPairMatrix && chainPairMatrix.fanoutTotal > 0
+      ? chainPairMatrix
+      : null;
+  const fanoutMax = matrix && Number.isFinite(matrix.fanoutTotal) ? matrix.fanoutTotal : 0;
+  const matrixSummaryLine = matrix
+    ? `Fan-out (N−1) from best chain <code style="font-size:10px">${(matrix.bestFanoutChainKey || '').replace(/</g, '')}</code>: ${matrix.coveredFanout}/${matrix.fanoutTotal} catalog hops · ${matrix.executableFanout} executable from wallet · per-chain table in API <code>perChainFanout</code>.`
+    : '';
+  const coverageFootnote = isAllChains
+    ? (matrix
+      ? `${matrixSummaryLine} Beam hops (one path per seed): ${beamHopRunnable != null ? beamHopRunnable : '—'}/${beamHopTotal != null ? beamHopTotal : '—'}.`
+      : `Hop depth (every candidate beam): ${readinessPct}% · ${runnableRoutes}/${totalRoutes} hops — not the same as “routes this run”.`)
+    : '';
 
   const assetRows = assets.map(a => {
-    const balStr = a.balance !== null ? Number(a.balance).toLocaleString() : '—';
+    const balStr = a.balanceNormalized !== undefined && a.balanceNormalized !== null
+      ? String(a.balanceNormalized)
+      : (a.balance !== null ? String(a.balance) : '—');
     const isChainFunded = a.reason === 'chain_funded';
-    const reqStr = isChainFunded ? '0 (chain-funded)' : Number(a.required).toLocaleString();
+    const shortfallStr = a.needMoreNormalized !== undefined && a.needMoreNormalized !== null
+      ? String(a.needMoreNormalized)
+      : (a.needMoreAtomic !== undefined && a.needMoreAtomic !== null ? String(a.needMoreAtomic) : '—');
 
     const icon = a.sufficient
       ? (isChainFunded ? '<span style="color:var(--cyan)">🔗</span>' : '<span style="color:var(--green)">✅</span>')
@@ -1476,7 +1613,7 @@ function showReadinessModal(readiness) {
         ? '<span style="color:var(--cyan);font-size:10px">Funded by previous trade output</span>'
         : '')
       : a.reason === 'balance_unknown'
-        ? '<span style="color:var(--yellow);font-size:10px">Balance not cached — will check at runtime</span>'
+        ? '<span style="color:var(--yellow);font-size:10px">Balance not cached — refresh balances or check RPC Issues</span>'
         : a.reason === 'insufficient_gas'
           ? '<span style="color:var(--red);font-size:10px">Insufficient native gas for tx fees</span>'
           : a.reason === 'insufficient_balance'
@@ -1499,20 +1636,82 @@ function showReadinessModal(readiness) {
         <div style="font-weight:600;font-size:13px">${a.ticker} <span style="color:var(--muted);font-weight:400;font-size:11px">on ${(a.chainRaw||a.chain||'').replace(/_/g,' ')}</span>${chainBadge}</div>
         <div style="display:flex;gap:12px;font-size:11px;margin-top:2px">
           <span style="color:var(--muted)">Balance: <span style="color:${balColor};font-family:'JetBrains Mono',monospace">${balStr}</span></span>
-          <span style="color:var(--muted)">Required: <span style="font-family:'JetBrains Mono',monospace">${reqStr}</span></span>
+          <span style="color:var(--muted)">Need More: <span style="font-family:'JetBrains Mono',monospace">${shortfallStr}</span></span>
         </div>
         ${reasonText ? `<div style="margin-top:3px">${reasonText}</div>` : ''}
       </div>
       <div style="text-align:right;flex-shrink:0">
-        <div style="font-size:12px;font-weight:600;color:var(--muted)">${a.routeCount} route${a.routeCount!==1?'s':''}</div>
+        <div style="font-size:12px;font-weight:600;color:var(--muted)">${a.routeCount} pair${a.routeCount!==1?'s':''}</div>
       </div>
     </div>`;
   }).join('');
 
   // Flow chain summary
+  const consolidationBanner = (isAllChains && consolidation && consolidation.eligible)
+    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(168,85,247,.08)">
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#c4b5fd;margin-bottom:6px">Fallback native target (no qualified beam seed)</div>
+        <div style="font-size:13px;font-weight:600">${(consolidation.targetName || consolidation.targetAssetId || '').replace(/</g,'')}</div>
+        <div style="font-size:10px;color:var(--muted);margin-top:6px;line-height:1.45">Random EVM native on a chain with sufficient gas and at least one Garden quote/liquidity path to another asset on that chain. Shown when no funded chain-start seed produced a beam in this mode, or when nothing else is executable. Other catalog swaps may still be runnable. A second check runs on Run.</div>
+      </div>`
+    : '';
+
+  const cycleTourBanner = `<div style="font-size:10px;color:var(--muted);line-height:1.55;margin-bottom:10px;padding:10px 12px;background:rgba(255,255,255,.04);border-radius:10px;border:1px solid rgba(255,255,255,.07)">
+    <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--fg);margin-bottom:6px">Cycle tour (both modes)</div>
+    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--fg);margin-bottom:6px">f(a_i) = a_{(i mod n) + 1} · a₁→a₂→⋯→aₙ→a₁</div>
+    <div style="font-size:11px;line-height:1.5"><b>allChains</b> — recurrence on <b>chain</b> prefixes (sorted): beam seeds use the chain cycle; N−1 fan-out rows follow the same ring from the best source chain.</div>
+    <div style="font-size:11px;line-height:1.5;margin-top:6px"><b>allTests</b> — same formula; ordering is over <b>every funded seed asset</b> (globally sorted asset ids), then scored multi-hop beams + standalone routes.</div>
+  </div>`;
+
+  const matrixPairRows = (matrix && Array.isArray(matrix.rows) && matrix.rows.length)
+    ? (() => {
+        const lim = 48;
+        const slice = matrix.rows.slice(0, lim);
+        const more = matrix.rows.length > lim ? ` … +${matrix.rows.length - lim} more` : '';
+        return slice.map((row) => {
+          const short = (k) => (k || '').replace(/_sepolia|_testnet|_mainnet/g, '').replace(/_/g, ' ') || '—';
+          const st = row.covered
+            ? (row.fromExecutable ? 'var(--green)' : 'var(--yellow)')
+            : 'var(--muted)';
+          const lab = row.covered
+            ? `${row.fromTicker || '?'} → ${row.toTicker || '?'}`
+            : '—';
+          return `<div style="font-size:10px;line-height:1.5;color:${st}"><span style="color:var(--muted)">${short(row.fromChain)}</span> → <span style="color:var(--muted)">${short(row.toChain)}</span> <span style="font-family:'JetBrains Mono',monospace">${lab}</span></div>`;
+        }).join('') + (more ? `<div style="font-size:10px;color:var(--muted);margin-top:6px">${more}</div>` : '');
+      })()
+    : '';
+
+  const allTestsModeHint = !isAllChains
+    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(6,182,212,.06)">
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--cyan);margin-bottom:6px">allTests — all assets</div>
+        <div style="font-size:11px;line-height:1.55;color:var(--muted)">See <b>Cycle tour</b> above: planner walks <b>all funded seed assets</b> (sorted), not only one chain at a time.</div>
+      </div>`
+    : '';
+
+  const perChainFanoutHtml = (matrix && Array.isArray(matrix.perChainFanout) && matrix.perChainFanout.length)
+    ? `<div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">Per chain (covered / N−1): ${matrix.perChainFanout.map((p) => {
+        const short = (k) => (k || '').replace(/_sepolia|_testnet|_mainnet/g, '').replace(/_/g, ' ') || '—';
+        return `<span style="display:inline-block;margin:0 8px 4px 0">${short(p.chainKey)}: <strong>${p.covered}</strong>/${p.fanoutSlots}</span>`;
+      }).join('')}</div>`
+    : '';
+
+  const chainMatrixBlock = matrix
+    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(34,197,94,.06)">
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--green);margin-bottom:6px">⬡ allChains — N−1 fan-out (catalog)</div>
+        <div style="font-size:11px;line-height:1.55;margin-bottom:8px;color:var(--fg)">
+          <strong>${matrix.coveredFanout}</strong> / <strong>${matrix.fanoutTotal}</strong> hops covered
+          <span style="color:var(--muted)"> (${matrix.distinctChains} chains ⇒ <strong>N−1 = ${fanoutMax}</strong> slots from one source chain; best source: <code style="font-size:10px">${(matrix.bestFanoutChainKey || '').replace(/</g, '')}</code>)</span>
+        </div>
+        ${perChainFanoutHtml}
+        <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.45">Rows follow the ring <span style="font-family:'JetBrains Mono',monospace;font-size:9px">a₁→⋯→aₙ→a₁</span> from the best source chain. “Covered” = at least one swap exists. Plan prepends these hops (same recurrence as above), then beam/standalone routes.</div>
+        <div style="max-height:180px;overflow-y:auto;padding-right:4px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
+          ${matrixPairRows || '<div style="font-size:11px;color:var(--muted)">No pairs</div>'}
+        </div>
+      </div>`
+    : '';
+
   const chainSummary = (flowChains && flowChains.length)
     ? `<div style="padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(6,182,212,.04)">
-        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--cyan);margin-bottom:6px">⚡ Chain-Reaction Flows</div>
+        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--cyan);margin-bottom:6px">⚡ Beam preview (one path per funded seed)</div>
         ${flowChains.map((fc, i) => {
           const assetLabels = (fc.assets || []).map(a => {
             const t = a.split(':').pop()?.toUpperCase() || a;
@@ -1530,57 +1729,85 @@ function showReadinessModal(readiness) {
 
   const runBtnStyle = canRun
     ? 'background:var(--green);color:#000;cursor:pointer'
-    : 'background:var(--bg3);color:var(--muted);cursor:not-allowed;border:1px solid var(--border);pointer-events:none';
+    : 'background:var(--bg3);color:var(--muted);cursor:not-allowed;border:1px solid var(--border)';
   const runBtnText = canRun
-    ? `▶ Run ${runnableRoutes} Routes (${fundedSeeds.length} seed${fundedSeeds.length!==1?'s':''})`
-    : `🔒 ${readinessPct}% Ready — Fund seed assets to unlock`;
+    ? (isAllChains
+      ? `▶ Run ${executablePlannedRoutes ?? 0} route${(executablePlannedRoutes||0)!==1?'s':''} — N−1 fan-out + catalog (wallet-funded source) · ${effectiveFundedSeeds.length} funded seed${effectiveFundedSeeds.length!==1?'s':''}`
+      : `▶ Run ${executablePlannedRoutes ?? runnableRoutes} Routes (${effectiveFundedSeeds.length} seed${effectiveFundedSeeds.length!==1?'s':''})`)
+    : `🔒 No executable beam plan from funded sources`;
+  const requiredSummary = requiredAmountSummary || { sufficientCount: 0, insufficientCount: 0, unknownCount: 0 };
+  const requiredColor = requiredAmountSufficient ? 'var(--green)' : 'var(--yellow)';
+  const modeAllTestsStyle = _selectedRunMode === 'allTests'
+    ? 'background:var(--cyan);color:#021015;border-color:var(--cyan)'
+    : 'background:var(--bg3);color:var(--muted);border-color:var(--border)';
+  const modeAllChainsStyle = _selectedRunMode === 'allChains'
+    ? 'background:var(--cyan);color:#021015;border-color:var(--cyan)'
+    : 'background:var(--bg3);color:var(--muted);border-color:var(--border)';
+
+  const runBypassHtml = !canRun
+    ? `<button type="button" id="readinessRunBypassBtn" onclick="if(confirm('Strict readiness gate is closed (no executable planned routes with current balances). Trades may skip or fail. Continue?')){ document.getElementById('readinessOverlay').remove(); _proceedToTradeSizeModal(_selectedRunMode); }" style="padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;border:1px solid rgba(234,179,8,.45);background:rgba(234,179,8,.08);color:var(--yellow);cursor:pointer;width:100%;margin-top:8px">▶ Run anyway — bypass gate</button>`
+    : '';
 
   document.body.insertAdjacentHTML('beforeend', `
-    <div id="readinessOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;z-index:200">
-      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:16px;width:620px;max-width:95vw;max-height:90vh;display:flex;flex-direction:column;overflow:hidden">
-        <div style="padding:20px 24px 16px;border-bottom:1px solid var(--border)">
+    <div id="readinessOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;z-index:200;overflow:auto;overscroll-behavior:contain;padding:12px 0">
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:16px;width:620px;max-width:95vw;max-height:min(90vh,calc(100vh - 24px));display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;margin:auto">
+        <div style="flex-shrink:0;padding:20px 24px 16px;border-bottom:1px solid var(--border)">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
             <div style="font-size:17px;font-weight:700">🚀 Route Readiness — Chain Reaction</div>
             <button onclick="document.getElementById('readinessOverlay').remove()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0 4px">×</button>
           </div>
           <div style="margin-bottom:12px">
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-              <span style="font-size:12px;color:var(--muted)">Balance Coverage</span>
-              <span style="font-size:14px;font-weight:700;color:${barColor}">${readinessPct}%</span>
+              <span style="font-size:12px;color:var(--muted)">${coverageTitle}</span>
+              <span style="font-size:14px;font-weight:700;color:${barColor}">${displayReadinessPct}%${isAllChains && canRun ? ' <span style="font-size:11px;font-weight:500;color:var(--muted)">(execute)</span>' : ''}</span>
             </div>
             <div style="background:var(--bg3);border-radius:8px;height:12px;overflow:hidden;border:1px solid var(--border)">
               <div style="height:100%;width:0%;background:${barColor};border-radius:7px;transition:width 1s ease-out" id="readinessBar"></div>
             </div>
+            ${coverageFootnote ? `<div style="font-size:10px;color:var(--muted);margin-top:6px;line-height:1.45">${coverageFootnote}</div>` : ''}
+            ${isAllChains ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;line-height:1.45"><b>Seeds</b> = wallet-funded starting assets for a beam (chain cycle). <b>allChains</b> prepends ring-ordered N−1 fan-out, then beams (${planReadinessPct}% of broad plan rows executable).</div>` : ''}
           </div>
           <div style="display:flex;gap:12px;font-size:12px;flex-wrap:wrap">
-            <span style="color:var(--green)">⚡ ${fundedSeeds.length} seed${fundedSeeds.length!==1?'s':''} funded</span>
+            <span style="color:var(--green)">⚡ ${effectiveFundedSeeds.length} seed${effectiveFundedSeeds.length!==1?'s':''} funded</span>
             <span style="color:var(--cyan)">🔗 ${chainFunded.length} chain-funded</span>
             ${unknownAssets.length > 0 ? `<span style="color:var(--yellow)">❓ ${unknownAssets.length} unknown</span>` : ''}
             ${insufficientAssets.length > 0 ? `<span style="color:var(--red)">❌ ${insufficientAssets.length} insufficient</span>` : ''}
-            <span style="color:var(--muted);margin-left:auto">${runnableRoutes}/${totalRoutes} routes runnable</span>
+            <span style="color:var(--muted);margin-left:auto" title="${matrix ? 'Best-chain fan-out: covered hops vs N−1.' : 'Runnable asset-rows vs total route rows.'}">${runnableRoutes}/${totalRoutes} ${matrix ? 'fan-out covered' : 'hops runnable'}</span>
           </div>
         </div>
+        <div style="flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch">
+        ${consolidationBanner}
+        ${cycleTourBanner}
+        ${allTestsModeHint}
+        ${chainMatrixBlock}
         ${chainSummary}
-        <div style="flex:1;overflow-y:auto;max-height:400px">
+        <div>
           ${assets.length ? assetRows : '<div style="text-align:center;padding:40px;color:var(--muted)">No routes found — connect wallets first</div>'}
         </div>
-        <div style="padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center">
+        </div>
+        <div style="flex-shrink:0;padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:flex-start;background:var(--bg2)">
           <button onclick="document.getElementById('readinessOverlay').remove();showPanel('wallets')" class="btn btn-ghost" style="font-size:13px">💳 Wallets</button>
           <button onclick="document.getElementById('readinessOverlay').remove()" class="btn btn-ghost" style="font-size:13px">Cancel</button>
           <div style="flex:1"></div>
           <div style="display:flex;flex-direction:column;gap:6px;min-width:220px;max-width:300px">
-            <button id="readinessRunBtn"
-              onclick="document.getElementById('readinessOverlay').remove();_proceedToTradeSizeModal()"
-              style="padding:10px 20px;border-radius:10px;font-size:14px;font-weight:700;border:none;width:100%;${runBtnStyle}"
+            <div style="display:flex;gap:6px" title="Switch planner mode — refetches readiness from the server">
+              <button type="button" id="modeAllTestsBtn" onclick="_setRunModeFromModal('allTests')" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid;font-size:11px;font-weight:700;cursor:pointer;${modeAllTestsStyle}">allTests</button>
+              <button type="button" id="modeAllChainsBtn" onclick="_setRunModeFromModal('allChains')" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid;font-size:11px;font-weight:700;cursor:pointer;${modeAllChainsStyle}">allChains</button>
+            </div>
+            <div style="font-size:9px;color:var(--muted);line-height:1.35;margin:-2px 0 4px">allTests = all assets (sorted) + beams · allChains = chain cycle + N−1 fan-out · tap to switch</div>
+            <button type="button" id="readinessRunBtn"
+              onclick="document.getElementById('readinessOverlay').remove();_proceedToTradeSizeModal(_selectedRunMode)"
+              style="padding:10px 20px;border-radius:10px;font-size:13px;font-weight:700;border:none;width:100%;line-height:1.35;${runBtnStyle}"
               ${canRun ? '' : 'disabled'}>
-              ${runBtnText}
+              ${runBtnText} · ${_selectedRunMode}
             </button>
+            ${runBypassHtml}
             <div style="position:relative;background:var(--bg3);border-radius:6px;height:8px;overflow:hidden;border:1px solid var(--border)">
               <div id="readinessRunBar" style="height:100%;width:0%;border-radius:5px;transition:width 1.2s ease-out;background:${barColor}"></div>
             </div>
             <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted)">
-              <span>${fundedSeeds.length}/${seedAssets.length} seeds funded</span>
-              <span>${runnableRoutes}/${totalRoutes} routes</span>
+              <span>${effectiveFundedSeeds.length}/${seedAssets.length || assets.length} seeds funded</span>
+              <span title="${matrix ? 'Best-chain N−1 fan-out coverage.' : 'Beam hop accounting, not Run button count.'}">${runnableRoutes}/${totalRoutes} ${matrix ? 'fan-out' : 'hops'}</span>
             </div>
           </div>
         </div>
@@ -1590,14 +1817,32 @@ function showReadinessModal(readiness) {
   requestAnimationFrame(() => {
     setTimeout(() => {
       const bar = document.getElementById('readinessBar');
-      if (bar) bar.style.width = readinessPct + '%';
+      if (bar) bar.style.width = displayReadinessPct + '%';
       const runBar = document.getElementById('readinessRunBar');
-      if (runBar) runBar.style.width = readinessPct + '%';
+      if (runBar) runBar.style.width = displayReadinessPct + '%';
     }, 50);
   });
 }
 
-async function _proceedToTradeSizeModal() {
+async function _setRunModeFromModal(mode) {
+  _selectedRunMode = mode === 'allChains' ? 'allChains' : 'allTests';
+  const runBtn = document.getElementById('readinessRunBtn');
+  if (runBtn) {
+    runBtn.disabled = true;
+    runBtn.innerHTML = '<span class="spinner"></span> Recomputing…';
+  }
+  try {
+    const r = await fetch(`/api/route-readiness?mode=${encodeURIComponent(_selectedRunMode)}`);
+    const readiness = await r.json();
+    if (readiness?.error) throw new Error(readiness.error);
+    showReadinessModal(readiness);
+  } catch (e) {
+    alert('Failed to refresh readiness for selected mode: ' + (e.message || 'unknown error'));
+  }
+}
+
+async function _proceedToTradeSizeModal(mode = _selectedRunMode) {
+  _selectedRunMode = mode === 'allChains' ? 'allChains' : 'allTests';
   const btn = document.getElementById('btnRunAll');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Loading…';
@@ -1610,13 +1855,13 @@ async function _proceedToTradeSizeModal() {
     const tradeable = allCombos.filter(c => c.canTrade || c.fromWalletConnected);
     btn.disabled = false;
     btn.innerHTML = '▶ Run All Tests';
-    if (!tradeable.length) { _launchRunAll(); return; }
+    if (!tradeable.length) { _launchRunAll(_selectedRunMode); return; }
     _runAllAfterModal = true;
     showTradeSizeModal(tradeable);
   } catch(e) {
     btn.disabled = false;
     btn.innerHTML = '▶ Run All Tests';
-    _launchRunAll();
+    _launchRunAll(_selectedRunMode);
   }
 }
 
@@ -2392,6 +2637,7 @@ function updatePairBadge() {
 
 // Balance cache for asset picker — populated lazily
 window._swAssetBalances = {};
+window._supportedTokenContracts = {};
 
 let swRecentSwaps = [];
 function renderRecentSwaps() {
@@ -2472,9 +2718,8 @@ async function loadConfig() {
 async function loadChains() {
   allChains = await fetch('/api/chains').then(r => r.json()).catch(() => []);
   refreshRouteGrid();
-  // Pre-populate stats
-  const srcCount = allChains.filter(c => c.id !== 'bitcoin').length;
-  document.getElementById('statTotal').textContent = srcCount * 2 + ' routes';
+  // Do not prefill executed count with estimates; keep metrics explicit.
+  updateStats();
 }
 
 // ── NAVIGATION ──
@@ -2547,9 +2792,11 @@ async function loadCombinations() {
     const r = await fetch("/api/combinations");
     const d = await r.json();
     allCombos = d.combinations || [];
+    routeMetrics.discovered = allCombos.length;
+    updateStats();
 
-    const ready   = allCombos.filter(c => c.canTrade).length;
-    const partial = allCombos.filter(c => !c.canTrade && (c.fromWalletConnected || c.toWalletConnected)).length;
+    const ready   = allCombos.filter(c => c.comboStatus === 'ready').length;
+    const partial = allCombos.filter(c => c.comboStatus === 'partial').length;
 
     subtitle.textContent = `${allCombos.length} active asset pairs found`;
     // Normal stats line (no extra hint message)
@@ -2661,9 +2908,9 @@ function renderCombos(filter) {
   });
 
   let filtered = healthy;
-  if (filter === "ready")   filtered = healthy.filter(c => c.canTrade);
-  if (filter === "partial") filtered = healthy.filter(c => !c.canTrade && (c.fromWalletConnected || c.toWalletConnected));
-  if (filter === "no")      filtered = healthy.filter(c => !c.fromWalletConnected && !c.toWalletConnected);
+  if (filter === "ready")   filtered = healthy.filter(c => c.comboStatus === "ready");
+  if (filter === "partial") filtered = healthy.filter(c => c.comboStatus === "partial");
+  if (filter === "no")      filtered = healthy.filter(c => c.comboStatus === "no");
 
   if (filtered.length === 0) {
     grid.style.display  = "none";
@@ -2674,24 +2921,17 @@ function renderCombos(filter) {
   grid.style.display  = "grid";
   empty.style.display = "none";
 
-  grid.innerHTML = filtered.map(c => {
+  try {
+    grid.innerHTML = filtered.map(c => {
     const safeId = c.id.replace(/[^a-z0-9]/gi, '_');
 
     // Status: distinguish "ready with confirmed balance" vs "ready but EVM balance unknown"
-    const bothConnected = c.fromWalletConnected && c.toWalletConnected;
-    const eitherConnected = c.fromWalletConnected || c.toWalletConnected;
-    const balanceOk = c.canAfford === true;
-    const balanceLow = c.canAfford === false;
-    const balanceUnknown = c.canAfford === null && bothConnected; // EVM
-
     let statusClass, badgeClass, badgeText;
-    if (balanceLow) {
+    if (c.comboStatus === "ready") {
+      statusClass = "can-trade"; badgeClass = "ready"; badgeText = "✅ Ready to Trade";
+    } else if (c.comboStatus === "partial" && c.canAfford === false) {
       statusClass = "partial"; badgeClass = "partial"; badgeText = "❌ Low Balance";
-    } else if (bothConnected && balanceOk) {
-      statusClass = "can-trade"; badgeClass = "ready"; badgeText = "✅ Ready";
-    } else if (bothConnected && balanceUnknown) {
-      statusClass = "can-trade"; badgeClass = "ready"; badgeText = "⚠️ Check Balance";
-    } else if (eitherConnected) {
+    } else if (c.comboStatus === "partial") {
       statusClass = "partial"; badgeClass = "partial"; badgeText = "⚠️ Partial";
     } else {
       statusClass = "no-wallet"; badgeClass = "no"; badgeText = "❌ Not Connected";
@@ -2708,13 +2948,14 @@ function renderCombos(filter) {
 
     // Balance info line (keep minimal, no instructions)
     let balanceLine = "";
+    const balanceLow = c.canAfford === false;
     if (c.walletBalance !== null) {
       const balColor = balanceLow ? "var(--red)" : "var(--green)";
       balanceLine = `· <span style="color:${balColor}">Balance: ${Number(c.walletBalance).toLocaleString()}</span>`;
     }
 
-    // Amount input — use minAmount from policy (correct per asset decimals)
-    const suggested = c.suggestedAmount || c.minAmount;
+    // Default input to policy minimum trade amount.
+    const suggested = c.minAmount;
 
     return `
     <div class="combo-card ${statusClass}" id="combo-${safeId}">
@@ -2752,6 +2993,9 @@ function renderCombos(filter) {
       </div>`}
     </div>`;
   }).join("");
+  } catch (err) {
+    throw err;
+  }
 }
 
 async function scanArbitrage() {
@@ -3090,7 +3334,7 @@ async function runAllTradeable() {
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Checking readiness…'; }
 
   try {
-    const r = await fetch('/api/route-readiness');
+    const r = await fetch(`/api/route-readiness?mode=${encodeURIComponent(_selectedRunMode)}`);
     const readiness = await r.json();
     if (btn) { btn.disabled = false; btn.innerHTML = '▶ Run All Tradeable'; }
 
@@ -3238,8 +3482,11 @@ function renderChainAssetList(chainId) {
   if (!chain) return;
   const bals = window._evmBalances || {};
   const tokBals = window._evmTokenBalances || {};
-  const key = Object.keys(bals).find(k => k.startsWith(chainId) || chainId.startsWith(k.split('_')[0]));
+  const supportedMap = window._supportedTokenContracts || {};
+  const key = Object.keys(bals).find(k => k.startsWith(chainId) || chainId.startsWith(k.split('_')[0]))
+    || Object.keys(supportedMap).find(k => k.startsWith(chainId) || chainId.startsWith(k.split('_')[0]));
   const chainTokenBals = key ? (tokBals[key] || {}) : {};
+  const chainSupported = key ? (supportedMap[key] || []) : [];
 
   // Native asset row
   const wei = key ? bals[key] : null;
@@ -3251,39 +3498,50 @@ function renderChainAssetList(chainId) {
     nativeBal = weiN === 0 ? `0 ${chain.symbol}` : `${(weiN/1e18).toFixed(5)} ${chain.symbol}`;
   }
 
-  const rows = [{ sym: chain.symbol, bal: nativeBal, isNative: true, hasBalance: nativeHasBalance }];
+  const rows = [{ sym: chain.symbol, bal: nativeBal, isNative: true, hasBalance: nativeHasBalance, contract: null }];
 
   // Add ERC20 tokens — from the tokenBalances map returned by server
   for (const [ticker, info] of Object.entries(chainTokenBals)) {
     const formatted = info.formatted || '0';
     const hasBalance = parseFloat(formatted) > 0;
     const balStr = hasBalance ? `${formatted} ${ticker}` : `0 ${ticker}`;
-    rows.push({ sym: ticker, bal: balStr, isNative: false, hasBalance });
+    rows.push({ sym: ticker, bal: balStr, isNative: false, hasBalance, contract: info.tokenAddr || null });
   }
 
-  // Also add any garden assets for this chain that weren't in token balances (show — for unknown)
-  const chainKey = chain.id;
+  // Add supported tokens/contracts for this chain even when balance is zero/unknown.
+  for (const st of chainSupported) {
+    const t = (st.ticker || st.id?.split(':')[1] || '').toUpperCase();
+    if (!t) continue;
+    if (rows.find(r => r.sym === t)) continue;
+    rows.push({ sym: t, bal: '—', isNative: false, hasBalance: false, contract: st.tokenAddr || null });
+  }
+
+  // Fallback: include known Garden assets on this chain if supported map is sparse.
   const gardenChainAssets = gardenAssets.filter(a => {
     const ac = (a.chain || a.id?.split(':')[0] || '').toLowerCase();
-    return (ac.startsWith(chainKey) || chainKey.startsWith(ac.split('_')[0])) &&
-           a.token_address && a.token_address !== 'native' && a.token_address !== '0x0000000000000000000000000000000000000000';
+    return (ac.startsWith(chainId) || chainId.startsWith(ac.split('_')[0]));
   });
   for (const ga of gardenChainAssets) {
+    const addr = ga.token_address || ga.tokenAddress || ga.contract_address || ga.contractAddress || ga.token?.address;
+    if (!addr || addr === 'native' || addr === '0x0000000000000000000000000000000000000000') continue;
     const t = (ga.asset || ga.ticker || ga.id?.split(':')[1] || '').toUpperCase();
-    if (rows.find(r => r.sym === t)) continue; // already have it
-    rows.push({ sym: t, bal: '—', isNative: false, hasBalance: false });
+    if (!t || rows.find(r => r.sym === t)) continue;
+    rows.push({ sym: t, bal: '—', isNative: false, hasBalance: false, contract: addr });
   }
 
-  el.innerHTML = rows.map(({ sym, bal, isNative, hasBalance }) => {
+  el.innerHTML = rows.map(({ sym, bal, isNative, hasBalance, contract }) => {
     const symLower = sym.toLowerCase();
     const icon = isNative ? chain.icon : (ASSET_META[symLower]?.icon || '🔸');
     const balColor = bal === '—' ? 'var(--muted)' : hasBalance ? 'var(--green)' : 'var(--muted)';
+    const contractHtml = !isNative && contract
+      ? `<div style="font-size:10px;color:var(--muted);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${contract}">Contract: ${contract}</div>`
+      : `<div style="font-size:10px;color:var(--muted)">${isNative ? 'Native' : 'ERC-20'}</div>`;
     return `<div style="display:flex;justify-content:space-between;align-items:center;padding:7px 0;border-bottom:1px solid rgba(255,255,255,.04)">
       <div style="display:flex;align-items:center;gap:8px">
         <span style="font-size:16px">${icon}</span>
         <div>
           <div style="font-size:12px;font-weight:600">${sym}</div>
-          <div style="font-size:10px;color:var(--muted)">${isNative ? 'Native' : 'ERC-20'}</div>
+          ${contractHtml}
         </div>
       </div>
       <span style="font-size:12px;font-family:'JetBrains Mono',monospace;color:${balColor}">${bal}</span>
@@ -4105,6 +4363,7 @@ async function fetchEvmBalances(address) {
     // Expose balances globally for combinations
     window._evmBalances = d.balances || {};
     window._evmTokenBalances = d.tokenBalances || {};  // { chainPrefix: { TICKER: {raw,formatted,tokenAddr} } }
+    window._supportedTokenContracts = d.supportedTokens || {};
     // Track chains whose RPC failed so we can hide them from "send" assets & combos
     window._badRpcChains = (d.rpcErrors || []).map(e => (e.chain || '').toLowerCase());
     refreshChainBalanceDisplay(); // update chain balance grid if open

@@ -31,11 +31,25 @@ app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 
 // ── CORE TEST ROUTES / BOT STATE ─────────────────────────────
 let _amountOverrides = {};
+let _lastEvmTokenBalancesByAddress = {};
+let _lastSupportedTokensByAddress = {};
 
 let _arbSummary = {
   totalProfitUsd: 0,
   trades: [],
 };
+
+function pickSeedAllowlistByMode(routes, balances, gasMap, mode) {
+  if (mode !== "allChains") return null;
+  try {
+    const { RouteOptimizerAgent } = require("./agents/routeOptimizerAgent");
+    const picker = new RouteOptimizerAgent();
+    const pickedSeeds = picker.pickOneSeedPerChain(routes, balances, gasMap || new Map());
+    return pickedSeeds.size ? pickedSeeds : null;
+  } catch (_) {
+    return null;
+  }
+}
 
 function recordArbTrade(entry) {
   const usdPnl = Number(entry.usdPnl || 0);
@@ -56,10 +70,86 @@ app.post("/api/run/set-amounts", (req, res) => {
 });
 
 app.post("/api/run", async (req, res) => {
-  res.json({ started: true, env: config.env });
-  const overrides = Object.assign({}, _amountOverrides);
-  _amountOverrides = {};
-  runner.runAll(overrides).catch(err => broadcast("error", { message: err.message }));
+  const mode = req.body?.mode === "allChains" ? "allChains" : "allTests";
+  try {
+    const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
+    const { balanceMap, gasMap } = await gatherBalances(connectedTypes, supported);
+    const seedAllowlist = pickSeedAllowlistByMode(routes, balanceMap, gasMap, mode);
+    const seedAllowlistSize = seedAllowlist ? seedAllowlist.size : null;
+    const { RouteOptimizerAgent } = require("./agents/routeOptimizerAgent");
+    const agent = new RouteOptimizerAgent();
+    const preview = agent.run(routes, {
+      balances: balanceMap,
+      gasBalances: gasMap,
+      connectedWalletTypes: connectedTypes,
+      seedAllowlist,
+    }, mode);
+    const readiness = preview.readiness;
+
+    const hasQualifiedChainStart = (readiness.assets || []).some((a) => a.isChainStart && a.sufficient);
+    const executablePlanCount = preview.executablePlanCount || 0;
+    // Only when no beam seed qualifies AND there is no other executable plan (e.g. standalone) do we
+    // require random native gas + Garden liquidity preflight (does not block funded standalone paths).
+    if (mode === "allChains" && !hasQualifiedChainStart && executablePlanCount === 0) {
+      const { resolveConsolidationTargetIfNoSeeds, verifyConsolidationPreflight } = require("./utils/consolidationTarget");
+      let consolidation = null;
+      try {
+        consolidation = await resolveConsolidationTargetIfNoSeeds({ supported, gasMap });
+      } catch (e) {
+        return res.status(409).json({
+          started: false,
+          env: config.env,
+          strictMode: true,
+          reason: `Consolidation target resolution failed: ${e.message}`,
+        });
+      }
+      if (consolidation.eligible) {
+        const pre = await verifyConsolidationPreflight(consolidation, gasMap);
+        if (!pre.ok) {
+          return res.status(409).json({
+            started: false,
+            env: config.env,
+            strictMode: true,
+            reason: "Consolidation preflight failed: native gas or Garden liquidity check did not pass before run.",
+            consolidation,
+            preflight: pre,
+          });
+        }
+      }
+    }
+
+    // Strict beam gate: allow run when selected mode has at least one executable planned route.
+    const strictReady = (preview.executablePlanCount || 0) > 0;
+    if (!strictReady) {
+      return res.status(409).json({
+        started: false,
+        env: config.env,
+        strictMode: true,
+        reason: "No executable beam plan from currently funded sources.",
+        readinessPct: readiness.readinessPct,
+        requiredAmountSufficient: readiness.requiredAmountSufficient,
+        requiredAmountSummary: readiness.requiredAmountSummary || null,
+        seedAllowlistSize,
+        builtChains: readiness.flowChains?.length || 0,
+        rawPlannedRoutes: preview.rawPlanCount || 0,
+        executablePlannedRoutes: preview.executablePlanCount || 0,
+      });
+    }
+
+    res.json({
+      started: true,
+      env: config.env,
+      mode,
+      strictMode: true,
+      rawPlannedRoutes: preview.rawPlanCount || 0,
+      executablePlannedRoutes: preview.executablePlanCount || 0,
+    });
+    const overrides = Object.assign({}, _amountOverrides);
+    _amountOverrides = {};
+    runner.runAll(overrides, mode).catch(err => broadcast("error", { message: err.message }));
+  } catch (err) {
+    res.status(500).json({ started: false, error: err.message });
+  }
 });
 
 app.post("/api/run/route", async (req, res) => {
@@ -234,7 +324,7 @@ app.post("/api/trade", async (req, res) => {
   if (!fromChain || !toChain || !amount) return res.status(400).json({ error: "fromChain, toChain, amount required" });
 
   try {
-    let fromAssetId, toAssetId, fromWalletType, toWalletType, label;
+    let fromAssetId, toAssetId, fromWalletType, toWalletType, fromMeta = null, toMeta = null, label;
 
     if (fromChain.includes(":") || toChain.includes(":")) {
       const [fromRes, toRes] = await Promise.all([resolveAssetId(fromChain), resolveAssetId(toChain)]);
@@ -244,6 +334,8 @@ app.post("/api/trade", async (req, res) => {
       toAssetId      = toRes.assetId;
       fromWalletType = fromRes.walletType;
       toWalletType   = toRes.walletType;
+      fromMeta       = fromRes.meta || null;
+      toMeta         = toRes.meta || null;
       label = `Swap: ${fromChain} → ${toChain}`;
     } else {
       const from = config.chains[fromChain]; const to = config.chains[toChain];
@@ -262,6 +354,8 @@ app.post("/api/trade", async (req, res) => {
       fromAsset: fromAssetId,
       toAsset:   toAssetId,
       amount:    parseInt(amount),
+      fromMeta,
+      toMeta,
       label,
     }).catch(err => broadcast("error", { message: err.message }));
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -370,11 +464,52 @@ async function gatherBalances(connectedTypes, supported) {
   const wallets = walletState.getStatus();
   const balanceMap = new Map();
   const gasMap     = new Map();
+  const evmAddrKey = wallets?.evm?.address ? String(wallets.evm.address).toLowerCase() : null;
+  const evmTokenByChain = evmAddrKey ? (_lastEvmTokenBalancesByAddress[evmAddrKey] || {}) : {};
+  const evmSupportedByChain = evmAddrKey ? (_lastSupportedTokensByAddress[evmAddrKey] || {}) : {};
 
-  // Cached token balances from wallet panel
-  const cached = wallets.evm?.tokenBalances || {};
-  for (const [assetId, bal] of Object.entries(cached)) {
-    balanceMap.set(assetId, Number(bal));
+  function getAssetTokenAddress(asset) {
+    return asset?.token_address || asset?.tokenAddress || asset?.contract_address || asset?.contractAddress || asset?.token?.address || null;
+  }
+
+  function gteLikeValue(v) {
+    if (v === null || v === undefined) return null;
+    if (typeof v === 'bigint') return v;
+    try { return BigInt(String(v)); } catch (_) { return null; }
+  }
+
+  // Map EVM supported source assets to their cached balances by token contract.
+  for (const a of (supported || [])) {
+    if (getWalletTypeForAsset(a) !== "evm") continue;
+    const assetId = a.id;
+    const chainKey = String(assetId || "").split(":")[0];
+    const tokenAddr = String(getAssetTokenAddress(a) || "").toLowerCase();
+
+    // Native EVM assets: use native chain balance cache.
+    if (!tokenAddr || tokenAddr === "native" || tokenAddr === "0x0000000000000000000000000000000000000000") {
+      const nativeWei = wallets.evm?.tokenBalances?.[chainKey];
+      if (nativeWei !== undefined && nativeWei !== null) {
+        const bn = gteLikeValue(nativeWei);
+        if (bn !== null) balanceMap.set(assetId, bn);
+      }
+      continue;
+    }
+
+    // ERC20 assets: use token balance cache built by /api/wallet/evm/balances.
+    const chainTokenBals = evmTokenByChain[chainKey] || {};
+    const chainSupported = evmSupportedByChain[chainKey] || [];
+    const matched = Object.values(chainTokenBals).find(tb =>
+      String(tb?.tokenAddr || "").toLowerCase() === tokenAddr
+    );
+    if (matched?.raw !== undefined && matched?.raw !== null) {
+      const bn = gteLikeValue(matched.raw);
+      if (bn !== null) balanceMap.set(assetId, bn);
+      continue;
+    }
+    // If token is known on chain but not present in balances, treat as explicit zero (not unknown).
+    if (chainSupported.some(st => String(st?.tokenAddr || "").toLowerCase() === tokenAddr)) {
+      balanceMap.set(assetId, 0n);
+    }
   }
 
   // BTC balance
@@ -428,6 +563,9 @@ async function gatherBalances(connectedTypes, supported) {
 // ── TRADE COMBINATIONS ────────────────────────────────────────
 async function buildCombinationsResponse() {
   const wallets = walletState.getStatus();
+  const evmAddrKey = wallets?.evm?.address ? String(wallets.evm.address).toLowerCase() : null;
+  const evmTokenByChain = evmAddrKey ? (_lastEvmTokenBalancesByAddress[evmAddrKey] || {}) : {};
+  const evmSupportedByChain = evmAddrKey ? (_lastSupportedTokensByAddress[evmAddrKey] || {}) : {};
 
   // CHANGE: Always fresh assets
   clearAssetCache();
@@ -455,14 +593,28 @@ async function buildCombinationsResponse() {
              starknet: !!wallets.starknet, sui: !!wallets.sui, tron: !!wallets.tron }[t] || false;
   }
 
-  // CHANGE: Filter out assets whose wallet is not connected
+  // Include assets for all supported wallet types; status logic determines ready/partial/no.
   const supported = assets.filter(a => {
     const wt = getWalletType(a);
-    return wt && isWalletConnected(wt);
+    return !!wt;
   });
 
-  console.log(`[combinations] assets: ${assets.length}, connected+supported: ${supported.length}`);
+  console.log(`[combinations] assets: ${assets.length}, supported: ${supported.length}`);
   const combinations = [];
+
+  function getAssetTokenAddress(asset) {
+    return asset?.token_address || asset?.tokenAddress || asset?.contract_address || asset?.contractAddress || asset?.token?.address || null;
+  }
+
+  function gteAtomic(left, right) {
+    try {
+      return BigInt(String(left)) >= BigInt(String(right));
+    } catch (_) {
+      const l = Number(left);
+      const r = Number(right);
+      return Number.isFinite(l) && Number.isFinite(r) && l >= r;
+    }
+  }
 
   for (const from of supported) {
     for (const to of supported) {
@@ -486,10 +638,29 @@ async function buildCombinationsResponse() {
         walletBalance = parseFloat(wallets.solana.balance);
         canAfford = walletBalance >= minAmount;
       } else if (fromType === "evm" && wallets.evm?.address) {
-        const evmBal = wallets.evm?.tokenBalances?.[from.id];
-        if (evmBal !== undefined) {
-          walletBalance = evmBal;
-          canAfford = walletBalance >= minAmount;
+        const chainKey = (from.id || '').split(':')[0];
+        const tokenAddr = (getAssetTokenAddress(from) || '').toLowerCase();
+        const chainTokenBals = evmTokenByChain[chainKey] || {};
+        const chainSupported = evmSupportedByChain[chainKey] || [];
+
+        if (tokenAddr && tokenAddr !== 'native' && tokenAddr !== '0x0000000000000000000000000000000000000000') {
+          const match = Object.values(chainTokenBals).find(tb =>
+            String(tb?.tokenAddr || '').toLowerCase() === tokenAddr
+          );
+          if (match?.raw !== undefined) {
+            walletBalance = String(match.raw);
+            canAfford = gteAtomic(walletBalance, minAmount);
+          } else if (chainSupported.some(st => String(st?.tokenAddr || '').toLowerCase() === tokenAddr)) {
+            // Known supported ERC20 on this chain but wallet balance is zero.
+            walletBalance = "0";
+            canAfford = false;
+          }
+        } else {
+          const nativeWei = wallets.evm?.tokenBalances?.[chainKey];
+          if (nativeWei !== undefined) {
+            walletBalance = String(nativeWei);
+            canAfford = gteAtomic(walletBalance, minAmount);
+          }
         }
       }
 
@@ -498,7 +669,13 @@ async function buildCombinationsResponse() {
         : minAmount;
 
       const balanceKnown = walletBalance !== null;
-      const canTrade = fromConnected && toConnected;
+      let comboStatus = "no";
+      // "Send" wallet must be connected to be considered tradeable/partial.
+      // If only destination wallet is connected, keep it in "no" (Not Connected).
+      if (!fromConnected) comboStatus = "no";
+      else if (toConnected && canAfford === true) comboStatus = "ready";
+      else comboStatus = "partial";
+      const canTrade = comboStatus === "ready";
 
       combinations.push({
         id: `${from.id}->${to.id}`,
@@ -511,6 +688,7 @@ async function buildCombinationsResponse() {
         canAfford,
         balanceKnown,
         walletBalance,
+        comboStatus,
       });
     }
   }
@@ -547,24 +725,92 @@ app.get("/api/combinations", async (req, res) => {
 // ── ROUTE READINESS — chain-reaction aware ───────────────────
 app.get("/api/route-readiness", async (req, res) => {
   try {
+    const mode = req.query?.mode === "allChains" ? "allChains" : "allTests";
     const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
 
     if (!routes.length) {
       return res.json({
         assets: [], totalRoutes: 0, runnableRoutes: 0, readinessPct: 100,
-        flowChains: [], clusters: [], walletCoverage: null,
+        flowChains: [], clusters: [], walletCoverage: null, mode,
       });
     }
 
     const { balanceMap, gasMap } = await gatherBalances(connectedTypes, supported);
+    const seedAllowlist = pickSeedAllowlistByMode(routes, balanceMap, gasMap, mode);
+    const seedAllowlistSize = seedAllowlist ? seedAllowlist.size : null;
 
-    // CHANGE: Pass connectedWalletTypes so optimizer filters disconnected assets
-    const routeOptimizerAgent = require('./agents/routeOptimizerAgent');
-    res.json(routeOptimizerAgent.getRouteReadiness(routes, {
+    const { RouteOptimizerAgent } = require("./agents/routeOptimizerAgent");
+    const agent = new RouteOptimizerAgent();
+    const preview = agent.run(routes, {
       balances: balanceMap,
       gasBalances: gasMap,
       connectedWalletTypes: connectedTypes,
-    }));
+      seedAllowlist,
+    }, mode);
+    const payload = preview.readiness;
+    const hasQualifiedChainStart = (payload.assets || []).some((a) => a.isChainStart && a.sufficient);
+    const executablePlanCountGet = preview.executablePlanCount || 0;
+    const builtChains = (payload.flowChains || []).length;
+    // Banner: offer a native consolidation hint when no beam chains were built (no Garden flow from seeds),
+    // even if standalone/matrix hops still look executable — POST /api/run keeps stricter gating.
+    const shouldResolveConsolidation =
+      mode === "allChains" &&
+      !hasQualifiedChainStart &&
+      (executablePlanCountGet === 0 || builtChains === 0);
+    try {
+      const { appendRuntimeLog } = require("./utils/runtimeLog");
+      appendRuntimeLog({
+        sessionId: "66ed74",
+        hypothesisId: "H19",
+        location: "src/server.js:/api/route-readiness:consolidationGate",
+        message: "Consolidation gate (readiness)",
+        data: {
+          hasQualifiedChainStart,
+          executablePlanCount: executablePlanCountGet,
+          builtChains,
+          shouldResolveConsolidation,
+        },
+        timestamp: Date.now(),
+      });
+    } catch (_) {}
+    let consolidation = null;
+    if (shouldResolveConsolidation) {
+      const { resolveConsolidationTargetIfNoSeeds } = require("./utils/consolidationTarget");
+      try {
+        consolidation = await resolveConsolidationTargetIfNoSeeds({ supported, gasMap });
+      } catch (e) {
+        consolidation = { eligible: false, reason: "resolver_error", error: e.message };
+      }
+      try {
+        const { appendRuntimeLog } = require("./utils/runtimeLog");
+        appendRuntimeLog({
+          sessionId: "66ed74",
+          hypothesisId: "H20",
+          location: "src/server.js:/api/route-readiness:consolidationResult",
+          message: "Consolidation resolver outcome",
+          data: {
+            eligible: consolidation?.eligible === true,
+            reason: consolidation?.reason ?? null,
+            targetAssetId: consolidation?.targetAssetId ?? null,
+          },
+          timestamp: Date.now(),
+        });
+      } catch (_) {}
+    }
+    res.json({
+      ...payload,
+      mode,
+      selectedRunOption: mode,
+      availableRunOptions: ["allTests", "allChains"],
+      seedAllowlistSize,
+      builtChains: payload.flowChains?.length || 0,
+      rawPlannedRoutes: preview.rawPlanCount || 0,
+      executablePlannedRoutes: preview.executablePlanCount || 0,
+      canInitiate: (preview.executablePlanCount || 0) > 0,
+      hasQualifiedChainStart,
+      executablePlanCount: executablePlanCountGet,
+      consolidation,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -719,6 +965,15 @@ app.post("/api/run/combination", async (req, res) => {
   if (!fromAssetId || !toAssetId || !amount)
     return res.status(400).json({ error: "fromAssetId, toAssetId, amount required" });
 
+  let fromMeta = null;
+  let toMeta = null;
+  try {
+    const assets = await getAssets();
+    const list = assets.result || assets.assets || (Array.isArray(assets) ? assets : []);
+    fromMeta = list.find(a => a.id === fromAssetId) || null;
+    toMeta = list.find(a => a.id === toAssetId) || null;
+  } catch (_) {}
+
   res.json({ started: true });
   runner.runRoute({
     fromChain: fromWalletType || "evm",
@@ -726,6 +981,8 @@ app.post("/api/run/combination", async (req, res) => {
     fromAsset: fromAssetId,
     toAsset:   toAssetId,
     amount,
+    fromMeta,
+    toMeta,
     label: `${fromAssetId} → ${toAssetId}`,
   }).catch(err => broadcast("error", { message: err.message }));
 });
@@ -749,7 +1006,10 @@ app.post("/api/privy/disconnect", (req, res) => { walletState.disconnect("privy"
 app.post("/api/wallet/evm", (req, res) => {
   const { address } = req.body;
   if (!address) return res.status(400).json({ error: "address required" });
-  try { walletState.connectMetaMask(address); res.json({ ok: true, address }); }
+  try {
+    walletState.connectMetaMask(address);
+    res.json({ ok: true, address });
+  }
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -777,6 +1037,7 @@ app.post("/api/wallet/evm/balances", async (req, res) => {
 
   const results = {};
   const tokenResults = {};
+  const supportedTokens = {};
   const rpcErrors = [];
 
   const chainTokenMap = {};
@@ -784,14 +1045,27 @@ app.post("/api/wallet/evm/balances", async (req, res) => {
   const assetList = (rawAssets?.result || rawAssets?.assets || (Array.isArray(rawAssets) ? rawAssets : []));
   for (const a of assetList) {
     const chainId = (a.chain || a.id?.split(':')[0] || '').toLowerCase();
-    const tokenAddr = a.token_address || a.tokenAddress;
+    const tokenAddr = a.token_address || a.tokenAddress || a.contract_address || a.contractAddress || a.token?.address;
     const ticker = (a.asset || a.ticker || a.id?.split(':')[1] || '').toLowerCase();
     if (!tokenAddr || tokenAddr === 'native' || tokenAddr === '0x0000000000000000000000000000000000000000') continue;
-    const rpcKey = Object.keys(FREE_RPCS).find(k => chainId.startsWith(k.split('_')[0]) || k.startsWith(chainId.split('_')[0]));
+    let rpcKey = Object.keys(FREE_RPCS).find(k => chainId.startsWith(k.split('_')[0]) || k.startsWith(chainId.split('_')[0]));
+    if (!rpcKey && chainId.startsWith('evm:')) {
+      const numericChainId = parseInt(chainId.split(':')[1], 10);
+      if (!Number.isNaN(numericChainId)) {
+        const cfgChain = Object.values(config.chains).find(c => Number(c.chainId) === numericChainId);
+        if (cfgChain?.id) {
+          rpcKey = Object.keys(FREE_RPCS).find(k => k.startsWith(cfgChain.id)) || null;
+        }
+      }
+    }
     if (!rpcKey) continue;
     if (!chainTokenMap[rpcKey]) chainTokenMap[rpcKey] = [];
+    if (!supportedTokens[rpcKey]) supportedTokens[rpcKey] = [];
     if (!chainTokenMap[rpcKey].find(t => t.tokenAddr === tokenAddr)) {
       chainTokenMap[rpcKey].push({ id: a.id, ticker, tokenAddr });
+    }
+    if (!supportedTokens[rpcKey].find(t => t.tokenAddr === tokenAddr)) {
+      supportedTokens[rpcKey].push({ id: a.id, ticker, tokenAddr });
     }
   }
 
@@ -831,8 +1105,10 @@ app.post("/api/wallet/evm/balances", async (req, res) => {
   }));
 
   walletState.setEvmBalances(address, results);
+  _lastEvmTokenBalancesByAddress[address.toLowerCase()] = tokenResults;
+  _lastSupportedTokensByAddress[address.toLowerCase()] = supportedTokens;
   console.log(`[evm balances] ${Object.keys(results).length} chains OK, ${rpcErrors.length} errors, ${Object.values(tokenResults).reduce((s,t)=>s+Object.keys(t).length,0)} ERC20 balances`);
-  res.json({ ok: true, address, balances: results, tokenBalances: tokenResults, rpcErrors });
+  res.json({ ok: true, address, balances: results, tokenBalances: tokenResults, supportedTokens, rpcErrors });
 });
 
 // ── RPC: update URL for a chain ──────────────────────────────
@@ -854,6 +1130,41 @@ app.post("/api/rpc/update", async (req, res) => {
 
 app.get("/api/rpc/list", (req, res) => {
   res.json({ rpcs: FREE_RPCS });
+});
+
+app.get("/api/rpc/scan", async (req, res) => {
+  const checks = await Promise.all(Object.entries(FREE_RPCS).map(async ([chain, url]) => {
+    const startedAt = Date.now();
+    try {
+      const out = await axios.post(url, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_blockNumber",
+        params: [],
+      }, { timeout: 7000 });
+      const raw = out.data?.result;
+      if (!raw) throw new Error("No result from RPC");
+      return {
+        chain,
+        url,
+        ok: true,
+        blockNumber: parseInt(raw, 16),
+        latencyMs: Date.now() - startedAt,
+      };
+    } catch (e) {
+      return {
+        chain,
+        url,
+        ok: false,
+        error: e.message,
+        latencyMs: Date.now() - startedAt,
+      };
+    }
+  }));
+
+  const ok = checks.filter(c => c.ok).length;
+  const failed = checks.length - ok;
+  res.json({ ok: failed === 0, total: checks.length, healthy: ok, failed, checks });
 });
 
 // ── WALLET: BTC ───────────────────────────────────────────────
@@ -985,6 +1296,9 @@ app.get("/api/wallet/balances", async (req, res) => {
 
   const status = walletState.getStatus();
   const safeStatus = JSON.parse(JSON.stringify(status));
+  const evmAddrKey = status?.evm?.address ? String(status.evm.address).toLowerCase() : null;
+  safeStatus.evmTokenBalances = evmAddrKey ? (_lastEvmTokenBalancesByAddress[evmAddrKey] || {}) : {};
+  safeStatus.supportedTokens = evmAddrKey ? (_lastSupportedTokensByAddress[evmAddrKey] || {}) : {};
   for (const key of ['evm','btc','solana','starknet','sui','tron']) {
     if (safeStatus[key]?.source === 'envkey' && safeStatus[key]?.address) {
       const addr = safeStatus[key].address;

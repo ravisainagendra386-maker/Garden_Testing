@@ -1,5 +1,37 @@
 // src/tests/runner.js
+const fs = require("fs");
+const path = require("path");
 const garden = require("../api/garden");
+const { appendRuntimeLog } = require("../utils/runtimeLog");
+
+/** NDJSON mirror for session 92463b — write to `logs/` (reliable) and `.cursor/` (debug UI). */
+const DEBUG_LOG_PATHS_92463B = [
+  path.join(__dirname, "../../logs/debug-92463b.log"),
+  path.join(__dirname, "../../debug-92463b.log"),
+  path.join(__dirname, "../../.cursor/debug-92463b.log"),
+];
+function debugNdjson92463b(payload) {
+  const line = JSON.stringify(payload) + "\n";
+  for (const p of DEBUG_LOG_PATHS_92463B) {
+    try {
+      const dir = path.dirname(p);
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.appendFileSync(p, line, "utf8");
+    } catch (_) {}
+  }
+}
+function debugQuoteIngest92463b(payload) {
+  const body = { sessionId: "92463b", timestamp: Date.now(), ...payload };
+  debugNdjson92463b(body);
+  try {
+    appendRuntimeLog(body);
+  } catch (_) {}
+  fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "92463b" },
+    body: JSON.stringify(body),
+  }).catch(() => {});
+}
 
 const FREE_RPCS = {
   base:       'https://sepolia.base.org',
@@ -38,13 +70,26 @@ const { initiateEvm, redeemEvm } = require("../htlc/evm");
 const envkey = require("../wallet/envkey");
 const { initiateHtlc }           = require("../wallet/btc");
 const walletState = require("../wallet/state");
-const routeOptimizerAgent        = require("../agents/routeOptimizerAgent");
 const tradeHistory               = require("../agents/tradeHistory");
+const { RouteOptimizerAgent }    = require("../agents/routeOptimizerAgent");
 
 let _emit = null;
 let _approvalQueue = [];
 const _activeTests = new Map();
 let _globalAbort = false;
+let _requestSeq = 0;
+const _routeAgent = new RouteOptimizerAgent();
+let _routeAgentInitPromise = null;
+
+async function ensureRouteAgentReady() {
+  if (!_routeAgentInitPromise) {
+    _routeAgentInitPromise = _routeAgent.init().catch((e) => {
+      _routeAgentInitPromise = null;
+      console.warn("[runner] RouteOptimizerAgent init failed:", e?.message || e);
+    });
+  }
+  await _routeAgentInitPromise;
+}
 
 function setEmitter(fn) { _emit = fn; }
 function emit(event, data) {
@@ -52,11 +97,44 @@ function emit(event, data) {
   else console.log(`[${event}]`, JSON.stringify(data).slice(0, 120));
 }
 
+/** Rewire the next beam hop to spend the asset & amount we actually received (e.g. after same-chain dest substitution). */
+function patchNextChainHopFromReceive(nextRoute, prevPassResult) {
+  if (!nextRoute || !prevPassResult || prevPassResult.status !== "pass") return;
+  const { actualDestAsset, actualDestMeta, nextHopAmountAtomic } = prevPassResult;
+  if (!actualDestAsset || !actualDestMeta || !Number.isFinite(nextHopAmountAtomic)) return;
+  const fromChain = getWalletTypeForAsset(actualDestMeta);
+  if (!fromChain) return;
+  const amount = clampGardenQuoteAmount(nextHopAmountAtomic, actualDestMeta);
+  const fromName = actualDestMeta.name || actualDestAsset;
+  const toName = nextRoute.toMeta?.name || nextRoute.toAsset;
+  Object.assign(nextRoute, {
+    fromAsset: actualDestAsset,
+    fromMeta: actualDestMeta,
+    fromChain,
+    amount,
+    label: `${fromName} → ${toName}`,
+  });
+}
+
+/** Clamp Swap API quote size to asset policy (min/max). Balance can exceed max; Garden still rejects. */
+function clampGardenQuoteAmount(raw, fromMeta) {
+  let base = Number(raw);
+  if (!Number.isFinite(base) || base <= 0) base = 50000;
+  base = Math.floor(base);
+  const lo = Math.max(1, parseInt(String(fromMeta?.min_amount ?? 50000), 10) || 50000);
+  const hiRaw = fromMeta?.max_amount;
+  const hi = hiRaw != null && String(hiRaw) !== ''
+    ? parseInt(String(hiRaw), 10)
+    : NaN;
+  const cap = Number.isFinite(hi) && hi >= lo ? hi : Number.MAX_SAFE_INTEGER;
+  return Math.min(Math.max(base, lo), cap);
+}
+
 // ── APPROVAL / EVM TX / EIP-712 SIGN QUEUE ──────────────────
 
 async function requestApproval(txData) {
   return new Promise(resolve => {
-    const id = Date.now().toString();
+    const id = `approval_${Date.now()}_${++_requestSeq}`;
     emit("approval_request", { id, ...txData });
     _approvalQueue.push({ id, resolve });
   });
@@ -64,7 +142,7 @@ async function requestApproval(txData) {
 
 async function requestEvmTx({ orderId, label, to, data, value, chainId, gasLimit }) {
   return new Promise((resolve, reject) => {
-    const id = `evmtx_${Date.now()}`;
+    const id = `evmtx_${Date.now()}_${++_requestSeq}`;
     emit("evm_tx_request", { id, orderId, label, to, data, value, chainId: String(chainId), gasLimit });
     _approvalQueue.push({ id, resolve, reject });
     setTimeout(() => {
@@ -76,7 +154,7 @@ async function requestEvmTx({ orderId, label, to, data, value, chainId, gasLimit
 
 async function requestEvmSign({ orderId, label, signData, chainId }) {
   return new Promise((resolve, reject) => {
-    const id = `evmsign_${Date.now()}`;
+    const id = `evmsign_${Date.now()}_${++_requestSeq}`;
     emit("evm_sign_request", { id, orderId, label, signData, chainId: String(chainId) });
     _approvalQueue.push({ id, resolve, reject });
     setTimeout(() => {
@@ -135,6 +213,15 @@ function getWalletTypeForAsset(asset) {
   return null;
 }
 
+function pickTokenAddress(...candidates) {
+  for (const c of candidates) {
+    if (!c) continue;
+    const addr = c.token_address || c.tokenAddress || c.contract_address || c.contractAddress || c.token?.address || c.address || null;
+    if (addr) return addr;
+  }
+  return null;
+}
+
 // ── ASSET FAMILY (for pair plausibility) ─────────────────────
 function assetFamily(asset) {
   const t = (asset.name || asset.id || '').toLowerCase().split(':').pop();
@@ -151,6 +238,161 @@ function isPairPlausible(from, to) {
   if (ff === 'btc' && tf !== 'btc') return false;
   if (tf === 'btc' && ff !== 'btc') return false;
   return true;
+}
+
+function isInsufficientLiquidityGardenError(err) {
+  const m = String(err?.message || err?.raw?.error || "").toLowerCase();
+  if (m.includes("insufficient liquidity") || m.includes("no liquidity")) return true;
+  if (m.includes("not enough liquidity") || m.includes("liquidity unavailable")) return true;
+  if (m.includes("liquidity") && (m.includes("too low") || m.includes("too shallow") || m.includes("depth"))) return true;
+  return false;
+}
+
+/**
+ * If the primary destination has no quote liquidity, try other assets on the same chain
+ * (same id prefix / wallet type, Garden-supported plausible pairs).
+ * If all fail at the requested size, halves from_amount down to min_amount (Garden often has
+ * depth only at smaller sizes on testnets).
+ */
+async function getQuoteWithDestinationFallback({
+  fromAsset,
+  toAsset,
+  toMeta,
+  toChain,
+  fromMeta,
+  safeAmount,
+  allowFallback = true,
+}) {
+  const minAmt = Math.max(1, parseInt(String(fromMeta?.min_amount ?? 50000), 10) || 50000);
+  let tryAmt = Math.floor(Number(safeAmount) || minAmt);
+  if (!Number.isFinite(tryAmt) || tryAmt < minAmt) tryAmt = minAmt;
+
+  async function tryQuotesAtAmount(amt) {
+    const tried = new Set([String(toAsset)]);
+    let lastErr = null;
+
+    async function attemptQuote(tA) {
+      const res = await garden.getQuote(fromAsset, tA, amt);
+      if (!res?.result?.length) return null;
+      return res;
+    }
+
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "92463b" },
+      body: JSON.stringify({
+        sessionId: "92463b",
+        runId: "post-fix",
+        hypothesisId: "H6",
+        location: "src/tests/runner.js:getQuoteWithDestinationFallback:tryAmt",
+        message: "Quote pass: amount + primary dest",
+        data: { tryAmt, minAmt, fromAsset, toAsset },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+
+    try {
+      const res = await attemptQuote(toAsset);
+      if (res) {
+        return { quoteRes: res, toAsset, toMeta, swappedDestination: false, usedFromAmount: amt };
+      }
+    } catch (e) {
+      lastErr = e;
+      if (!allowFallback || !isInsufficientLiquidityGardenError(e)) throw e;
+    }
+
+    if (!allowFallback) {
+      throw lastErr || new Error("No quotes returned — pair may have no liquidity");
+    }
+
+    let assets = [];
+    try {
+      const g = await garden.getAssets();
+      assets = g.result || g.assets || g || [];
+    } catch (_) {
+      throw lastErr || new Error("getAssets failed during destination fallback");
+    }
+
+    const chainPrefix = String(toAsset).split(":")[0];
+    const candidates = assets.filter((a) => {
+      if (tried.has(String(a.id))) return false;
+      if (a.id === fromAsset) return false;
+      if (String(a.id).split(":")[0] !== chainPrefix) return false;
+      if (!fromMeta || !isPairPlausible(fromMeta, a)) return false;
+      if (getWalletTypeForAsset(a) !== toChain) return false;
+      return true;
+    });
+    candidates.sort((x, y) => String(x.id).localeCompare(String(y.id)));
+
+    // #region agent log
+    debugQuoteIngest92463b({
+      runId: "post-fix",
+      hypothesisId: "H7",
+      location: "src/tests/runner.js:getQuoteWithDestinationFallback:candidates",
+      message: "Same-chain destination fallback candidates",
+      data: {
+        tryAmt,
+        candidateCount: candidates.length,
+        candidateIds: candidates.map((x) => x.id).slice(0, 20),
+      },
+    });
+    // #endregion
+
+    for (const a of candidates) {
+      tried.add(String(a.id));
+      try {
+        const res = await attemptQuote(a.id);
+        if (res) {
+          return { quoteRes: res, toAsset: a.id, toMeta: a, swappedDestination: true, usedFromAmount: amt };
+        }
+      } catch (e) {
+        lastErr = e;
+        if (!isInsufficientLiquidityGardenError(e)) throw e;
+      }
+    }
+
+    throw lastErr || new Error("No quotes returned — pair may have no liquidity");
+  }
+
+  for (;;) {
+    try {
+      return await tryQuotesAtAmount(tryAmt);
+    } catch (e) {
+      const treatAsLiquidity = isInsufficientLiquidityGardenError(e);
+      // #region agent log
+      debugQuoteIngest92463b({
+        runId: "post-fix",
+        hypothesisId: "H9",
+        location: "src/tests/runner.js:getQuoteWithDestinationFallback:outerCatch",
+        message: "tryQuotesAtAmount exit",
+        data: {
+          tryAmt,
+          minAmt,
+          fromAsset,
+          toAsset,
+          treatAsLiquidity,
+          errSnippet: String(e?.message || e).slice(0, 280),
+        },
+      });
+      // #endregion
+      if (!treatAsLiquidity) throw e;
+      if (tryAmt <= minAmt) throw e;
+      const next = Math.max(minAmt, Math.floor(tryAmt / 2));
+      if (next >= tryAmt) throw e;
+      // #region agent log
+      debugQuoteIngest92463b({
+        runId: "post-fix",
+        hypothesisId: "H8",
+        location: "src/tests/runner.js:getQuoteWithDestinationFallback:reduce",
+        message: "Liquidity miss — reducing from_amount",
+        data: { fromTry: tryAmt, nextTry: next, minAmt, fromAsset, toAsset },
+      });
+      // #endregion
+      tryAmt = next;
+    }
+  }
 }
 
 // ── SINGLE ROUTE TEST ─────────────────────────────────────────
@@ -172,9 +414,22 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
 
   emit("test_start", { testId, label, fromChain, toChain, fromAsset, toAsset, amount });
 
+  let swapDestAsset = toAsset;
+  let swapDestMeta = toMeta;
+
   try {
     // 1. Wallet addresses
-    const fromAddress = walletState.getAddressByType(fromChain);
+    const envEvmAvailable = envkey.isAvailable();
+    const envEvmAddress = envkey.getEvmAddress?.() || null;
+    const walletStatusAtStart = walletState.getStatus();
+    const walletEvmSourceAtStart = walletStatusAtStart?.evmSource || null;
+    const preferEnvkeyEvm =
+      fromChain === "evm" &&
+      envEvmAvailable &&
+      !!envEvmAddress &&
+      (walletEvmSourceAtStart === "envkey" || !walletEvmSourceAtStart);
+
+    const fromAddress = preferEnvkeyEvm ? envEvmAddress : walletState.getAddressByType(fromChain);
     const toAddress   = walletState.getAddressByType(toChain);
 
     if (!fromAddress) {
@@ -194,16 +449,42 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     await garden.health();
     step("Health Check", "pass", "API is live");
 
-    // 3. Amount
-    const safeAmount = Number(amount) || 50000;
-    step("Route Policy", "pass", `Using amount: ${safeAmount} (atomic units)`);
+    // 3. Amount (policy max can be far below wallet balance)
+    const rawRequested = Number(amount) || 50000;
+    const safeAmount = clampGardenQuoteAmount(amount, fromMeta);
+    step("Route Policy", "pass", rawRequested !== safeAmount
+      ? `Using amount: ${safeAmount} (capped from ${rawRequested} per Garden max ${fromMeta?.max_amount})`
+      : `Using amount: ${safeAmount} (atomic units)`);
 
-    // 4. Quote
+    // 4. Quote (try alternate destination assets on same chain if primary has no liquidity)
     step("Get Quote", "running");
     checkAbort();
+    // #region agent log
+    debugQuoteIngest92463b({
+      runId: "post-fix",
+      hypothesisId: "H0",
+      location: "src/tests/runner.js:runRoute:beforeQuote",
+      message: "Reached Get Quote step",
+      data: { testId, fromAsset, toAsset: swapDestAsset, safeAmount },
+    });
+    // #endregion
     let quoteRes;
+    let quoteSwitchedDest = false;
+    let execAmount = safeAmount;
     try {
-      quoteRes = await garden.getQuote(fromAsset, toAsset, safeAmount);
+      const resolved = await getQuoteWithDestinationFallback({
+        fromAsset,
+        toAsset: swapDestAsset,
+        toMeta: swapDestMeta,
+        toChain,
+        fromMeta,
+        safeAmount,
+      });
+      quoteRes = resolved.quoteRes;
+      quoteSwitchedDest = resolved.swappedDestination;
+      swapDestAsset = resolved.toAsset;
+      swapDestMeta = resolved.toMeta;
+      if (Number.isFinite(resolved.usedFromAmount)) execAmount = resolved.usedFromAmount;
     } catch (qErr) {
       const msg = qErr.message || "";
       step("Get Quote", "skipped", `No quote: ${msg.split("]").pop().trim()}`);
@@ -224,16 +505,23 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     const solverId     = bestQuote.solver_id;
     const fromDisplay  = `${bestQuote.source.display} (${bestQuote.source.value} USD)`;
     const toDisplay    = `${bestQuote.destination.display} (${bestQuote.destination.value} USD)`;
-    step("Get Quote", "pass", `${fromDisplay} → ${toDisplay}`);
+    const swapNote = quoteSwitchedDest
+      ? ` · destination asset switched to ${swapDestAsset} (original had no liquidity)`
+      : "";
+    const sizeNote =
+      execAmount < safeAmount
+        ? ` · traded ${execAmount} from_amount (reduced from ${safeAmount} for liquidity)`
+        : "";
+    step("Get Quote", "pass", `${fromDisplay} → ${toDisplay}${swapNote}${sizeNote}`);
 
     // 5a. Liquidity check
     step("Liquidity Check", "running");
     checkAbort();
     try {
-      const liq = await garden.getLiquidity(fromAsset, toAsset);
+      const liq = await garden.getLiquidity(fromAsset, swapDestAsset);
       const available = liq.result?.available ?? liq.result?.liquidity ?? liq.available;
-      if (available !== undefined && Number(available) < safeAmount) {
-        throw new Error(`Insufficient liquidity: ${available} available, need ${safeAmount}`);
+      if (available !== undefined && Number(available) < execAmount) {
+        throw new Error(`Insufficient liquidity: ${available} available, need ${execAmount}`);
       }
       step("Liquidity Check", "pass", available !== undefined ? `Available: ${available}` : "Liquidity OK");
     } catch(e) {
@@ -243,6 +531,28 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
         return { testId, label, status: "skipped", error: e.message };
       }
       step("Liquidity Check", "pass", "Could not verify (continuing)");
+    }
+
+    // 5a2. Destination-side liquidity sanity check (reverse route)
+    // Ensures the received token is also liquid enough before locking source funds.
+    step("Destination Liquidity Check", "running");
+    checkAbort();
+    try {
+      const revLiq = await garden.getLiquidity(swapDestAsset, fromAsset);
+      const revAvailable = revLiq.result?.available ?? revLiq.result?.liquidity ?? revLiq.available;
+      const expectedOutNum = Number(outputAmount || 0);
+      if (revAvailable !== undefined && expectedOutNum > 0 && Number(revAvailable) < expectedOutNum) {
+        throw new Error(`Insufficient destination-side liquidity: ${revAvailable} available, need ${expectedOutNum}`);
+      }
+      step("Destination Liquidity Check", "pass",
+        revAvailable !== undefined ? `Available: ${revAvailable}` : "Destination liquidity OK");
+    } catch (e) {
+      if ((e.message || "").includes("Insufficient") || (e.message || "").includes("liquidity")) {
+        emit("test_end", { testId, label, status: "skipped", error: e.message });
+        _activeTests.delete(testId);
+        return { testId, label, status: "skipped", error: e.message };
+      }
+      step("Destination Liquidity Check", "pass", "Could not verify (continuing)");
     }
 
     // 5b. Balance check
@@ -255,6 +565,7 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
       let gasBalanceWei = null;
       let gasSymbol = "";
       let isNativeToken = false;
+      let balanceSource = "none";
 
       if (fromChain === "bitcoin") {
         const rawBal = wallets.btc?.balance;
@@ -264,7 +575,7 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
         }
       } else if (fromChain === "evm") {
         try {
-          const tokenAddr = fromMeta?.token_address;
+          const tokenAddr = pickTokenAddress(fromMeta);
           const { ethers } = require('ethers');
           const rawKey = fromAsset.split(':')[0];
           const chainKey = rawKey.replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, '');
@@ -279,6 +590,7 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
             const nativeSym = chainConf[chainKey]?.asset || 'ETH';
             balanceLabel = `${(balance/1e18).toFixed(6)} ${nativeSym}`;
             isNativeToken = true;
+            balanceSource = "evm-rpc-native";
           } else {
             const ERC20_ABI = ['function balanceOf(address) view returns (uint256)', 'function decimals() view returns (uint8)'];
             const token = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
@@ -286,6 +598,7 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
             balance = Number(bal);
             const ticker = fromAsset.split(':')[1]?.toUpperCase() || 'TOKEN';
             balanceLabel = `${(balance/Math.pow(10,decimals)).toFixed(6)} ${ticker}`;
+            balanceSource = "evm-rpc-token";
             try {
               const weiGas = await provider.getBalance(fromAddress);
               gasBalanceWei = BigInt(weiGas.toString());
@@ -297,8 +610,10 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
           if (cachedBals[fromAsset] !== undefined) {
             balance = Number(cachedBals[fromAsset]);
             balanceLabel = `${balance} (cached)`;
+            balanceSource = "cached";
           } else {
             console.warn('[runner] EVM balance RPC error:', onChainErr.message);
+            balanceSource = "rpc-error";
           }
         }
       } else if (fromChain === "solana") {
@@ -306,8 +621,8 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
         if (rawBal) { balance = parseFloat(rawBal); balanceLabel = `${balance} SOL`; }
       }
 
-      if (balance !== null && balance < safeAmount) {
-        const msg = `Insufficient balance: have ${balanceLabel}, need ${safeAmount.toLocaleString()} (atomic units)`;
+      if (balance !== null && balance < execAmount) {
+        const msg = `Insufficient balance: have ${balanceLabel}, need ${execAmount.toLocaleString()} (atomic units)`;
         step("Balance Check", "fail", msg);
         emit("test_end", { testId, label, status: "skipped", error: msg });
         _activeTests.delete(testId);
@@ -335,9 +650,9 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
         balMsg = "Balance verified OK";
       } else if (fromChain === "evm" && !isNativeToken && gasBalanceWei !== null) {
         const nativeAmt = Number(gasBalanceWei) / 1e18;
-        balMsg = `Token: ${balanceLabel} ≥ ${safeAmount.toLocaleString()}, Gas: ${nativeAmt.toFixed(6)} ${gasSymbol}`;
+        balMsg = `Token: ${balanceLabel} ≥ ${execAmount.toLocaleString()}, Gas: ${nativeAmt.toFixed(6)} ${gasSymbol}`;
       } else {
-        balMsg = `${balanceLabel} ≥ ${safeAmount.toLocaleString()} (atomic)`;
+        balMsg = `${balanceLabel} ≥ ${execAmount.toLocaleString()} (atomic)`;
       }
       step("Balance Check", "pass", balMsg);
     } catch(balErr) {
@@ -358,10 +673,10 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
       source: {
         asset:  fromAsset,
         owner:  fromAddress,
-        amount: String(safeAmount),
+        amount: String(execAmount),
       },
       destination: {
-        asset:  toAsset,
+        asset:  swapDestAsset,
         owner:  toAddress,
         amount: outputAmount,
       },
@@ -387,7 +702,7 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     const htlcAddress = orderRes.result?.source?.htlc_address
                      || orderRes.result?.source?.swap_id
                      || orderRes.result?.to;
-    const htlcAmount  = orderRes.result?.source?.amount || safeAmount;
+    const htlcAmount  = orderRes.result?.source?.amount || execAmount;
 
     if (!orderId) throw new Error(`No order_id in response: ${JSON.stringify(orderRes).slice(0, 200)}`);
     step("Create Order", "pass", `Order ID: ${orderId}`);
@@ -396,7 +711,7 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     if (config.manualApprove) {
       step("Awaiting Approval", "pending", "Waiting for your approval…");
       checkAbort();
-      const approved = await requestApproval({ orderId, fromAsset, toAsset, safeAmount, outputAmount, htlcAddress, label });
+      const approved = await requestApproval({ orderId, fromAsset, toAsset: swapDestAsset, safeAmount: execAmount, outputAmount, htlcAddress, label });
       if (!approved) {
         step("Manual Approval", "skipped", "User rejected");
         emit("test_end", { testId, label, status: "skipped", steps });
@@ -522,6 +837,15 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     } else if (fromChain === "evm") {
       const prebuiltTx = orderRes.result?.initiate_transaction;
       const signData   = orderRes.result?.sign_data || orderRes.result?.eip712_data || orderRes.result?.permit_data;
+      const approvalTxForLog = orderRes.result?.approval_transaction;
+      const walletStatus = walletState.getStatus();
+      const evmSource = walletStatus?.evmSource;
+      const envkeyAvailable = envkey.isAvailable();
+      const effectiveEnvkey =
+        envkeyAvailable &&
+        !!envkey.getEvmAddress?.() &&
+        (evmSource === "envkey" || !evmSource);
+
 
       if (signData && prebuiltTx?.chain_id) {
         // Gasless EIP-712 path
@@ -536,42 +860,73 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
       } else if (prebuiltTx?.data && prebuiltTx?.to) {
         // Regular EVM tx path
         const approvalTx = orderRes.result?.approval_transaction;
-        if (approvalTx?.data && approvalTx?.to) {
-          step("ERC20 Approve", "running", "Requesting approve() in wallet…");
-          const approveTxHash = await requestEvmTx({
-            orderId,
-            label: label + ' [ERC20 Approve]',
-            to: approvalTx.to, data: approvalTx.data,
-            value: approvalTx.value || "0x0",
-            chainId: approvalTx.chain_id,
-            gasLimit: approvalTx.gas_limit || "0xea60",
-          });
-          step("ERC20 Approve", "running", `Approve tx sent: ${approveTxHash}`);
-          try {
-            const { waitForConfirmation } = require('../htlc/evm');
-            await waitForConfirmation(approveTxHash, String(approvalTx.chain_id), 120000);
-            step("ERC20 Approve", "pass", `Confirmed: ${approveTxHash}`);
-          } catch (waitErr) {
-            step("ERC20 Approve", "pass", `Approve sent (confirmation wait failed)`);
+        const shouldUseEnvkey = effectiveEnvkey;
+        if (shouldUseEnvkey) {
+          // In envkey mode we must never call requestEvmTx() (that triggers MetaMask popups).
+          if (approvalTx?.data && approvalTx?.to) {
+            step("ERC20 Approve", "running", "Sending approve() via .env key…");
+            const approveTxHash = await envkey.sendEvmTransaction({
+              to: approvalTx.to, data: approvalTx.data,
+              value: approvalTx.value || "0x0",
+              chainId: approvalTx.chain_id || prebuiltTx.chain_id,
+              gasLimit: approvalTx.gas_limit || "0xea60",
+            });
+            step("ERC20 Approve", "pass", `Approved on-chain: ${approveTxHash}`);
+          } else {
+            await ensureErc20Approval({
+              tokenAddr:    pickTokenAddress(fromMeta, orderRes.result?.source),
+              spender:      prebuiltTx.to,
+              amount:       htlcAmount,
+              chainIdOrKey: prebuiltTx.chain_id,
+              walletMode:   'envkey',
+            });
           }
+
+          step("Initiate HTLC", "pending", "Sending initiate tx via .env private key…");
+          initTxHash = await envkey.sendEvmTransaction({
+            to: prebuiltTx.to, data: prebuiltTx.data,
+            value: prebuiltTx.value || "0x0",
+            chainId: prebuiltTx.chain_id,
+            gasLimit: prebuiltTx.gas_limit || "0x493e0",
+          });
         } else {
-          await ensureErc20Approval({
-            tokenAddr:    fromMeta?.token_address || orderRes.result?.source?.token_address,
-            spender:      prebuiltTx.to,
-            amount:       htlcAmount,
-            chainIdOrKey: prebuiltTx.chain_id,
-            walletMode:   'metamask',
+          if (approvalTx?.data && approvalTx?.to) {
+            step("ERC20 Approve", "running", "Requesting approve() in wallet…");
+            const approveTxHash = await requestEvmTx({
+              orderId,
+              label: label + ' [ERC20 Approve]',
+              to: approvalTx.to, data: approvalTx.data,
+              value: approvalTx.value || "0x0",
+              chainId: approvalTx.chain_id,
+              gasLimit: approvalTx.gas_limit || "0xea60",
+            });
+            step("ERC20 Approve", "running", `Approve tx sent: ${approveTxHash}`);
+            try {
+              const { waitForConfirmation } = require('../htlc/evm');
+              await waitForConfirmation(approveTxHash, String(approvalTx.chain_id), 120000);
+              step("ERC20 Approve", "pass", `Confirmed: ${approveTxHash}`);
+            } catch (waitErr) {
+              step("ERC20 Approve", "pass", `Approve sent (confirmation wait failed)`);
+            }
+          } else {
+            await ensureErc20Approval({
+              tokenAddr:    pickTokenAddress(fromMeta, orderRes.result?.source),
+              spender:      prebuiltTx.to,
+              amount:       htlcAmount,
+              chainIdOrKey: prebuiltTx.chain_id,
+              walletMode:   'metamask',
+            });
+          }
+
+          step("Initiate HTLC", "pending", "Waiting for wallet approval…");
+          initTxHash = await requestEvmTx({
+            orderId, label,
+            to: prebuiltTx.to, data: prebuiltTx.data,
+            value: prebuiltTx.value || "0x0",
+            chainId: prebuiltTx.chain_id,
+            gasLimit: prebuiltTx.gas_limit || "0x493e0",
           });
         }
-
-        step("Initiate HTLC", "pending", "Waiting for wallet approval…");
-        initTxHash = await requestEvmTx({
-          orderId, label,
-          to: prebuiltTx.to, data: prebuiltTx.data,
-          value: prebuiltTx.value || "0x0",
-          chainId: prebuiltTx.chain_id,
-          gasLimit: prebuiltTx.gas_limit || "0x493e0",
-        });
       } else if (walletState.getStatus().evmSource === "privy") {
         initTxHash = await initiateEvm({
           htlcAddress,
@@ -585,7 +940,7 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
       } else if (walletState.getStatus().evmSource === "envkey" && envkey.isAvailable()) {
         step("Initiate HTLC", "running", "Signing with .env private key…");
         await ensureErc20Approval({
-          tokenAddr:    fromMeta?.token_address || orderRes.result?.source?.token_address,
+          tokenAddr:    pickTokenAddress(fromMeta, orderRes.result?.source),
           spender:      prebuiltTx?.to || htlcAddress,
           amount:       htlcAmount,
           chainIdOrKey: prebuiltTx?.chain_id || fromAsset.split(":")[0],
@@ -877,17 +1232,35 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
 
     try {
       tradeHistory.record({
-        testId, status: "pass", fromAssetId: fromAsset, toAssetId: toAsset,
-        fromChain, toChain, amount: safeAmount, outputAmount: received,
+        testId, status: "pass", fromAssetId: fromAsset, toAssetId: swapDestAsset,
+        fromChain, toChain, amount: execAmount, outputAmount: received,
         usdIn: Number(bestQuote?.source?.value ?? 0),
         usdOut: Number(bestQuote?.destination?.value ?? 0),
         slippagePct, durationSec: elapsed, ts: new Date().toISOString(),
       });
     } catch (_) {}
 
+    const rawFilled =
+      finalOrder?.destination_filled_amount ??
+      finalOrder?.destination_swap?.amount ??
+      outputAmount;
+    const parsedNext = parseInt(String(rawFilled).replace(/\..*$/, ""), 10);
+    let nextHopAmountAtomic = Number.isFinite(parsedNext) && parsedNext > 0
+      ? parsedNext
+      : Math.max(1, Math.floor(parseFloat(String(outputAmount)) || 0));
+
     emit("test_end", { testId, label, status: "pass", steps, duration: elapsed });
     _activeTests.delete(testId);
-    return { testId, label, status: "pass", steps };
+    return {
+      testId,
+      label,
+      status: "pass",
+      steps,
+      duration: elapsed,
+      actualDestAsset: swapDestAsset,
+      actualDestMeta: swapDestMeta,
+      nextHopAmountAtomic,
+    };
 
   } catch (err) {
     const failStep = { name: "Error", status: "fail", detail: err.message, ts: new Date().toISOString() };
@@ -897,7 +1270,7 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     emit("test_end",  { testId, label, status: finalStatus, error: err.message, steps });
     try {
       tradeHistory.record({
-        testId, status: finalStatus, fromAssetId: fromAsset, toAssetId: toAsset,
+        testId, status: finalStatus, fromAssetId: fromAsset, toAssetId: swapDestAsset,
         fromChain, toChain, amount, outputAmount: 0,
         usdIn: 0, usdOut: 0, slippagePct: 0, durationSec: 0,
         ts: new Date().toISOString(),
@@ -931,7 +1304,7 @@ async function runApiTests() {
 }
 
 // ── BUILD ROUTES — ALWAYS FRESH (no cache) ────────────────────
-async function buildRoutes(amountOverrides = {}) {
+async function buildRoutes(amountOverrides = {}, mode = "allTests") {
   const wallets = walletState.getStatus();
   const connectedTypes = new Set();
   if (wallets.evm)      connectedTypes.add("evm");
@@ -963,14 +1336,16 @@ async function buildRoutes(amountOverrides = {}) {
       if (from.id === to.id) continue;
       if (!isPairPlausible(from, to)) continue;
       const overrideAmt = amountOverrides[from.id];
+      const rawChosen = overrideAmt !== undefined
+        ? parseInt(overrideAmt, 10)
+        : parseInt(from.min_amount || 50000, 10);
+      const chosenAmount = clampGardenQuoteAmount(rawChosen, from);
       routes.push({
         fromAsset: from.id,
         toAsset:   to.id,
         fromChain: getWalletTypeForAsset(from),
         toChain:   getWalletTypeForAsset(to),
-        amount:    overrideAmt !== undefined
-          ? parseInt(overrideAmt)
-          : parseInt(from.min_amount || 50000),
+        amount:    chosenAmount,
         fromMeta:  from,
         toMeta:    to,
         label:     `${from.name} → ${to.name}`,
@@ -1022,30 +1397,41 @@ async function buildRoutes(amountOverrides = {}) {
  
   // Chain-reaction optimizer
   try {
-    return routeOptimizerAgent.optimizeRoutes(routes, {
+    await ensureRouteAgentReady();
+    const result = _routeAgent.run(routes, {
       maxTotal: 160,
       perPairLimit: 3,
       balances: balanceMap,
       gasBalances: gasMap,
       connectedWalletTypes: connectedTypes,
+    }, mode);
+    emit("route_plan", {
+      mode: result.mode,
+      availableRunOptions: result.availableRunOptions || ["allTests", "allChains"],
+      topThreeConditions: result.topThreeConditions,
+      requiredAmountSufficient: result.requiredAmountSufficient,
+      requiredAmountSummary: result.requiredAmountSummary,
+      plannedRoutes: result.plan?.length || 0,
+      chains: result.chains?.length || 0,
     });
+    return result.plan || routes;
   } catch (_) {
     return routes;
   }
 }
 
 // ── RUN ALL — PARALLEL CHAIN-REACTION EXECUTION ──────────────
-async function runAll(amountOverrides = {}) {
-  emit("suite_start", { env: config.env, ts: new Date().toISOString() });
+async function runAll(amountOverrides = {}, mode = "allTests") {
+  emit("suite_start", { env: config.env, mode, ts: new Date().toISOString() });
   await runApiTests();
-  const routes = await buildRoutes(amountOverrides);
+  const routes = await buildRoutes(amountOverrides, mode);
   const results = [];
 
   emit("suite_routes", { count: routes.length, routes: routes.map(r => r.label) });
 
   if (!routes.length) {
     emit("suite_end", {
-      env: config.env, total: 0, passed: 0, failed: 0, skipped: 0,
+      env: config.env, total: 0, executed: 0, passed: 0, failed: 0, aborted: 0, skipped: 0,
       message: "No routes — connect wallets first",
       ts: new Date().toISOString(),
     });
@@ -1070,27 +1456,44 @@ async function runAll(amountOverrides = {}) {
   // Each seed's chain runs sequentially (A→B before B→C)
   // Different seeds run in parallel
   async function runChain(chainRoutes, seedLabel) {
-    for (const route of chainRoutes) {
+    for (let i = 0; i < chainRoutes.length; i++) {
       if (_globalAbort) break;
+      const route = chainRoutes[i];
       const result = await runRoute(route);
       results.push(result);
 
-      // If chain-reaction trade fails, stop this chain
-      if (result.status === 'fail' && route._chainReaction) {
+      if (result.status !== "pass") {
         emit("suite_info", {
-          message: `Chain broken at ${route.label} — skipping remaining hops from seed ${seedLabel}`,
+          message:
+            result.status === "skipped"
+              ? `Chain stopped at ${route.label} — ${result.error || "skipped"}`
+              : `Chain broken at ${route.label} — ${result.error || result.status}`,
         });
         break;
+      }
+
+      if (i + 1 < chainRoutes.length) {
+        patchNextChainHopFromReceive(chainRoutes[i + 1], result);
       }
 
       if (!_globalAbort) await new Promise(r => setTimeout(r, 500));
     }
   }
 
-  // Launch all seed chains in parallel
-  const chainPromises = [...bySeed.entries()].map(([seed, chainRoutes]) =>
-    runChain(chainRoutes, seed)
-  );
+  // allChains mode: execute seed chains sequentially (beam propagation).
+  // allTests mode: keep seed chains parallel for throughput.
+  const chainPromise = (mode === "allChains")
+    ? (async () => {
+        for (const [seed, chainRoutes] of [...bySeed.entries()]) {
+          if (_globalAbort) break;
+          await runChain(chainRoutes, seed);
+        }
+      })()
+    : Promise.all(
+        [...bySeed.entries()].map(([seed, chainRoutes]) =>
+          runChain(chainRoutes, seed)
+        )
+      );
 
   // Standalone routes with concurrency limit
   const PARALLEL_LIMIT = 3;
@@ -1113,15 +1516,27 @@ async function runAll(amountOverrides = {}) {
     if (running.size > 0) await Promise.all([...running]);
   }
 
-  // Execute everything in parallel
-  await Promise.all([...chainPromises, runStandalonePool()]);
+  // allChains: finish every seed beam before standalone routes so the first trade is always
+  // the first hop of the first seed (and not racing standalones). allTests: chains ∥ standalones.
+  if (mode === "allChains") {
+    await chainPromise;
+    await runStandalonePool();
+  } else {
+    await Promise.all([chainPromise, runStandalonePool()]);
+  }
 
+  const passed = results.filter(r => r.status === "pass").length;
+  const failed = results.filter(r => r.status === "fail").length;
+  const aborted = results.filter(r => r.status === "aborted").length;
+  const skipped = results.filter(r => r.status === "skipped").length;
   emit("suite_end", {
     env: config.env,
     total: results.length,
-    passed:  results.filter(r => r.status === "pass").length,
-    failed:  results.filter(r => r.status === "fail").length,
-    skipped: results.filter(r => r.status === "skipped").length,
+    executed: passed + failed + aborted,
+    passed,
+    failed,
+    aborted,
+    skipped,
     ts: new Date().toISOString(),
   });
   return results;

@@ -104,19 +104,65 @@ function getRpcForChain(chainIdOrKey) {
   throw new Error(`No RPC found for chain: ${chainIdOrKey}`);
 }
 
+function getRpcCandidates(chainIdOrKey) {
+  const candidates = [];
+  try { candidates.push(getRpcForChain(chainIdOrKey)); } catch (_) {}
+
+  const key = String(chainIdOrKey).toLowerCase();
+  const num = parseInt(chainIdOrKey);
+  if (!isNaN(num)) {
+    if (num === 11155111) {
+      candidates.push(
+        "https://ethereum-sepolia-rpc.publicnode.com",
+        "https://sepolia.gateway.tenderly.co",
+        "https://rpc2.sepolia.org"
+      );
+    } else if (num === 84532) {
+      candidates.push("https://sepolia.base.org");
+    } else if (num === 421614) {
+      candidates.push("https://sepolia-rollup.arbitrum.io/rpc");
+    }
+  } else if (key.includes("ethereum")) {
+    candidates.push(
+      "https://ethereum-sepolia-rpc.publicnode.com",
+      "https://sepolia.gateway.tenderly.co",
+      "https://rpc2.sepolia.org"
+    );
+  }
+
+  const seen = new Set();
+  return candidates.filter((u) => {
+    if (!u || seen.has(u)) return false;
+    seen.add(u);
+    return true;
+  });
+}
+
 async function sendEvmTransaction({ to, data, value = "0x0", chainId, gasLimit }) {
-  const rpc      = getRpcForChain(chainId);
-  const provider = new ethers.JsonRpcProvider(rpc);
-  const wallet   = new ethers.Wallet(getEvmPrivateKey(), provider);
+  const rpcCandidates = getRpcCandidates(chainId);
+  if (!rpcCandidates.length) throw new Error(`No RPC found for chain: ${chainId}`);
+
   const tx = {
     to, data: data || "0x", value: value || "0x0",
     gasLimit: gasLimit ? BigInt(gasLimit) : BigInt(500000),
   };
-  console.log(`[envkey/evm] sendTx chain=${chainId} to=${to}`);
-  const sent = await wallet.sendTransaction(tx);
-  console.log(`[envkey/evm] broadcast: ${sent.hash}`);
-  await sent.wait(1);
-  return sent.hash;
+
+  let lastErr = null;
+  for (const rpc of rpcCandidates) {
+    try {
+      const provider = new ethers.JsonRpcProvider(rpc);
+      const wallet = new ethers.Wallet(getEvmPrivateKey(), provider);
+      console.log(`[envkey/evm] sendTx chain=${chainId} rpc=${rpc} to=${to}`);
+      const sent = await wallet.sendTransaction(tx);
+      console.log(`[envkey/evm] broadcast: ${sent.hash}`);
+      await sent.wait(1);
+      return sent.hash;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[envkey/evm] RPC failed chain=${chainId} rpc=${rpc}: ${e.message}`);
+    }
+  }
+  throw lastErr || new Error(`All RPC candidates failed for chain ${chainId}`);
 }
 
 // legacy alias
