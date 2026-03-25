@@ -34,7 +34,18 @@ const garden = {
   getAssets:        ()            => client.get("/assets").then(r => r.data),
   getPolicy:        (from, to)    => client.get("/policy", { params: { from, to } }).then(r => r.data),
   getLiquidity:     (from, to)    => client.get("/liquidity", { params: { from, to } }).then(r => r.data),
-  getQuote:         (from, to, amt) => client.get("/quote", { params: { from, to, from_amount: amt } }).then(r => r.data),
+  getQuote: async (from, to, amt) => {
+    const params = { from, to, from_amount: amt };
+    try {
+      return await client.get("/v2/quote", { params }).then(r => r.data);
+    } catch (e) {
+      // Backward compatibility for older Garden deployments.
+      if (e?.status === 404 || String(e?.message || "").includes("404")) {
+        return client.get("/quote", { params }).then(r => r.data);
+      }
+      throw e;
+    }
+  },
   getOrder:         (id)          => client.get(`/orders/${id}`).then(r => r.data),
   getOrders:        (f = {})      => client.get("/orders", { params: f }).then(r => r.data),
   createOrder:      (body)        => client.post("/orders", body).then(r => r.data),

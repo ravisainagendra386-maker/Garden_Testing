@@ -2,36 +2,6 @@
 const fs = require("fs");
 const path = require("path");
 const garden = require("../api/garden");
-const { appendRuntimeLog } = require("../utils/runtimeLog");
-
-/** NDJSON mirror for session 92463b — write to `logs/` (reliable) and `.cursor/` (debug UI). */
-const DEBUG_LOG_PATHS_92463B = [
-  path.join(__dirname, "../../logs/debug-92463b.log"),
-  path.join(__dirname, "../../debug-92463b.log"),
-  path.join(__dirname, "../../.cursor/debug-92463b.log"),
-];
-function debugNdjson92463b(payload) {
-  const line = JSON.stringify(payload) + "\n";
-  for (const p of DEBUG_LOG_PATHS_92463B) {
-    try {
-      const dir = path.dirname(p);
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.appendFileSync(p, line, "utf8");
-    } catch (_) {}
-  }
-}
-function debugQuoteIngest92463b(payload) {
-  const body = { sessionId: "92463b", timestamp: Date.now(), ...payload };
-  debugNdjson92463b(body);
-  try {
-    appendRuntimeLog(body);
-  } catch (_) {}
-  fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "92463b" },
-    body: JSON.stringify(body),
-  }).catch(() => {});
-}
 
 const FREE_RPCS = {
   base:       'https://sepolia.base.org',
@@ -70,13 +40,36 @@ const { initiateEvm, redeemEvm } = require("../htlc/evm");
 const envkey = require("../wallet/envkey");
 const { initiateHtlc }           = require("../wallet/btc");
 const walletState = require("../wallet/state");
+const priceFeed = require("../agents/price-feed");
+const { appendRuntimeLog } = require("../utils/runtimeLog");
 const tradeHistory               = require("../agents/tradeHistory");
 const { RouteOptimizerAgent }    = require("../agents/routeOptimizerAgent");
+const fundingTree                = require("../utils/fundingTree");
+
+const DEBUG_LOG_PATH_92463B = path.join(__dirname, "../../debug-92463b.log");
+function appendDebug92463b(payload) {
+  try {
+    fs.appendFileSync(DEBUG_LOG_PATH_92463B, JSON.stringify(payload) + "\n", "utf8");
+  } catch (_) {}
+}
+
+const DEBUG_LOG_PATH_8856D6 = path.join(__dirname, "../../debug-8856d6.log");
+function appendDebug8856d6(payload) {
+  try { fs.appendFileSync(DEBUG_LOG_PATH_8856D6, JSON.stringify(payload) + "\n", "utf8"); } catch (_) {}
+}
 
 let _emit = null;
 let _approvalQueue = [];
 const _activeTests = new Map();
 let _globalAbort = false;
+/** True while `runAll` is in progress (including gaps between routes, e.g. long sleeps). Used to hydrate dashboard after reconnect. */
+let _suiteRunActive = false;
+let _suiteRunMeta = null;
+
+function getSuiteRunStatus() {
+  if (!_suiteRunActive || !_suiteRunMeta) return { suiteRunning: false };
+  return { suiteRunning: true, ..._suiteRunMeta };
+}
 let _requestSeq = 0;
 const _routeAgent = new RouteOptimizerAgent();
 let _routeAgentInitPromise = null;
@@ -93,6 +86,16 @@ async function ensureRouteAgentReady() {
 
 function setEmitter(fn) { _emit = fn; }
 function emit(event, data) {
+  // Mirror key runtime events for debug session 92463b.
+  // (Needed because UI socket events are otherwise hard to correlate with failures.)
+  try {
+    const keep = new Set(["suite_start", "suite_routes", "suite_info", "suite_end", "test_start", "test_step", "test_end", "error", "simulation_trace", "simulation_summary"]);
+    if (keep.has(event)) {
+      const payload = { sessionId: "92463b", runId: "exec", event, data, timestamp: Date.now() };
+      appendRuntimeLog(payload);
+      appendDebug92463b(payload);
+    }
+  } catch (_) {}
   if (_emit) _emit(event, data);
   else console.log(`[${event}]`, JSON.stringify(data).slice(0, 120));
 }
@@ -248,6 +251,361 @@ function isInsufficientLiquidityGardenError(err) {
   return false;
 }
 
+/** Same threshold as runRoute EVM native gas check (0.001 ETH-equivalent wei). */
+const MIN_NATIVE_WEI_FOR_GAS = 10n ** 15n;
+/** Rough minimum SOL for a few txs + rent buffer (lamports). */
+const MIN_SOL_LAMPORTS_FOR_FEES = 1_000_000n;
+/** Reserve sats on Bitcoin after the swap amount for network fee. */
+const MIN_BTC_FEE_SATS_RESERVE = 2_000n;
+
+/**
+ * Garden asset for paying chain fees (native / gas token) on this chain prefix.
+ */
+function findNativeFeeAssetOnChain(assets, chainPrefix) {
+  if (!Array.isArray(assets) || !chainPrefix) return null;
+  const pref = String(chainPrefix);
+  const onChain = assets.filter((a) => String(a.id).startsWith(`${pref}:`));
+  if (!onChain.length) return null;
+  const isAddrNative = (a) => {
+    const t = String(pickTokenAddress(a) || a.token_address || "").toLowerCase();
+    return !t || t === "native" || t === "0x0000000000000000000000000000000000000000";
+  };
+  let hit = onChain.find(isAddrNative);
+  if (hit) return hit;
+  const chainKey = pref.replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, "");
+  const sym = String(config.chains[chainKey]?.asset || "").toUpperCase();
+  if (sym) {
+    hit = onChain.find((a) => {
+      const tick = tickerFromMeta(a).toUpperCase();
+      return tick === sym || String(a.name || "").toUpperCase().includes(sym);
+    });
+  }
+  return hit || null;
+}
+
+function getSolanaNativeLamports(wallets) {
+  const raw = wallets?.solana?.balance;
+  if (raw == null || raw === "") return null;
+  const sol = parseFloat(String(raw));
+  if (!Number.isFinite(sol)) return null;
+  return BigInt(Math.max(0, Math.floor(sol * 1e9)));
+}
+
+async function readEvmNativeAndTokenBalance(fromMeta, fromAsset, fromAddress) {
+  const { ethers } = require("ethers");
+  const tokenAddr = pickTokenAddress(fromMeta);
+  const rawKey = fromAsset.split(":")[0];
+  const chainKey = rawKey.replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, "");
+  const chainConf = require("../config").chains;
+  const rpcUrl = chainConf[chainKey]?.rpc || FREE_RPCS[chainKey] || "";
+  if (!rpcUrl) throw new Error(`No RPC URL for chain key: ${chainKey}`);
+  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const weiGas = await provider.getBalance(fromAddress);
+  const gasWei = BigInt(weiGas.toString());
+  if (!tokenAddr || tokenAddr === "native" || tokenAddr === "0x0000000000000000000000000000000000000000") {
+    return { gasWei, tokenBalance: Number(weiGas), isNativeToken: true, chainKey };
+  }
+  const ERC20_ABI = [
+    "function balanceOf(address) view returns (uint256)",
+    "function decimals() view returns (uint8)",
+  ];
+  const token = new ethers.Contract(tokenAddr, ERC20_ABI, provider);
+  const bal = await token.balanceOf(fromAddress);
+  return { gasWei, tokenBalance: Number(bal), isNativeToken: false, chainKey };
+}
+
+/**
+ * allChains: same-chain swap into native fee asset when non-EVM native balance is low (not destination fallback).
+ * Execution uses the same runRoute path; chains without HTLC initiation in this runner may fail until implemented.
+ */
+async function maybeNonEvmAllChainsGasPrefundViaGarden(ctx) {
+  const {
+    fromChain,
+    fromAsset,
+    fromMeta,
+    amount,
+    label,
+    step,
+    checkAbort,
+  } = ctx;
+  const wallets = walletState.getStatus();
+  let assets = [];
+  try {
+    const g = await garden.getAssets();
+    assets = g.result || g.assets || g || [];
+  } catch (_) {
+    return { ok: false, error: "getAssets failed for gas prefund" };
+  }
+  const chainPrefix = String(fromAsset).split(":")[0];
+  const nativeMeta = findNativeFeeAssetOnChain(assets, chainPrefix);
+  if (!nativeMeta?.id) {
+    return { ok: true, skipped: true, reason: "no_native_meta" };
+  }
+  if (String(fromAsset) === String(nativeMeta.id)) {
+    return { ok: true, skipped: true, reason: "already_native" };
+  }
+
+  if (fromChain === "solana") {
+    const lamports = getSolanaNativeLamports(wallets);
+    if (lamports !== null && lamports >= MIN_SOL_LAMPORTS_FOR_FEES) {
+      return { ok: true, skipped: true, reason: "sol_fee_ok" };
+    }
+    if (lamports === 0n) {
+      return {
+        ok: false,
+        error: "Insufficient SOL for fees: 0 lamports — cannot prefund (need dust for tx fees)",
+      };
+    }
+  }
+
+  const minAmt = Math.max(1, parseInt(String(fromMeta?.min_amount ?? 50000), 10) || 50000);
+  const safeAmt = clampGardenQuoteAmount(amount, fromMeta);
+  let prefundAmt = Math.max(minAmt, Math.min(safeAmt, minAmt * 4));
+  prefundAmt = clampGardenQuoteAmount(prefundAmt, fromMeta);
+
+  let quoteRes;
+  try {
+    quoteRes = await garden.getQuote(fromAsset, nativeMeta.id, prefundAmt);
+  } catch (e) {
+    return {
+      ok: false,
+      error: `No Garden quote for gas prefund (${fromAsset} → ${nativeMeta.id}): ${e.message || e}`,
+    };
+  }
+  if (!quoteRes?.result?.length) {
+    return { ok: false, error: "Gas prefund quote returned empty" };
+  }
+
+  // #region agent log
+  fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+    body: JSON.stringify({
+      sessionId: "8d11f5",
+      runId: "gas-prefund",
+      hypothesisId: "H2",
+      location: "runner.js:maybeNonEvmAllChainsGasPrefundViaGarden:quote_ok",
+      message: "Non-EVM gas prefund quote OK",
+      data: { fromChain, fromAsset, toNative: nativeMeta.id, prefundAmt },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+
+  checkAbort();
+  step(
+    "Gas prefund",
+    "running",
+    `Swapping to native fee asset (${fromChain}, ${prefundAmt} atomic)…`
+  );
+  const prefundResult = await runRoute({
+    fromChain,
+    toChain: fromChain,
+    fromAsset,
+    toAsset: nativeMeta.id,
+    amount: prefundAmt,
+    label: `${label} [gas prefund ${fromChain}]`,
+    fromMeta,
+    toMeta: nativeMeta,
+    executionMode: "allChains",
+    skipGasPrefund: true,
+  });
+
+  if (prefundResult.status !== "pass") {
+    return {
+      ok: false,
+      error: `Gas prefund failed (${fromChain}): ${prefundResult.error || prefundResult.status}`,
+    };
+  }
+  step("Gas prefund", "pass", `Native fee asset topped up via Garden (${fromChain})`);
+  emit("suite_info", {
+    message: `Gas prefund completed before main hop: ${label} (${fromChain})`,
+  });
+  return { ok: true, didPrefund: true };
+}
+
+/**
+ * allChains: if source is not native fee token and native gas is below threshold, run a same-chain
+ * Garden swap into native first (gas-funding pre-swap — not destination liquidity fallback).
+ * EVM uses RPC balances; other chains use wallet/API checks where available.
+ */
+async function maybeAllChainsGasPrefundViaGarden({
+  executionMode,
+  skipGasPrefund,
+  fromChain,
+  fromAsset,
+  fromMeta,
+  fromAddress,
+  amount,
+  label,
+  testId,
+  step,
+  checkAbort,
+}) {
+  if (executionMode !== "allChains" || skipGasPrefund) {
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "gas-prefund",
+        hypothesisId: "H1",
+        location: "runner.js:maybeAllChainsGasPrefundViaGarden:skip_mode",
+        message: "Gas prefund skipped (mode or skip flag)",
+        data: { executionMode, skipGasPrefund: !!skipGasPrefund, fromChain },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+    return { ok: true, skipped: true };
+  }
+
+  if (fromChain === "evm") {
+  let evmRead;
+  try {
+    evmRead = await readEvmNativeAndTokenBalance(fromMeta, fromAsset, fromAddress);
+  } catch (e) {
+    return { ok: true, skipped: true, reason: "evm_read_failed", detail: String(e?.message || e) };
+  }
+  const { gasWei, isNativeToken, tokenBalance } = evmRead;
+  if (isNativeToken) return { ok: true, skipped: true, reason: "source_is_native" };
+  if (gasWei >= MIN_NATIVE_WEI_FOR_GAS) {
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "gas-prefund",
+        hypothesisId: "H3",
+        location: "runner.js:maybeAllChainsGasPrefundViaGarden:gas_ok",
+        message: "Native gas already sufficient",
+        data: { haveWei: gasWei.toString(), minWei: MIN_NATIVE_WEI_FOR_GAS.toString() },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+    return { ok: true, skipped: true, reason: "gas_sufficient" };
+  }
+  if (gasWei === 0n) {
+    return {
+      ok: false,
+      error:
+        "Insufficient native gas: 0 — cannot auto-prefund (need a non-zero balance for approvals / txs)",
+    };
+  }
+
+  let assets = [];
+  try {
+    const g = await garden.getAssets();
+    assets = g.result || g.assets || g || [];
+  } catch (_) {
+    return { ok: false, error: "getAssets failed for gas prefund" };
+  }
+  const chainPrefix = String(fromAsset).split(":")[0];
+  const nativeMeta = findNativeFeeAssetOnChain(assets, chainPrefix);
+  if (!nativeMeta?.id) {
+    return { ok: false, error: "Could not resolve native fee asset on chain for gas prefund" };
+  }
+  if (String(fromAsset) === String(nativeMeta.id)) {
+    return { ok: true, skipped: true, reason: "already_native_asset_id" };
+  }
+
+  const minAmt = Math.max(1, parseInt(String(fromMeta?.min_amount ?? 50000), 10) || 50000);
+  const safeAmt = clampGardenQuoteAmount(amount, fromMeta);
+  const tb = Number(tokenBalance || 0);
+  let prefundAmt = Math.max(minAmt, Math.min(safeAmt, Math.floor(tb / 4)));
+  prefundAmt = clampGardenQuoteAmount(prefundAmt, fromMeta);
+  if (prefundAmt < minAmt) {
+    return { ok: false, error: "Token balance too low for gas prefund swap" };
+  }
+
+  let quoteRes;
+  try {
+    quoteRes = await garden.getQuote(fromAsset, nativeMeta.id, prefundAmt);
+  } catch (e) {
+    return {
+      ok: false,
+      error: `No Garden quote for gas prefund (${fromAsset} → ${nativeMeta.id}): ${e.message || e}`,
+    };
+  }
+  if (!quoteRes?.result?.length) {
+    return { ok: false, error: "Gas prefund quote returned empty" };
+  }
+
+  // #region agent log
+  fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+    body: JSON.stringify({
+      sessionId: "8d11f5",
+      runId: "gas-prefund",
+      hypothesisId: "H4",
+      location: "runner.js:maybeAllChainsGasPrefundViaGarden:quote_ok",
+      message: "Gas prefund quote OK; executing nested runRoute",
+      data: {
+        fromAsset,
+        toNative: nativeMeta.id,
+        prefundAmt,
+        gasWeiBefore: gasWei.toString(),
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+
+  checkAbort();
+  step("Gas prefund", "running", `Swapping to native for gas (${prefundAmt} atomic)…`);
+  const prefundResult = await runRoute({
+    fromChain,
+    toChain: fromChain,
+    fromAsset,
+    toAsset: nativeMeta.id,
+    amount: prefundAmt,
+    label: `${label} [gas prefund]`,
+    fromMeta,
+    toMeta: nativeMeta,
+    executionMode: "allChains",
+    skipGasPrefund: true,
+  });
+
+  if (prefundResult.status !== "pass") {
+    return {
+      ok: false,
+      error: `Gas prefund failed: ${prefundResult.error || prefundResult.status}`,
+    };
+  }
+  step("Gas prefund", "pass", "Native gas topped up via Garden (same-chain swap)");
+  emit("suite_info", { message: `Gas prefund completed before main hop: ${label}` });
+  return { ok: true, didPrefund: true };
+  }
+
+  if (
+    fromChain === "solana" ||
+    fromChain === "bitcoin" ||
+    fromChain === "starknet" ||
+    fromChain === "sui" ||
+    fromChain === "tron"
+  ) {
+    return maybeNonEvmAllChainsGasPrefundViaGarden({
+      executionMode,
+      skipGasPrefund,
+      fromChain,
+      fromAsset,
+      fromMeta,
+      fromAddress,
+      amount,
+      label,
+      testId,
+      step,
+      checkAbort,
+    });
+  }
+
+  return { ok: true, skipped: true, reason: "gas_prefund_not_supported_chain" };
+}
+
 /**
  * If the primary destination has no quote liquidity, try other assets on the same chain
  * (same id prefix / wallet type, Garden-supported plausible pairs).
@@ -277,22 +635,6 @@ async function getQuoteWithDestinationFallback({
       return res;
     }
 
-    // #region agent log
-    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "92463b" },
-      body: JSON.stringify({
-        sessionId: "92463b",
-        runId: "post-fix",
-        hypothesisId: "H6",
-        location: "src/tests/runner.js:getQuoteWithDestinationFallback:tryAmt",
-        message: "Quote pass: amount + primary dest",
-        data: { tryAmt, minAmt, fromAsset, toAsset },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
-
     try {
       const res = await attemptQuote(toAsset);
       if (res) {
@@ -300,6 +642,9 @@ async function getQuoteWithDestinationFallback({
       }
     } catch (e) {
       lastErr = e;
+      // #region agent log
+      fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'preflight',hypothesisId:'H1',location:'src/tests/runner.js:getQuoteWithDestinationFallback:primary_fail',message:'Primary quote failed',data:{fromAsset,toAsset,amt,error:String(e?.message||e)},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
       if (!allowFallback || !isInsufficientLiquidityGardenError(e)) throw e;
     }
 
@@ -327,17 +672,7 @@ async function getQuoteWithDestinationFallback({
     candidates.sort((x, y) => String(x.id).localeCompare(String(y.id)));
 
     // #region agent log
-    debugQuoteIngest92463b({
-      runId: "post-fix",
-      hypothesisId: "H7",
-      location: "src/tests/runner.js:getQuoteWithDestinationFallback:candidates",
-      message: "Same-chain destination fallback candidates",
-      data: {
-        tryAmt,
-        candidateCount: candidates.length,
-        candidateIds: candidates.map((x) => x.id).slice(0, 20),
-      },
-    });
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'preflight',hypothesisId:'H1',location:'src/tests/runner.js:getQuoteWithDestinationFallback:candidate_scan',message:'Scanning same-chain destination candidates',data:{fromAsset,toAsset,amt,chainPrefix,toChain,candidateCount:candidates.length},timestamp:Date.now()})}).catch(()=>{});
     // #endregion
 
     for (const a of candidates) {
@@ -345,6 +680,9 @@ async function getQuoteWithDestinationFallback({
       try {
         const res = await attemptQuote(a.id);
         if (res) {
+          // #region agent log
+          fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'preflight',hypothesisId:'H1',location:'src/tests/runner.js:getQuoteWithDestinationFallback:swapped_destination',message:'Destination asset switched due to liquidity',data:{fromAsset,originalToAsset:toAsset,swappedToAsset:String(a.id),amt},timestamp:Date.now()})}).catch(()=>{});
+          // #endregion
           return { quoteRes: res, toAsset: a.id, toMeta: a, swappedDestination: true, usedFromAmount: amt };
         }
       } catch (e) {
@@ -360,43 +698,28 @@ async function getQuoteWithDestinationFallback({
     try {
       return await tryQuotesAtAmount(tryAmt);
     } catch (e) {
-      const treatAsLiquidity = isInsufficientLiquidityGardenError(e);
-      // #region agent log
-      debugQuoteIngest92463b({
-        runId: "post-fix",
-        hypothesisId: "H9",
-        location: "src/tests/runner.js:getQuoteWithDestinationFallback:outerCatch",
-        message: "tryQuotesAtAmount exit",
-        data: {
-          tryAmt,
-          minAmt,
-          fromAsset,
-          toAsset,
-          treatAsLiquidity,
-          errSnippet: String(e?.message || e).slice(0, 280),
-        },
-      });
-      // #endregion
-      if (!treatAsLiquidity) throw e;
+      if (!isInsufficientLiquidityGardenError(e)) throw e;
       if (tryAmt <= minAmt) throw e;
       const next = Math.max(minAmt, Math.floor(tryAmt / 2));
       if (next >= tryAmt) throw e;
-      // #region agent log
-      debugQuoteIngest92463b({
-        runId: "post-fix",
-        hypothesisId: "H8",
-        location: "src/tests/runner.js:getQuoteWithDestinationFallback:reduce",
-        message: "Liquidity miss — reducing from_amount",
-        data: { fromTry: tryAmt, nextTry: next, minAmt, fromAsset, toAsset },
-      });
-      // #endregion
       tryAmt = next;
     }
   }
 }
 
 // ── SINGLE ROUTE TEST ─────────────────────────────────────────
-async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label, fromMeta, toMeta }) {
+async function runRoute({
+  fromChain,
+  toChain,
+  fromAsset,
+  toAsset,
+  amount,
+  label,
+  fromMeta,
+  toMeta,
+  executionMode = "allTests",
+  skipGasPrefund = false,
+}) {
   const testId = `${fromAsset}->${toAsset}-${Date.now()}`;
   const ctrl   = { abort: false };
   _activeTests.set(testId, ctrl);
@@ -449,6 +772,27 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     await garden.health();
     step("Health Check", "pass", "API is live");
 
+    const prefundRes = await maybeAllChainsGasPrefundViaGarden({
+      executionMode,
+      skipGasPrefund,
+      fromChain,
+      fromAsset,
+      fromMeta,
+      fromAddress,
+      amount,
+      label,
+      testId,
+      step,
+      checkAbort,
+    });
+    if (!prefundRes.ok) {
+      const msg = prefundRes.error || "Gas prefund failed";
+      step("Gas prefund", "fail", msg);
+      emit("test_end", { testId, label, status: "skipped", error: msg });
+      _activeTests.delete(testId);
+      return { testId, label, status: "skipped", error: msg };
+    }
+
     // 3. Amount (policy max can be far below wallet balance)
     const rawRequested = Number(amount) || 50000;
     const safeAmount = clampGardenQuoteAmount(amount, fromMeta);
@@ -459,15 +803,6 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     // 4. Quote (try alternate destination assets on same chain if primary has no liquidity)
     step("Get Quote", "running");
     checkAbort();
-    // #region agent log
-    debugQuoteIngest92463b({
-      runId: "post-fix",
-      hypothesisId: "H0",
-      location: "src/tests/runner.js:runRoute:beforeQuote",
-      message: "Reached Get Quote step",
-      data: { testId, fromAsset, toAsset: swapDestAsset, safeAmount },
-    });
-    // #endregion
     let quoteRes;
     let quoteSwitchedDest = false;
     let execAmount = safeAmount;
@@ -560,6 +895,13 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
     checkAbort();
     try {
       const wallets = walletState.getStatus();
+      let feeCheckAssets = [];
+      if (["solana", "starknet", "sui", "tron"].includes(fromChain)) {
+        try {
+          const g = await garden.getAssets();
+          feeCheckAssets = g.result || g.assets || g || [];
+        } catch (_) {}
+      }
       let balance = null;
       let balanceLabel = "";
       let gasBalanceWei = null;
@@ -629,11 +971,83 @@ async function runRoute({ fromChain, toChain, fromAsset, toAsset, amount, label,
         return { testId, label, status: "skipped", error: msg };
       }
 
+      if (fromChain === "bitcoin" && balance !== null) {
+        const rem = BigInt(balance) - BigInt(Math.floor(execAmount));
+        if (rem < MIN_BTC_FEE_SATS_RESERVE) {
+          const msg = `Insufficient sats left for BTC network fee after swap: ${rem} remaining, need ≥ ${MIN_BTC_FEE_SATS_RESERVE} sats reserve`;
+          step("Balance Check", "fail", msg);
+          emit("test_end", { testId, label, status: "skipped", error: msg });
+          _activeTests.delete(testId);
+          return { testId, label, status: "skipped", error: msg };
+        }
+      }
+
+      if (fromChain === "solana" && feeCheckAssets.length) {
+        const chainPrefix = String(fromAsset).split(":")[0];
+        const nativeMeta = findNativeFeeAssetOnChain(feeCheckAssets, chainPrefix);
+        if (nativeMeta && String(fromAsset) !== String(nativeMeta.id)) {
+          const lamports = getSolanaNativeLamports(wallets);
+          if (lamports !== null && lamports < MIN_SOL_LAMPORTS_FOR_FEES) {
+            const msg = `Insufficient native SOL for fees: ~${lamports} lamports, need at least ${MIN_SOL_LAMPORTS_FOR_FEES}`;
+            // #region agent log
+            fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+              body: JSON.stringify({
+                sessionId: "8d11f5",
+                runId: "native-fee",
+                hypothesisId: "H5",
+                location: "runner.js:runRoute:solana_fee_check",
+                message: "Solana native SOL fee check failed",
+                data: { fromAsset, lamports: lamports.toString(), min: MIN_SOL_LAMPORTS_FOR_FEES.toString() },
+                timestamp: Date.now(),
+              }),
+            }).catch(() => {});
+            // #endregion
+            step("Balance Check", "fail", msg);
+            emit("test_end", { testId, label, status: "skipped", error: msg });
+            _activeTests.delete(testId);
+            return { testId, label, status: "skipped", error: msg };
+          }
+        }
+      }
+
+      if (["starknet", "sui", "tron"].includes(fromChain) && feeCheckAssets.length) {
+        const chainPrefix = String(fromAsset).split(":")[0];
+        const nativeMeta = findNativeFeeAssetOnChain(feeCheckAssets, chainPrefix);
+        if (nativeMeta && String(fromAsset) !== String(nativeMeta.id)) {
+          const nm = String(nativeMeta.name || nativeMeta.id || "native fee asset");
+          step(
+            "Native fee check",
+            "pass",
+            `${fromChain}: non-native source — ensure ${nm} for network fees (balance not read in this runner)`,
+          );
+          // #region agent log
+          fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+            body: JSON.stringify({
+              sessionId: "8d11f5",
+              runId: "native-fee",
+              hypothesisId: "H6",
+              location: "runner.js:runRoute:non_evm_fee_warn",
+              message: "Non-EVM non-native fee reminder",
+              data: { fromChain, fromAsset, nativeFeeAsset: nativeMeta.id },
+              timestamp: Date.now(),
+            }),
+          }).catch(() => {});
+          // #endregion
+        }
+      }
+
       if (fromChain === "evm" && gasBalanceWei !== null) {
-        const MIN_NATIVE_WEI = 10n ** 15n;
+        const MIN_NATIVE_WEI = MIN_NATIVE_WEI_FOR_GAS;
         if (gasBalanceWei < MIN_NATIVE_WEI) {
           const nativeAmt = Number(gasBalanceWei) / 1e18;
           const msg = `Insufficient native gas: have ${nativeAmt.toFixed(6)} ${gasSymbol}, require at least ${(Number(MIN_NATIVE_WEI)/1e18).toFixed(6)} ${gasSymbol}`;
+          // #region agent log
+          fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'run',hypothesisId:'H3',location:'src/tests/runner.js:runRoute:insufficient_native_gas',message:'Native gas check failed during runRoute',data:{label,fromAsset,chainKey:String(fromAsset||'').split(':')[0],gasSymbol,haveWei:gasBalanceWei.toString(),minWei:MIN_NATIVE_WEI.toString()},timestamp:Date.now()})}).catch(()=>{});
+          // #endregion
           step("Balance Check", "fail", msg);
           emit("test_end", { testId, label, status: "skipped", error: msg });
           _activeTests.delete(testId);
@@ -1330,36 +1744,13 @@ async function buildRoutes(amountOverrides = {}, mode = "allTests") {
     return wt && connectedTypes.has(wt);
   });
 
-  const routes = [];
-  for (const from of supported) {
-    for (const to of supported) {
-      if (from.id === to.id) continue;
-      if (!isPairPlausible(from, to)) continue;
-      const overrideAmt = amountOverrides[from.id];
-      const rawChosen = overrideAmt !== undefined
-        ? parseInt(overrideAmt, 10)
-        : parseInt(from.min_amount || 50000, 10);
-      const chosenAmount = clampGardenQuoteAmount(rawChosen, from);
-      routes.push({
-        fromAsset: from.id,
-        toAsset:   to.id,
-        fromChain: getWalletTypeForAsset(from),
-        toChain:   getWalletTypeForAsset(to),
-        amount:    chosenAmount,
-        fromMeta:  from,
-        toMeta:    to,
-        label:     `${from.name} → ${to.name}`,
-      });
-    }
-  }
-
-  // Gather balances for chain-reaction planning
+  // Gather balances early so default route amounts can use them.
   const balanceMap = new Map();
   const gasMap = new Map();
   try {
     const cached = wallets.evm?.tokenBalances || {};
     for (const [assetId, bal] of Object.entries(cached)) {
-      balanceMap.set(assetId, Number(bal));
+      balanceMap.set(assetId, bal);
     }
     if (wallets.btc?.balance && wallets.btc.balance !== 'unknown') {
       const sats = Math.floor(parseFloat(wallets.btc.balance) * 1e8);
@@ -1394,6 +1785,60 @@ async function buildRoutes(amountOverrides = {}, mode = "allTests") {
     }
   } catch (_) {}
 
+  const routes = [];
+  let _debugBufferedMinLogCount = 0;
+  const _debugBufferedMinLoggedAssets = new Set();
+  for (const from of supported) {
+    for (const to of supported) {
+      if (from.id === to.id) continue;
+      if (!isPairPlausible(from, to)) continue;
+      const overrideAmt = amountOverrides[from.id];
+      const minAmtAtomic = parseInt(from.min_amount || 50000, 10);
+
+      let rawChosen = 0;
+      let _bufferPick = null;
+      if (overrideAmt !== undefined) {
+        rawChosen = parseInt(overrideAmt, 10);
+      } else {
+        const fromChain = getWalletTypeForAsset(from);
+        const balAtomicBig = balanceMap.has(from.id) ? toBigIntAtomic(balanceMap.get(from.id)) : null;
+        _bufferPick = pickBufferedMinTradeAmountAtomic({
+          minTradeAtomicBig: BigInt(Math.max(1, minAmtAtomic)),
+          balanceAtomicBig: balAtomicBig,
+        });
+        rawChosen = Number(_bufferPick.chosen);
+      }
+
+      const chosenAmount = clampGardenQuoteAmount(rawChosen, from);
+
+      if (
+        overrideAmt === undefined &&
+        _bufferPick &&
+        _debugBufferedMinLogCount < 20 &&
+        !_debugBufferedMinLoggedAssets.has(from.id)
+      ) {
+        _debugBufferedMinLoggedAssets.add(from.id);
+        _debugBufferedMinLogCount += 1;
+        // #region agent log
+        const _p = {sessionId:'8856d6',runId:'pre-fix',hypothesisId:'H1',location:'src/tests/runner.js:buildRoutes:bufferedMinTradePick',message:'Picked default route amount (buffered min trade rules)',data:{fromAsset:from.id,fromName:from.name||null,fromChain:getWalletTypeForAsset(from),minAmtAtomic,_bufferPick:{reason:_bufferPick.reason,balA:_bufferPick.balA?String(_bufferPick.balA):null,minA:String(_bufferPick.minA),feeThresh:_bufferPick.feeThresh?String(_bufferPick.feeThresh):null,bufThresh:_bufferPick.bufThresh?String(_bufferPick.bufThresh):null,chosen:String(_bufferPick.chosen)},rawChosen,chosenAmount,clampedChanged:chosenAmount!==rawChosen,policyMin:from.min_amount??null,policyMax:from.max_amount??null},timestamp:Date.now()};
+        appendDebug8856d6(_p);
+        fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8856d6'},body:JSON.stringify(_p)}).catch(()=>{});
+        // #endregion
+      }
+      routes.push({
+        fromAsset: from.id,
+        toAsset:   to.id,
+        fromChain: getWalletTypeForAsset(from),
+        toChain:   getWalletTypeForAsset(to),
+        amount:    chosenAmount,
+        fromMeta:  from,
+        toMeta:    to,
+        label:     `${from.name} → ${to.name}`,
+        executionMode: mode,
+      });
+    }
+  }
+
  
   // Chain-reaction optimizer
   try {
@@ -1420,9 +1865,374 @@ async function buildRoutes(amountOverrides = {}, mode = "allTests") {
   }
 }
 
+function toBigIntAtomic(value) {
+  if (typeof value === "bigint") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return BigInt(Math.max(0, Math.floor(value)));
+  if (typeof value === "string") {
+    const clean = value.trim();
+    if (!clean) return 0n;
+    const intPart = clean.includes(".") ? clean.split(".")[0] : clean;
+    try { return BigInt(intPart || "0"); } catch (_) { return 0n; }
+  }
+  return 0n;
+}
+
+function tickerFromMeta(meta) {
+  const idSuffix = String(meta?.id || "").split(":")[1] || "";
+  return String(meta?.asset || meta?.ticker || idSuffix || "").toLowerCase();
+}
+
+function getQuoteAmountAtomic(bestQuote, side, fallbackAmount) {
+  const source = bestQuote?.source || {};
+  const destination = bestQuote?.destination || {};
+  const candidates = side === "from"
+    ? [source.amount, bestQuote?.fromAmount, bestQuote?.from_amount, fallbackAmount]
+    : [destination.amount, bestQuote?.toAmount, bestQuote?.to_amount, bestQuote?.output_amount, fallbackAmount];
+  for (const c of candidates) {
+    const asBig = toBigIntAtomic(c);
+    if (asBig > 0n) return asBig;
+  }
+  return 0n;
+}
+
+function getWalletAssetAtomicBalance(route) {
+  const wallets = walletState.getStatus();
+  if (route.fromChain === "bitcoin") {
+    const rawBal = wallets.btc?.balance;
+    if (rawBal && rawBal !== "unknown") return BigInt(Math.max(0, Math.floor(parseFloat(rawBal) * 1e8)));
+    return null;
+  }
+  if (route.fromChain === "evm") {
+    const cached = wallets.evm?.tokenBalances || {};
+    if (cached[route.fromAsset] !== undefined) return toBigIntAtomic(cached[route.fromAsset]);
+  }
+  return null;
+}
+
+function mulRatioCeilBigInt(value, numerator, denominator) {
+  const v = toBigIntAtomic(value);
+  return (v * BigInt(numerator) + BigInt(denominator - 1)) / BigInt(denominator);
+}
+
+function mulBpsCeilBigInt(valueAtomicBig, bps) {
+  const v = toBigIntAtomic(valueAtomicBig);
+  const denom = 10000n;
+  const numer = denom + BigInt(bps);
+  return (v * numer + (denom - 1n)) / denom;
+}
+
+function pickBufferedMinTradeAmountAtomic({
+  minTradeAtomicBig,
+  balanceAtomicBig,
+  feeBps = 30,   // 0.3%
+  bufferBps = 50 // 0.5%
+}) {
+  const minA = toBigIntAtomic(minTradeAtomicBig);
+  const balA = balanceAtomicBig === null ? null : toBigIntAtomic(balanceAtomicBig);
+  if (balA === null) {
+    return { chosen: minA, reason: "balance_unknown", minA, feeThresh: null, bufThresh: null, balA: null };
+  }
+
+  const feeThresh = mulBpsCeilBigInt(minA, feeBps);     // min + 0.3%
+  const bufThresh = mulBpsCeilBigInt(minA, bufferBps);  // min + 0.5%
+
+  if (balA >= bufThresh) return { chosen: bufThresh, reason: "min_plus_buffer", minA, feeThresh, bufThresh, balA };
+  if (balA > feeThresh)  return { chosen: balA,       reason: "use_max_balance", minA, feeThresh, bufThresh, balA };
+  return { chosen: minA, reason: "use_min_trade", minA, feeThresh, bufThresh, balA };
+}
+
+async function simulateSingleHop({
+  fromAsset,
+  fromMeta,
+  toAsset,
+  toMeta,
+  toChain,
+  inputAtomicBig,
+}) {
+  const inputAmount = Number(inputAtomicBig);
+  const safeAmount = clampGardenQuoteAmount(inputAmount, fromMeta);
+  const resolved = await getQuoteWithDestinationFallback({
+    fromAsset,
+    toAsset,
+    toMeta,
+    toChain,
+    fromMeta,
+    safeAmount,
+  });
+  const quotes = resolved.quoteRes?.result || [];
+  if (!quotes.length) throw new Error("No quote returned in simulation");
+  const best = quotes[0];
+  const fromAmt = getQuoteAmountAtomic(best, "from", safeAmount);
+  const toAmt = getQuoteAmountAtomic(best, "to", 0);
+  const feeValue = best?.fee ?? best?.fees ?? best?.fixed_fee ?? null;
+  return {
+    fromAmountAtomic: fromAmt,
+    toAmountAtomic: toAmt,
+    destinationAsset: resolved.toAsset,
+    destinationMeta: resolved.toMeta,
+    swappedDestination: resolved.swappedDestination,
+    fee: feeValue,
+    best,
+  };
+}
+
+async function simulateRouteFlow(flowRoutes, flowId) {
+  if (!flowRoutes.length) return { ok: true, flowId, requiredStartAtomic: "0", requiredStartBufferedAtomic: "0", hops: [] };
+  await priceFeed.fetchPrices().catch(() => {});
+
+  const first = flowRoutes[0];
+  let startBalance = getWalletAssetAtomicBalance(first);
+  if (startBalance === null) {
+    return { ok: false, flowId, reason: "balance_unknown", error: `Balance unknown for ${first.fromAsset}` };
+  }
+
+  let effectiveFromAsset = first.fromAsset;
+  let effectiveFromMeta = first.fromMeta;
+  let currentAtomic = startBalance;
+  const hops = [];
+
+  for (let i = 0; i < flowRoutes.length; i++) {
+    const route = flowRoutes[i];
+    const toAsset = route.toAsset;
+    const toMeta = route.toMeta;
+    const toChain = route.toChain;
+
+    const fromTicker = tickerFromMeta(effectiveFromMeta);
+    const toTickerPreview = tickerFromMeta(toMeta);
+
+    const minTradeAtomic = toBigIntAtomic(effectiveFromMeta?.min_amount || 50000);
+    const currentUsd = priceFeed.atomicToUsd(Number(currentAtomic), fromTicker);
+    const minTradeUsd = priceFeed.atomicToUsd(Number(minTradeAtomic), fromTicker);
+
+    if (!Number.isFinite(currentUsd) || currentUsd <= 0 || currentUsd < minTradeUsd) {
+      appendRuntimeLog({
+        sessionId: "92463b",
+        runId: "simulation-preflight",
+        hypothesisId: "SIM1",
+        location: "simulateRouteFlow:insufficient_balance_usd",
+        message: "Simulation hop failed minTrade USD check",
+        data: {
+          flowId,
+          hopIndex: i + 1,
+          effectiveFromAsset,
+          toAsset,
+          inputAtomic: currentAtomic.toString(),
+          currentUsd,
+          minTradeAtomic: minTradeAtomic.toString(),
+          minTradeUsd,
+          toTickerPreview,
+        },
+        timestamp: Date.now(),
+      });
+      return {
+        ok: false,
+        flowId,
+        reason: "insufficient_balance_usd",
+        error: `Hop ${i + 1}: current USD ${currentUsd.toFixed(4)} < minTrade USD ${minTradeUsd.toFixed(4)}`,
+        hops,
+      };
+    }
+
+    const hop = await simulateSingleHop({
+      fromAsset: effectiveFromAsset,
+      fromMeta: effectiveFromMeta,
+      toAsset,
+      toMeta,
+      toChain,
+      inputAtomicBig: currentAtomic,
+    });
+
+    if (hop.toAmountAtomic <= 0n) {
+      appendRuntimeLog({
+        sessionId: "92463b",
+        runId: "simulation-preflight",
+        hypothesisId: "SIM2",
+        location: "simulateRouteFlow:quote_zero_toAmount",
+        message: "Simulation hop failed: toAmount is zero",
+        data: { flowId, hopIndex: i + 1, effectiveFromAsset, toAsset, inputAtomic: currentAtomic.toString() },
+        timestamp: Date.now(),
+      });
+      return { ok: false, flowId, reason: "quote_zero_toAmount", error: `Hop ${i + 1}: toAmount is zero`, hops };
+    }
+
+    const actualToMeta = hop.destinationMeta || toMeta;
+    const actualToTicker = tickerFromMeta(actualToMeta);
+    const fromUsd = priceFeed.atomicToUsd(Number(hop.fromAmountAtomic), fromTicker);
+    const toUsd = priceFeed.atomicToUsd(Number(hop.toAmountAtomic), actualToTicker);
+
+    // Rough sanity check for extreme drops in USD value.
+    if (
+      Number.isFinite(fromUsd) &&
+      fromUsd > 0 &&
+      Number.isFinite(toUsd) &&
+      toUsd > 0 &&
+      toUsd < fromUsd * 0.4
+    ) {
+      appendRuntimeLog({
+        sessionId: "92463b",
+        runId: "simulation-preflight",
+        hypothesisId: "SIM3",
+        location: "simulateRouteFlow:abnormal_value_drop",
+        message: "Simulation hop failed: abnormal value drop",
+        data: {
+          flowId,
+          hopIndex: i + 1,
+          effectiveFromAsset,
+          toAsset: hop.destinationAsset,
+          usdBefore: fromUsd,
+          usdAfter: toUsd,
+        },
+        timestamp: Date.now(),
+      });
+      return {
+        ok: false,
+        flowId,
+        reason: "abnormal_value_drop",
+        error: `Hop ${i + 1}: abnormal value drop ${fromUsd.toFixed(4)} -> ${toUsd.toFixed(4)} USD`,
+        hops,
+      };
+    }
+
+    hops.push({
+      hop: i + 1,
+      fromAsset: effectiveFromAsset,
+      toAsset: hop.destinationAsset || toAsset,
+      inputAmountAtomic: hop.fromAmountAtomic.toString(),
+      outputAmountAtomic: hop.toAmountAtomic.toString(),
+      fee: hop.fee,
+      usdBefore: Number.isFinite(fromUsd) ? fromUsd : null,
+      usdAfter: Number.isFinite(toUsd) ? toUsd : null,
+      minTradeUsd: Number.isFinite(minTradeUsd) ? minTradeUsd : null,
+      swappedDestination: !!hop.swappedDestination,
+    });
+
+    // Apply the same semantics as execution: next hop spends the actual asset received here.
+    effectiveFromAsset = hop.destinationAsset || toAsset;
+    effectiveFromMeta = actualToMeta;
+    currentAtomic = hop.toAmountAtomic;
+  }
+
+  appendRuntimeLog({
+    sessionId: "92463b",
+    runId: "simulation-preflight",
+    hypothesisId: "SIM_OK",
+    location: "simulateRouteFlow:success",
+    message: "Simulation flow succeeded",
+    data: { flowId, startAsset: first.fromAsset, startBalanceAtomic: startBalance.toString(), hops },
+    timestamp: Date.now(),
+  });
+
+  const buffered = mulRatioCeilBigInt(startBalance, 105, 100);
+  return {
+    ok: true,
+    flowId,
+    startAsset: first.fromAsset,
+    startBalanceAtomic: startBalance.toString(),
+    requiredStartAtomic: buffered.toString(),
+    requiredStartBufferedAtomic: buffered.toString(),
+    hops,
+  };
+}
+
+async function simulateFlowsForRoutes(routes, mode = "allTests", opts = {}) {
+  const bySeed = new Map();
+  const standalone = [];
+  for (const route of routes || []) {
+    if (route._chainStart) {
+      if (!bySeed.has(route._chainStart)) bySeed.set(route._chainStart, []);
+      bySeed.get(route._chainStart).push(route);
+    } else {
+      standalone.push(route);
+    }
+  }
+  const simulationFlows = [];
+  for (const [seed, chainRoutes] of bySeed.entries()) {
+    simulationFlows.push({ id: `seed:${seed}`, routes: chainRoutes });
+  }
+  for (let i = 0; i < standalone.length; i++) {
+    simulationFlows.push({ id: `standalone:${i + 1}`, routes: [standalone[i]] });
+  }
+  const maxFlows = Number(opts.maxFlows || 0);
+  const bounded = maxFlows > 0 ? simulationFlows.slice(0, maxFlows) : simulationFlows;
+  const simulationResults = [];
+  for (const flow of bounded) {
+    try {
+      const res = await simulateRouteFlow(flow.routes, flow.id);
+      simulationResults.push(res);
+      if (!opts.silent) emit("simulation_trace", res);
+    } catch (e) {
+      const msg = e?.message || String(e);
+      const isLiq = isInsufficientLiquidityGardenError({ message: msg });
+      const first = flow.routes?.[0] || {};
+      const fail = {
+        ok: false,
+        flowId: flow.id,
+        reason: isLiq ? "insufficient_liquidity" : "simulation_exception",
+        error: msg,
+        skippable: isLiq && String(flow.id || "").startsWith("standalone:"),
+        routeHint: { fromAsset: first.fromAsset || null, toAsset: first.toAsset || null, label: first.label || null },
+      };
+      simulationResults.push(fail);
+      if (!opts.silent) emit("simulation_trace", fail);
+      // #region agent log
+      fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'preflight',hypothesisId:'H4',location:'src/tests/runner.js:simulateFlowsForRoutes:flow_fail',message:'Simulation flow failed',data:{mode,flowId:flow.id,reason:fail.reason,skippable:!!fail.skippable,fromAsset:fail.routeHint.fromAsset,toAsset:fail.routeHint.toAsset,label:fail.routeHint.label,error:msg},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+    }
+  }
+  // #region agent log
+  const skipped = simulationResults.filter((x) => x && x.ok === false && x.skippable);
+  const firstFail = simulationResults.find((x) => x && x.ok === false && !x.skippable) || null;
+  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'preflight',hypothesisId:'H2',location:'src/tests/runner.js:simulateFlowsForRoutes:summary',message:'Preflight simulation summary',data:{mode,totalFlows:bounded.length,passed:simulationResults.filter((x)=>x.ok).length,failed:simulationResults.filter((x)=>!x.ok).length,firstFailed:firstFail?{flowId:firstFail.flowId,reason:firstFail.reason,error:firstFail.error}:null},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
+  const simulationFailed = firstFail;
+  const summary = {
+    mode,
+    totalFlows: bounded.length,
+    passedFlows: simulationResults.filter((x) => x.ok).length,
+    failedFlows: simulationResults.filter((x) => !x.ok).length,
+    skippedFlows: skipped.map((x) => ({ flowId: x.flowId, reason: x.reason, error: x.error, routeHint: x.routeHint })),
+    skippedFlowIds: skipped.map((x) => x.flowId),
+    requiredStartByFlow: simulationResults
+      .filter((x) => x.ok)
+      .map((x) => ({ flowId: x.flowId, startAsset: x.startAsset, requiredStartBufferedAtomic: x.requiredStartBufferedAtomic })),
+    ok: !simulationFailed,
+    failedFlow: simulationFailed
+      ? { flowId: simulationFailed.flowId, reason: simulationFailed.reason, error: simulationFailed.error || null }
+      : null,
+  };
+  if (!opts.silent) emit("simulation_summary", summary);
+  return summary;
+}
+
+async function simulateExecutionPreflight(amountOverrides = {}, mode = "allTests", opts = {}) {
+  // #region agent log
+  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'preflight',hypothesisId:'H2',location:'src/tests/runner.js:simulateExecutionPreflight:entry',message:'simulateExecutionPreflight called',data:{mode,maxFlows:Number(opts?.maxFlows||0),silent:!!opts?.silent,overrideKeys:Object.keys(amountOverrides||{}).length},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion
+  const routes = await buildRoutes(amountOverrides, mode);
+  return simulateFlowsForRoutes(routes, mode, opts);
+}
+
+/**
+ * allChains: run exactly one beam (one seed chain), e.g. S1 → X → Y → Z → P → Q.
+ * Prefer the longest hop list; tie-break by seed id. Other starting assets (S2…) belong to another run.
+ */
+function pickSingleBeamMapForAllChains(bySeed) {
+  if (!bySeed || bySeed.size <= 1) return bySeed;
+  const entries = [...bySeed.entries()].sort((a, b) => {
+    const dl = b[1].length - a[1].length;
+    if (dl !== 0) return dl;
+    return String(a[0]).localeCompare(String(b[0]));
+  });
+  return new Map([[entries[0][0], entries[0][1]]]);
+}
+
 // ── RUN ALL — PARALLEL CHAIN-REACTION EXECUTION ──────────────
 async function runAll(amountOverrides = {}, mode = "allTests") {
-  emit("suite_start", { env: config.env, mode, ts: new Date().toISOString() });
+  const ts = new Date().toISOString();
+  emit("suite_start", { env: config.env, mode, ts });
+  _suiteRunActive = true;
+  _suiteRunMeta = { env: config.env, mode, startedAt: ts };
+  try {
   await runApiTests();
   const routes = await buildRoutes(amountOverrides, mode);
   const results = [];
@@ -1453,6 +2263,56 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
     }
   }
 
+  const seedsToRun =
+    mode === "allChains" ? pickSingleBeamMapForAllChains(bySeed) : bySeed;
+  if (mode === "allChains" && bySeed.size > 1) {
+    const kept = [...seedsToRun.keys()][0];
+    const hops = seedsToRun.get(kept)?.length || 0;
+    emit("suite_info", {
+      message:
+        `allChains: single beam — seed ${kept} (${hops} hop${hops === 1 ? "" : "s"}); ` +
+        `${bySeed.size - 1} other seed(s) skipped (use another run for a different starting asset).`,
+    });
+  }
+
+  const simSummary = await simulateFlowsForRoutes(routes, mode, { allowLiquiditySkips: true });
+  if (!simSummary.ok) {
+    emit("suite_end", {
+      env: config.env,
+      total: 0,
+      executed: 0,
+      passed: 0,
+      failed: 0,
+      aborted: 1,
+      skipped: 0,
+      message: `Pre-execution simulation failed: ${simSummary.failedFlow?.error || simSummary.failedFlow?.reason || "unknown"}`,
+      ts: new Date().toISOString(),
+    });
+    return [{
+      status: "aborted",
+      error: simSummary.failedFlow?.error || simSummary.failedFlow?.reason || "simulation_failed",
+      flowId: simSummary.failedFlow?.flowId || null,
+    }];
+  }
+
+  // Skip standalone routes that preflight marked as skippable liquidity failures.
+  if (Array.isArray(simSummary.skippedFlows) && simSummary.skippedFlows.length) {
+    const skipKeys = new Set(
+      simSummary.skippedFlows
+        .map((s) => `${s?.routeHint?.fromAsset || ""}::${s?.routeHint?.toAsset || ""}`)
+        .filter((k) => k !== "::")
+    );
+    if (skipKeys.size) {
+      for (let i = standalone.length - 1; i >= 0; i--) {
+        const r = standalone[i];
+        if (skipKeys.has(`${r.fromAsset}::${r.toAsset}`)) standalone.splice(i, 1);
+      }
+    }
+    // #region agent log
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'run',hypothesisId:'H4',location:'src/tests/runner.js:runAll:skip_liquidity_standalone',message:'Skipping standalone routes due to liquidity preflight',data:{mode,skippedCount:simSummary.skippedFlows.length,remainingStandalone:standalone.length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+  }
+
   // Each seed's chain runs sequentially (A→B before B→C)
   // Different seeds run in parallel
   async function runChain(chainRoutes, seedLabel) {
@@ -1480,17 +2340,17 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
     }
   }
 
-  // allChains mode: execute seed chains sequentially (beam propagation).
+  // allChains mode: one beam only (seedsToRun has a single seed); hops run sequentially.
   // allTests mode: keep seed chains parallel for throughput.
   const chainPromise = (mode === "allChains")
     ? (async () => {
-        for (const [seed, chainRoutes] of [...bySeed.entries()]) {
+        for (const [seed, chainRoutes] of [...seedsToRun.entries()]) {
           if (_globalAbort) break;
           await runChain(chainRoutes, seed);
         }
       })()
     : Promise.all(
-        [...bySeed.entries()].map(([seed, chainRoutes]) =>
+        [...seedsToRun.entries()].map(([seed, chainRoutes]) =>
           runChain(chainRoutes, seed)
         )
       );
@@ -1540,17 +2400,334 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
     ts: new Date().toISOString(),
   });
   return results;
+  } finally {
+    _suiteRunActive = false;
+    _suiteRunMeta = null;
+  }
+}
+
+/**
+ * Build a binary funding tree from Garden API assets (connected-wallet filter).
+ * Tree size = number of assets picked (all supported, or capped by opts.assetLimit).
+ * Each edge is parent→child funding hop; N nodes → N−1 edges.
+ *
+ * @param {Record<string, number>} amountOverrides
+ * @param {{ assetLimit?: number | null }} [opts] — assetLimit: max nodes (omit/null = use all fetched supported assets)
+ */
+async function buildFundingTreePlan(amountOverrides = {}, opts = {}) {
+  const wallets = walletState.getStatus();
+  const connectedTypes = new Set();
+  if (wallets.evm)      connectedTypes.add("evm");
+  if (wallets.btc)      connectedTypes.add("bitcoin");
+  if (wallets.solana)   connectedTypes.add("solana");
+  if (wallets.starknet) connectedTypes.add("starknet");
+  if (wallets.sui)      connectedTypes.add("sui");
+  if (wallets.tron)     connectedTypes.add("tron");
+
+  if (connectedTypes.size === 0) {
+    throw new Error("Connect at least one wallet type to build funding tree");
+  }
+
+  let assets = [];
+  try {
+    const res = await garden.getAssets();
+    assets = res.result || res.assets || res || [];
+  } catch (e) {
+    throw new Error(`Garden getAssets failed: ${e.message || e}`);
+  }
+
+  const supported = assets.filter((a) => {
+    const wt = getWalletTypeForAsset(a);
+    return wt && connectedTypes.has(wt);
+  });
+
+  if (supported.length < 1) {
+    throw new Error("No supported Garden assets for connected wallets — cannot build funding tree");
+  }
+
+  let sorted = [...supported].sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const limit = opts.assetLimit;
+  if (limit != null && Number.isFinite(Number(limit)) && Number(limit) >= 1) {
+    sorted = sorted.slice(0, Math.min(sorted.length, Math.floor(Number(limit))));
+  } else if (limit != null) {
+    throw new Error("opts.assetLimit must be a positive integer or null/omitted");
+  }
+
+  const picked = sorted;
+  const assetIds = picked.map((a) => a.id);
+  const tree = fundingTree.buildBinaryFundingTree(assetIds);
+  const structureValidation = fundingTree.validateFundingTreeStructure(tree);
+  const levels = fundingTree.groupEdgesByChildDepth(tree);
+  const routesByEdgeKey = new Map();
+  const allEdges = fundingTree.listFundingEdges(tree);
+
+  for (const e of allEdges) {
+    const key = `${e.parent}->${e.child}`;
+    const fromMeta = picked[e.parent];
+    const toMeta = picked[e.child];
+    if (!isPairPlausible(fromMeta, toMeta)) {
+      routesByEdgeKey.set(key, { ok: false, reason: "pair_not_plausible" });
+      continue;
+    }
+    const fromChain = getWalletTypeForAsset(fromMeta);
+    const toChain = getWalletTypeForAsset(toMeta);
+    const overrideAmt = amountOverrides[fromMeta.id];
+    const minAmtAtomic = parseInt(fromMeta.min_amount || 50000, 10);
+    const rawChosen =
+      overrideAmt !== undefined ? parseInt(overrideAmt, 10) : minAmtAtomic;
+    const amount = clampGardenQuoteAmount(rawChosen, fromMeta);
+    routesByEdgeKey.set(key, {
+      ok: true,
+      route: {
+        fromAsset: fromMeta.id,
+        toAsset: toMeta.id,
+        fromChain,
+        toChain,
+        amount,
+        fromMeta,
+        toMeta,
+        label: `${fromMeta.name || fromMeta.id} → ${toMeta.name || toMeta.id}`,
+        _fundingTree: {
+          parentIndex: e.parent,
+          childIndex: e.child,
+          childDepth: fundingTree.depthFromRoot(e.child),
+        },
+      },
+    });
+  }
+
+  const returnToRootEdges = fundingTree.buildReturnToRootEdges(tree);
+  for (const r of returnToRootEdges) {
+    const key = `return:${r.leafIndex}`;
+    const fromMeta = picked[r.leafIndex];
+    const toMeta = picked[r.rootIndex];
+    if (!isPairPlausible(fromMeta, toMeta)) {
+      routesByEdgeKey.set(key, { ok: false, reason: "pair_not_plausible" });
+      continue;
+    }
+    const fromChain = getWalletTypeForAsset(fromMeta);
+    const toChain = getWalletTypeForAsset(toMeta);
+    const overrideAmt = amountOverrides[fromMeta.id];
+    const minAmtAtomic = parseInt(fromMeta.min_amount || 50000, 10);
+    const rawChosen =
+      overrideAmt !== undefined ? parseInt(overrideAmt, 10) : minAmtAtomic;
+    const amount = clampGardenQuoteAmount(rawChosen, fromMeta);
+    routesByEdgeKey.set(key, {
+      ok: true,
+      route: {
+        fromAsset: fromMeta.id,
+        toAsset: toMeta.id,
+        fromChain,
+        toChain,
+        amount,
+        fromMeta,
+        toMeta,
+        label: `${fromMeta.name || fromMeta.id} → ${toMeta.name || toMeta.id} [return to root]`,
+        _fundingTree: {
+          kind: "return_to_root",
+          leafIndex: r.leafIndex,
+          rootIndex: r.rootIndex,
+        },
+      },
+    });
+  }
+
+  const routesResolved = [...routesByEdgeKey.values()].filter((x) => x.ok).length;
+  const forwardResolved = [...allEdges].filter((e) => {
+    const ent = routesByEdgeKey.get(`${e.parent}->${e.child}`);
+    return ent && ent.ok;
+  }).length;
+  const returnResolved = returnToRootEdges.filter((r) => {
+    const ent = routesByEdgeKey.get(`return:${r.leafIndex}`);
+    return ent && ent.ok;
+  }).length;
+
+  return {
+    tree,
+    picked,
+    assetIds,
+    levels,
+    returnToRootEdges,
+    routesByEdgeKey,
+    structureValidation,
+    coverage: {
+      routesResolved,
+      routesTotal: allEdges.length + returnToRootEdges.length,
+      forwardEdges: allEdges.length,
+      returnEdges: returnToRootEdges.length,
+      forwardRoutesResolved: forwardResolved,
+      returnRoutesResolved: returnResolved,
+      assetsUnique: new Set(assetIds).size === tree.size,
+      assetCount: tree.size,
+    },
+  };
+}
+
+/**
+ * Simulate funding level-by-level: each wave = edges whose child sits at the same depth.
+ * Uses Garden quotes (simulateSingleHop); does not model splitting one parent balance across two children.
+ */
+async function simulateFundingTreeByLevel(amountOverrides = {}, opts = {}) {
+  const silent = !!opts.silent;
+  const plan = await buildFundingTreePlan(amountOverrides, opts);
+  const levelResults = [];
+
+  for (const { level, edges } of plan.levels) {
+    const edgeResults = [];
+    for (const e of edges) {
+      const key = `${e.parent}->${e.child}`;
+      const entry = plan.routesByEdgeKey.get(key);
+      if (!entry || !entry.ok) {
+        edgeResults.push({
+          parent: e.parent,
+          child: e.child,
+          parentAssetId: e.parentAssetId,
+          childAssetId: e.childAssetId,
+          ok: false,
+          error: entry?.reason || "no_route",
+        });
+        continue;
+      }
+      const { route } = entry;
+      try {
+        const minAmt = Math.max(
+          1,
+          parseInt(String(route.fromMeta?.min_amount ?? 50000), 10) || 50000
+        );
+        const sim = await simulateSingleHop({
+          fromAsset: route.fromAsset,
+          fromMeta: route.fromMeta,
+          toAsset: route.toAsset,
+          toMeta: route.toMeta,
+          toChain: route.toChain,
+          inputAtomicBig: BigInt(minAmt),
+        });
+        edgeResults.push({
+          parent: e.parent,
+          child: e.child,
+          parentAssetId: e.parentAssetId,
+          childAssetId: e.childAssetId,
+          ok: true,
+          fromAmountAtomic: String(sim.fromAmountAtomic),
+          toAmountAtomic: String(sim.toAmountAtomic),
+          destinationAsset: sim.destinationAsset,
+          swappedDestination: sim.swappedDestination,
+        });
+      } catch (err) {
+        edgeResults.push({
+          parent: e.parent,
+          child: e.child,
+          parentAssetId: e.parentAssetId,
+          childAssetId: e.childAssetId,
+          ok: false,
+          error: err.message || String(err),
+        });
+      }
+    }
+    const snapshot = {
+      level,
+      edges: edgeResults,
+      ok: edgeResults.length > 0 && edgeResults.every((x) => x.ok),
+    };
+    levelResults.push(snapshot);
+    if (!silent) emit("funding_tree_level", snapshot);
+  }
+
+  const returnEdgeResults = [];
+  for (const r of plan.returnToRootEdges || []) {
+    const key = `return:${r.leafIndex}`;
+    const entry = plan.routesByEdgeKey.get(key);
+    if (!entry || !entry.ok) {
+      returnEdgeResults.push({
+        kind: "return_to_root",
+        leafIndex: r.leafIndex,
+        rootIndex: r.rootIndex,
+        leafAssetId: r.leafAssetId,
+        rootAssetId: r.rootAssetId,
+        ok: false,
+        error: entry?.reason || "no_route",
+      });
+      continue;
+    }
+    const { route } = entry;
+    try {
+      const minAmt = Math.max(
+        1,
+        parseInt(String(route.fromMeta?.min_amount ?? 50000), 10) || 50000
+      );
+      const sim = await simulateSingleHop({
+        fromAsset: route.fromAsset,
+        fromMeta: route.fromMeta,
+        toAsset: route.toAsset,
+        toMeta: route.toMeta,
+        toChain: route.toChain,
+        inputAtomicBig: BigInt(minAmt),
+      });
+      returnEdgeResults.push({
+        kind: "return_to_root",
+        leafIndex: r.leafIndex,
+        rootIndex: r.rootIndex,
+        leafAssetId: r.leafAssetId,
+        rootAssetId: r.rootAssetId,
+        ok: true,
+        fromAmountAtomic: String(sim.fromAmountAtomic),
+        toAmountAtomic: String(sim.toAmountAtomic),
+        destinationAsset: sim.destinationAsset,
+        swappedDestination: sim.swappedDestination,
+      });
+    } catch (err) {
+      returnEdgeResults.push({
+        kind: "return_to_root",
+        leafIndex: r.leafIndex,
+        rootIndex: r.rootIndex,
+        leafAssetId: r.leafAssetId,
+        rootAssetId: r.rootAssetId,
+        ok: false,
+        error: err.message || String(err),
+      });
+    }
+  }
+  const returnSnapshot = {
+    level: "return_to_root",
+    edges: returnEdgeResults,
+    ok:
+      returnEdgeResults.length === 0 ||
+      returnEdgeResults.every((x) => x.ok),
+  };
+  levelResults.push(returnSnapshot);
+  if (!silent) emit("funding_tree_level", returnSnapshot);
+
+  const forwardOk =
+    plan.levels.length === 0 ||
+    levelResults
+      .filter((l) => l.level !== "return_to_root")
+      .every((l) => l.ok);
+  const summary = {
+    ok:
+      plan.structureValidation.ok &&
+      forwardOk &&
+      returnSnapshot.ok,
+    structureValidation: plan.structureValidation,
+    levels: levelResults,
+    coverage: plan.coverage,
+  };
+  if (!silent) emit("funding_tree_simulation", summary);
+  return summary;
 }
 
 module.exports = {
   runAll,
+  simulateExecutionPreflight,
   runApiTests,
   runRoute,
   buildRoutes,
+  buildFundingTreePlan,
+  simulateFundingTreeByLevel,
   setEmitter,
   handleApproval,
   handleEvmTxResponse,
   handleEvmSignResponse,
   abortTest,
   abortAll,
+  getSuiteRunStatus,
 };

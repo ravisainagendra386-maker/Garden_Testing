@@ -20,6 +20,52 @@ app.use(express.static(path.join(__dirname, "../dashboard")));
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server, path: '/ws' });
 
+// #region agent log
+fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H1',location:'src/server.js:startup',message:'process/server created',data:{pid:process.pid,node:process.version,cwd:process.cwd(),argv:process.argv.slice(0,5)},timestamp:Date.now()})}).catch(()=>{});
+// #endregion agent log
+
+server.on("error", (err) => {
+  // #region agent log
+  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H2',location:'src/server.js:server.error',message:'http server error event',data:{name:err?.name,code:err?.code,message:err?.message,errno:err?.errno,syscall:err?.syscall,address:err?.address,port:err?.port},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion agent log
+
+  if (err && err.code === "EADDRINUSE") {
+    const envPortExplicit = Object.prototype.hasOwnProperty.call(process.env, "PORT") && process.env.PORT !== "";
+    const basePort = Number(config?.port || 0);
+    const fallbackEnabled = Number.isFinite(basePort) && basePort > 0;
+    // #region agent log
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H5',location:'src/server.js:EADDRINUSE',message:'port in use handling',data:{envPortExplicit,configPort:basePort,fallbackEnabled},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
+
+    if (!fallbackEnabled) return;
+
+    const maxAttempts = 10;
+    let nextPort = basePort;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      nextPort = basePort + attempt;
+      console.warn(
+        `\n⚠️  Port ${basePort} is already in use.${envPortExplicit ? " (PORT was explicitly set)" : ""}` +
+        `\n   Retrying on ${nextPort}...\n`
+      );
+      // Ensure the rest of the app (and dashboard banner) uses the actual bound port.
+      config.port = nextPort;
+      // #region agent log
+      fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H6',location:'src/server.js:retryListen',message:'retrying listen on candidate port',data:{attempt,fromPort:basePort,toPort:nextPort,envPortExplicit},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion agent log
+      try { server.listen(nextPort); return; } catch (_) {}
+    }
+
+    console.error(`\n❌  Could not find a free port in range ${basePort + 1}-${basePort + maxAttempts}.\n`);
+    process.exitCode = 1;
+  }
+});
+
+wss.on("error", (err) => {
+  // #region agent log
+  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H3',location:'src/server.js:wss.error',message:'websocket server error event',data:{name:err?.name,code:err?.code,message:err?.message},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion agent log
+});
+
 function broadcast(event, data) {
   const msg = JSON.stringify({ event, data, ts: new Date().toISOString() });
   wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });
@@ -28,6 +74,53 @@ runner.setEmitter(broadcast);
 
 // ── HEALTH ────────────────────────────────────────────────────
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
+
+// ── BINARY FUNDING TREE (Garden API assets + optional quote sim) ──
+// Query: limit=<n> caps tree size (omit = use all supported assets for connected wallets)
+//        simulate=1 runs level-by-level Garden quote simulation
+app.get("/api/funding-tree", async (req, res) => {
+  try {
+    let assetLimit = null;
+    if (req.query.limit != null && String(req.query.limit).trim() !== "") {
+      const n = parseInt(String(req.query.limit), 10);
+      if (!Number.isFinite(n) || n < 1) {
+        return res.status(400).json({ ok: false, error: "limit must be a positive integer" });
+      }
+      assetLimit = n;
+    }
+    const ftOpts = { assetLimit };
+    const simulate = req.query.simulate === "1" || req.query.simulate === "true";
+    if (simulate) {
+      const summary = await runner.simulateFundingTreeByLevel({}, { silent: true, ...ftOpts });
+      return res.json(summary);
+    }
+    const plan = await runner.buildFundingTreePlan({}, ftOpts);
+    return res.json({
+      ok: true,
+      structureValidation: plan.structureValidation,
+      coverage: plan.coverage,
+      levels: plan.levels.map(({ level, edges }) => ({
+        level,
+        edgeCount: edges.length,
+        edges: edges.map((e) => ({
+          parent: e.parent,
+          child: e.child,
+          parentAssetId: e.parentAssetId,
+          childAssetId: e.childAssetId,
+        })),
+      })),
+      returnToRootEdges: (plan.returnToRootEdges || []).map((r) => ({
+        leafIndex: r.leafIndex,
+        rootIndex: r.rootIndex,
+        leafAssetId: r.leafAssetId,
+        rootAssetId: r.rootAssetId,
+      })),
+      assetIds: plan.assetIds,
+    });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: e.message || String(e) });
+  }
+});
 
 // ── CORE TEST ROUTES / BOT STATE ─────────────────────────────
 let _amountOverrides = {};
@@ -72,6 +165,17 @@ app.post("/api/run/set-amounts", (req, res) => {
 app.post("/api/run", async (req, res) => {
   const mode = req.body?.mode === "allChains" ? "allChains" : "allTests";
   try {
+    function jsonBigIntReplacer(_k, v) {
+      return typeof v === "bigint" ? v.toString() : v;
+    }
+    function toJsonSafePayload(value) {
+      try {
+        return JSON.parse(JSON.stringify(value, jsonBigIntReplacer));
+      } catch (_) {
+        return { error: "serialization_failed" };
+      }
+    }
+
     const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
     const { balanceMap, gasMap } = await gatherBalances(connectedTypes, supported);
     const seedAllowlist = pickSeedAllowlistByMode(routes, balanceMap, gasMap, mode);
@@ -136,6 +240,26 @@ app.post("/api/run", async (req, res) => {
       });
     }
 
+    const overrides = Object.assign({}, _amountOverrides);
+    const preflight = await runner.simulateExecutionPreflight(overrides, mode, { silent: true, maxFlows: 12 });
+    // #region agent log
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'api-run',hypothesisId:'H5',location:'src/server.js:/api/run:preflight_done',message:'simulateExecutionPreflight result',data:{mode,ok:!!preflight?.ok,failedFlow:preflight?.failedFlow||null,skippedFlowIds:preflight?.skippedFlowIds||null,skippedFlowsCount:Array.isArray(preflight?.skippedFlows)?preflight.skippedFlows.length:0},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+    if (!preflight.ok) {
+      _amountOverrides = {};
+      const safePreflight = toJsonSafePayload(preflight);
+      // #region agent log
+      fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'api-run',hypothesisId:'H5',location:'src/server.js:/api/run:preflight_block',message:'Blocking run due to preflight not ok',data:{mode,reason:`${preflight.failedFlow?.error||preflight.failedFlow?.reason||'unknown'}`},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+      return res.status(409).json({
+        started: false,
+        env: config.env,
+        strictMode: true,
+        reason: `Pre-execution simulation failed: ${preflight.failedFlow?.error || preflight.failedFlow?.reason || "unknown"}`,
+        simulation: safePreflight,
+      });
+    }
+
     res.json({
       started: true,
       env: config.env,
@@ -143,8 +267,8 @@ app.post("/api/run", async (req, res) => {
       strictMode: true,
       rawPlannedRoutes: preview.rawPlanCount || 0,
       executablePlannedRoutes: preview.executablePlanCount || 0,
+      simulation: toJsonSafePayload(preflight),
     });
-    const overrides = Object.assign({}, _amountOverrides);
     _amountOverrides = {};
     runner.runAll(overrides, mode).catch(err => broadcast("error", { message: err.message }));
   } catch (err) {
@@ -166,6 +290,11 @@ app.post("/api/run/route", async (req, res) => {
 app.post("/api/run/api-tests", async (req, res) => {
   const results = await runner.runApiTests();
   res.json(results);
+});
+
+/** Whether `runAll` is currently executing (survives page reload; used to restore Running + Stop on the dashboard). */
+app.get("/api/run/status", (req, res) => {
+  res.json(runner.getSuiteRunStatus());
 });
 
 app.post("/api/abort", (req, res) => {
@@ -561,15 +690,24 @@ async function gatherBalances(connectedTypes, supported) {
 }
 
 // ── TRADE COMBINATIONS ────────────────────────────────────────
+// Cross-request cache to avoid re-quoting the same (from,to,amount) repeatedly.
+// Cache values are non-sensitive (atomic amounts only).
+const _quoteCacheGlobal = new Map(); // key -> { toAmount, ts }
+const _QUOTE_CACHE_TTL_MS = 60_000;
 async function buildCombinationsResponse() {
   const wallets = walletState.getStatus();
   const evmAddrKey = wallets?.evm?.address ? String(wallets.evm.address).toLowerCase() : null;
   const evmTokenByChain = evmAddrKey ? (_lastEvmTokenBalancesByAddress[evmAddrKey] || {}) : {};
   const evmSupportedByChain = evmAddrKey ? (_lastSupportedTokensByAddress[evmAddrKey] || {}) : {};
+  const quoteCache = new Map(); // per-request hot cache: `${fromId}->${toId}->${fromAmount}` -> { toAmount }
+  const quoteStats = { calls: 0, hits: 0, misses: 0, errors: 0 };
+  const startedAt = Date.now();
 
   // CHANGE: Always fresh assets
   clearAssetCache();
+  const assetsFetchStartedAt = Date.now();
   const ar      = await getAssets();
+  const assetsFetchMs = Date.now() - assetsFetchStartedAt;
   const assets  = ar.result || ar.assets || ar || [];
   if (!assets.length) return { ok: true, total: 0, combinations: [], pairsValidated: false, totalBeforeFilter: 0 };
 
@@ -601,6 +739,7 @@ async function buildCombinationsResponse() {
 
   console.log(`[combinations] assets: ${assets.length}, supported: ${supported.length}`);
   const combinations = [];
+  let quoteEnabledCount = 0;
 
   function getAssetTokenAddress(asset) {
     return asset?.token_address || asset?.tokenAddress || asset?.contract_address || asset?.contractAddress || asset?.token?.address || null;
@@ -616,6 +755,219 @@ async function buildCombinationsResponse() {
     }
   }
 
+  async function computeSuggestedAmount({
+    from,
+    to,
+    minAmount,
+    maxAmount,
+    minToAmount,
+    walletBalance,
+    canAfford,
+    quoteEnabled,
+  }) {
+    function toBigIntOrNull(v) {
+      if (v === null || v === undefined) return null;
+      if (typeof v === "bigint") return v;
+      if (typeof v === "number") {
+        if (!Number.isFinite(v)) return null;
+        return BigInt(Math.floor(v));
+      }
+      try {
+        const s = String(v).trim();
+        if (!s) return null;
+        return BigInt(s.includes(".") ? s.split(".")[0] : s);
+      } catch (_) {
+        return null;
+      }
+    }
+
+    function clampInt(n, lo, hi) {
+      return Math.max(lo, Math.min(n, hi));
+    }
+
+    if (walletBalance === null || canAfford === false) return minAmount;
+
+    const minBig = toBigIntOrNull(minAmount);
+    const maxBig = toBigIntOrNull(maxAmount);
+    const minToBig = toBigIntOrNull(minToAmount);
+    const balBig = toBigIntOrNull(walletBalance);
+
+    if (minBig !== null && maxBig !== null && minToBig !== null && balBig !== null) {
+      // Mathematical formula (no external pricing):
+      // target = to.min_amount + 0.4% (ceil) in destination asset atomic units.
+      // Only safe to use directly as an input default when the pair is "like-kind"
+      // (same token/decimals), otherwise atomic units are incomparable.
+      const buf04 = (minToBig + 249n) / 250n; // ceil(minTo * 0.4%)
+      const targetTo = minToBig + (buf04 > 0n ? buf04 : 1n);
+
+      const fromTokenKey = String(from?.id || "").split(":")[1]?.toLowerCase() || "";
+      const toTokenKey = String(to?.id || "").split(":")[1]?.toLowerCase() || "";
+      const btcPegSet = new Set(["btc", "wbtc", "cbbtc", "ibtc"]);
+      const isBtcPegged =
+        btcPegSet.has(fromTokenKey) &&
+        btcPegSet.has(toTokenKey) &&
+        Number.isFinite(Number(from?.decimals)) &&
+        Number.isFinite(Number(to?.decimals)) &&
+        Number(from?.decimals) === Number(to?.decimals) &&
+        Number(from?.decimals) === 8;
+      const likeKind =
+        fromTokenKey &&
+        toTokenKey &&
+        fromTokenKey === toTokenKey &&
+        Number(from?.decimals) === Number(to?.decimals);
+
+      if (likeKind) {
+        // Rule A: Default suggested = clamp(targetTo, minAmount, maxAmount)
+        let target = targetTo;
+        if (target < minBig) target = minBig;
+        if (target > maxBig) target = maxBig;
+
+        // Rule B: If wallet balance is between sender min and target, use max wallet balance (clamped)
+        // (user requested: "if wallet balance is between min trade and toMin+0.4% then use max balance")
+        if (balBig >= minBig && balBig <= target) {
+          const v = balBig > maxBig ? maxBig : balBig;
+          // #region agent log
+          if (Date.now() % 20 === 0) {
+            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H16',location:'src/server.js:computeSuggestedAmount:likeKind:maxBal',message:'likeKind suggested uses max wallet balance (balance between min and target)',data:{from:from?.id,to:to?.id,minAmount:String(minBig),toMinAmount:String(minToBig),targetTo:String(targetTo),balance:String(balBig),suggested:String(v)},timestamp:Date.now()})}).catch(()=>{});
+          }
+          // #endregion agent log
+          return Number(v);
+        }
+
+        // #region agent log
+        if (Date.now() % 20 === 1) {
+          fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H16',location:'src/server.js:computeSuggestedAmount:likeKind:target',message:'likeKind suggested uses target (to.min+0.4%)',data:{from:from?.id,to:to?.id,minAmount:String(minBig),toMinAmount:String(minToBig),targetTo:String(targetTo),balance:String(balBig),suggested:String(target)},timestamp:Date.now()})}).catch(()=>{});
+        }
+        // #endregion agent log
+        return Number(target);
+      }
+
+      if (!quoteEnabled) {
+        // Without quote pricing, do not auto-max; keep a conservative default.
+        // (Prevents "everything becomes max balance" when quotes are disabled/unavailable.)
+        return Number(minBig);
+      }
+
+      function extractToAtomic(qr) {
+        // Some Garden deployments return an array of quote options (or an object with numeric keys).
+        // Normalize to a single quote record.
+        const q0 =
+          Array.isArray(qr) ? (qr[0] || null) :
+          (qr && typeof qr === "object" && (qr["0"] != null)) ? qr["0"] :
+          qr;
+        // Try common response shapes without logging entire payload.
+        return (
+          q0?.destination?.amount ??
+          q0?.destination?.atomic_amount ??
+          q0?.destination_amount ??
+          q0?.destinationAmount ??
+          q0?.to_amount ??
+          q0?.toAmount ??
+          q0?.to_amount_atomic ??
+          q0?.destination_amount_atomic ??
+          q0?.quote?.destination?.amount ??
+          q0?.quote?.destination_amount ??
+          q0?.quote?.to_amount ??
+          q0?.quote?.toAmount ??
+          q0?.data?.destination?.amount ??
+          q0?.data?.destination_amount ??
+          q0?.data?.to_amount ??
+          null
+        );
+      }
+
+      const cacheKey = `${from.id}->${to.id}->${minAmount}`;
+      let toAtMin = null;
+      const cached = quoteCache.get(cacheKey);
+      if (cached && cached.toAmount != null) {
+        quoteStats.hits++;
+        toAtMin = toBigIntOrNull(cached.toAmount);
+      } else {
+        // Global cache (TTL) to reduce latency across requests.
+        const g = _quoteCacheGlobal.get(cacheKey);
+        if (g && (Date.now() - g.ts) < _QUOTE_CACHE_TTL_MS && g.toAmount != null) {
+          quoteStats.hits++;
+          quoteCache.set(cacheKey, { toAmount: g.toAmount });
+          toAtMin = toBigIntOrNull(g.toAmount);
+        } else {
+        try {
+          quoteStats.misses++;
+          quoteStats.calls++;
+          const q = await garden.getQuote(from.id, to.id, minAmount);
+          const qr = q?.result || q;
+          const toAtomic = extractToAtomic(qr);
+
+          // #region agent log
+          if (toAtomic == null && quoteStats.calls <= 5) {
+            let topKeys = null;
+            let destKeys = null;
+            let quoteKeys = null;
+            let quoteDestKeys = null;
+            try { topKeys = Object.keys(qr || {}).slice(0, 30); } catch (_) {}
+            try { destKeys = Object.keys(qr?.destination || {}).slice(0, 30); } catch (_) {}
+            try { quoteKeys = Object.keys(qr?.quote || {}).slice(0, 30); } catch (_) {}
+            try { quoteDestKeys = Object.keys(qr?.quote?.destination || {}).slice(0, 30); } catch (_) {}
+            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H14',location:'src/server.js:computeSuggestedAmount:quoteShape',message:'quote missing destination amount field',data:{from:from?.id,to:to?.id,fromAmount:minAmount,hasResult:!!q?.result,topKeys,destKeys,quoteKeys,quoteDestKeys},timestamp:Date.now()})}).catch(()=>{});
+          }
+          // #endregion agent log
+          quoteCache.set(cacheKey, { toAmount: toAtomic });
+          _quoteCacheGlobal.set(cacheKey, { toAmount: toAtomic, ts: Date.now() });
+          toAtMin = toBigIntOrNull(toAtomic);
+        } catch (err) {
+          quoteStats.errors++;
+          quoteCache.set(cacheKey, { toAmount: null });
+          toAtMin = null;
+
+          // #region agent log
+          if (quoteStats.errors <= 5) {
+            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H15',location:'src/server.js:computeSuggestedAmount:quoteError',message:'quote call failed',data:{from:from?.id,to:to?.id,fromAmount:minAmount,message:err?.message||null,name:err?.name||null,status:err?.status||null},timestamp:Date.now()})}).catch(()=>{});
+          }
+          // #endregion agent log
+
+          // If Garden cannot quote due to insufficient liquidity, but both sides are BTC-pegged (8 decimals),
+          // assume 1:1 for the purpose of meeting destination min trade amounts.
+          const msg = String(err?.message || "");
+          const insufficientLiq = (err?.status === 400) && msg.toLowerCase().includes("insufficient liquidity");
+          if (insufficientLiq && isBtcPegged) {
+            toAtMin = minBig; // 1:1 peg assumption => toAtMin at minFrom equals minFrom
+            // #region agent log
+            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H17',location:'src/server.js:computeSuggestedAmount:btcPegFallback',message:'using BTC-peg 1:1 fallback due to insufficient liquidity',data:{from:from?.id,to:to?.id,decimalsFrom:from?.decimals,decimalsTo:to?.decimals,minAmount:String(minBig),toMinAmount:String(minToBig),targetTo:String(targetTo)},timestamp:Date.now()})}).catch(()=>{});
+            // #endregion agent log
+          }
+        }
+        }
+      }
+
+      if (toAtMin !== null && toAtMin > 0n) {
+        const requiredFrom = (minBig * targetTo + (toAtMin - 1n)) / toAtMin;
+        if (balBig >= requiredFrom) {
+          let v = requiredFrom;
+          if (v < minBig) v = minBig;
+          if (v > maxBig) v = maxBig;
+          // #region agent log
+          if (quoteStats.calls <= 3) {
+            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H12',location:'src/server.js:computeSuggestedAmount:requiredFrom',message:'computed requiredFrom for to.min+0.5%',data:{from:from?.id,to:to?.id,minAmount:String(minBig),targetTo:String(targetTo),toAtMin:String(toAtMin),requiredFrom:String(requiredFrom),balance:String(balBig),suggested:String(v)},timestamp:Date.now()})}).catch(()=>{});
+          }
+          // #endregion agent log
+          return Number(v);
+        }
+      }
+
+      // If we couldn't compute/afford a destination-min-satisfying amount, keep it conservative.
+      // #region agent log
+      if (String(from?.id || "").toLowerCase().includes("eth") && (String(to?.id || "").toLowerCase().includes("usdc") || String(to?.name || "").toLowerCase().includes("usdc"))) {
+        fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H13',location:'src/server.js:computeSuggestedAmount:fallbackMin',message:'suggestedAmount fallback -> minAmount (quote/rate unavailable or cannot afford required)',data:{from:from?.id,to:to?.id,minAmount:String(minBig),toMinAmount:String(minToBig),targetTo:String(targetTo),toAtMin:toAtMin===null?null:String(toAtMin),balance:String(balBig)},timestamp:Date.now()})}).catch(()=>{});
+      }
+      // #endregion agent log
+      return Number(minBig);
+    }
+
+    const balNum = Number(walletBalance);
+    if (!Number.isFinite(balNum)) return minAmount;
+    if (balNum >= minAmount) return clampInt(Math.floor(balNum), minAmount, maxAmount);
+    return minAmount;
+  }
+
   for (const from of supported) {
     for (const to of supported) {
       if (from.id === to.id) continue;
@@ -627,6 +979,7 @@ async function buildCombinationsResponse() {
       const toConnected   = isWalletConnected(toType);
       const minAmount     = parseInt(from.min_amount || 50000);
       const maxAmount     = parseInt(from.max_amount || 1000000);
+      const minToAmount   = parseInt(to.min_amount || 50000);
 
       let walletBalance = null;
       let canAfford     = null;
@@ -664,10 +1017,35 @@ async function buildCombinationsResponse() {
         }
       }
 
-      const suggested = (walletBalance !== null && canAfford !== false)
-        ? Math.max(minAmount, Math.min(walletBalance, maxAmount))
-        : minAmount;
+      function toBigIntOrNull(v) {
+        if (v === null || v === undefined) return null;
+        if (typeof v === "bigint") return v;
+        if (typeof v === "number") {
+          if (!Number.isFinite(v)) return null;
+          // If a float sneaks in, we only keep the integer part for atomic comparisons.
+          return BigInt(Math.floor(v));
+        }
+        try {
+          // String may be a big integer.
+          const s = String(v).trim();
+          if (!s) return null;
+          return BigInt(s.includes(".") ? s.split(".")[0] : s);
+        } catch (_) {
+          return null;
+        }
+      }
 
+      function clampInt(n, lo, hi) {
+        return Math.max(lo, Math.min(n, hi));
+      }
+
+      // Default input/suggested amount rules:
+      // - If balance < minAmount or unknown: suggested=minAmount
+      // - If receiving asset has a minimum constraint, compute required send amount to
+      //   reach (to.min_amount + 0.4%) using Garden quote pricing (chain-aware).
+      //   If quote is unavailable, fall back to "max balance" behavior.
+      // Always enforce sender min/max bounds.
+      // Always clamp to maxAmount when known.
       const balanceKnown = walletBalance !== null;
       let comboStatus = "no";
       // "Send" wallet must be connected to be considered tradeable/partial.
@@ -676,12 +1054,33 @@ async function buildCombinationsResponse() {
       else if (toConnected && canAfford === true) comboStatus = "ready";
       else comboStatus = "partial";
       const canTrade = comboStatus === "ready";
+      // Enable quote-based defaulting whenever we have a sender balance that can afford the sender min.
+      // This keeps defaults accurate even when destination wallet isn't connected (partial),
+      // while still avoiding quote spam for "no" combos / unknown balance.
+      const minBigForQuote = toBigIntOrNull(minAmount);
+      const quoteMinRequired = (minBigForQuote !== null) ? (minBigForQuote + ((minBigForQuote + 199n) / 200n)) : null; // min + ceil(min*0.5%)
+      const canAffordPlus05 =
+        quoteMinRequired !== null ? gteAtomic(walletBalance, quoteMinRequired.toString()) : (canAfford === true);
+
+      const quoteEnabled = fromConnected && balanceKnown === true && canAffordPlus05 === true;
+      if (quoteEnabled) quoteEnabledCount++;
+
+      const suggestedFinal = await computeSuggestedAmount({
+        from,
+        to,
+        minAmount,
+        maxAmount,
+        minToAmount,
+        walletBalance,
+        canAfford,
+        quoteEnabled,
+      });
 
       combinations.push({
         id: `${from.id}->${to.id}`,
         from: { assetId: from.id, name: from.name, chain: from.chain, icon: from.icon, walletType: fromType, decimals: from.decimals },
         to:   { assetId: to.id,   name: to.name,   chain: to.chain,   icon: to.icon,   walletType: toType,   decimals: to.decimals },
-        minAmount, maxAmount, suggestedAmount: suggested,
+        minAmount, maxAmount, toMinAmount: minToAmount, suggestedAmount: suggestedFinal,
         fromWalletConnected: fromConnected,
         toWalletConnected:   toConnected,
         canTrade,
@@ -692,6 +1091,30 @@ async function buildCombinationsResponse() {
       });
     }
   }
+
+  // #region agent log
+  try {
+    let tReq = 0, tBal = 0, tMin = 0;
+    for (const c of combinations) {
+      const bal = toBigIntOrNull(c.walletBalance);
+      const min = toBigIntOrNull(c.minAmount);
+      const minTo = toBigIntOrNull(c.toMinAmount);
+      if (bal === null || min === null || minTo === null || c.canAfford === false) { tMin++; continue; }
+      const sug = toBigIntOrNull(c.suggestedAmount);
+      const max = toBigIntOrNull(c.maxAmount);
+      const maxBal = (max !== null && bal !== null && bal > max) ? max : bal;
+      const isMaxBal = sug !== null && maxBal !== null && sug === maxBal;
+      if (!isMaxBal) tReq++;
+      else if (bal >= min) tBal++;
+      else tMin++;
+    }
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H8',location:'src/server.js:buildCombinationsResponse',message:'suggestedAmount tier counts (to.min via USD -> required send)',data:{total:combinations.length,tReq,tBal,tMin},timestamp:Date.now()})}).catch(()=>{});
+  } catch (_) {}
+  // #endregion agent log
+
+  // #region agent log
+  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H10',location:'src/server.js:buildCombinationsResponse',message:'buildCombinationsResponse perf',data:{ms:Date.now()-startedAt,assetsFetchMs,assets:assets.length,supported:supported.length,combinations:combinations.length,quoteEnabledCount,quoteCalls:quoteStats.calls,quoteHits:quoteStats.hits,quoteMisses:quoteStats.misses,quoteErrors:quoteStats.errors,quoteCacheSize:quoteCache.size},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion agent log
 
   // CHANGE: No valid-pairs cache filtering — always show all connected combos
   combinations.sort((a, b) => {
@@ -714,10 +1137,20 @@ async function buildCombinationsResponse() {
 }
 
 app.get("/api/combinations", async (req, res) => {
+  const reqStartedAt = Date.now();
+  // #region agent log
+  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H11',location:'src/server.js:/api/combinations:entry',message:'combinations request start',data:{qs:req.query||null},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion agent log
   try {
     const payload = await buildCombinationsResponse();
+    // #region agent log
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H11',location:'src/server.js:/api/combinations:success',message:'combinations request success',data:{ms:Date.now()-reqStartedAt,total:payload?.total},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
     res.json(payload);
   } catch (err) {
+    // #region agent log
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H11',location:'src/server.js:/api/combinations:error',message:'combinations request error',data:{ms:Date.now()-reqStartedAt,message:err?.message,name:err?.name},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion agent log
     res.status(500).json({ error: err.message });
   }
 });
@@ -726,12 +1159,16 @@ app.get("/api/combinations", async (req, res) => {
 app.get("/api/route-readiness", async (req, res) => {
   try {
     const mode = req.query?.mode === "allChains" ? "allChains" : "allTests";
+    // #region agent log
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'server',hypothesisId:'H28',location:'src/server.js:/api/route-readiness:entry',message:'route-readiness request received',data:{mode,hasQueryMode:typeof req.query?.mode==='string'},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
 
     if (!routes.length) {
       return res.json({
         assets: [], totalRoutes: 0, runnableRoutes: 0, readinessPct: 100,
         flowChains: [], clusters: [], walletCoverage: null, mode,
+        rawPlannedRoutes: 0, executablePlannedRoutes: 0, executablePlanRoutes: [],
       });
     }
 
@@ -757,22 +1194,6 @@ app.get("/api/route-readiness", async (req, res) => {
       mode === "allChains" &&
       !hasQualifiedChainStart &&
       (executablePlanCountGet === 0 || builtChains === 0);
-    try {
-      const { appendRuntimeLog } = require("./utils/runtimeLog");
-      appendRuntimeLog({
-        sessionId: "66ed74",
-        hypothesisId: "H19",
-        location: "src/server.js:/api/route-readiness:consolidationGate",
-        message: "Consolidation gate (readiness)",
-        data: {
-          hasQualifiedChainStart,
-          executablePlanCount: executablePlanCountGet,
-          builtChains,
-          shouldResolveConsolidation,
-        },
-        timestamp: Date.now(),
-      });
-    } catch (_) {}
     let consolidation = null;
     if (shouldResolveConsolidation) {
       const { resolveConsolidationTargetIfNoSeeds } = require("./utils/consolidationTarget");
@@ -781,22 +1202,14 @@ app.get("/api/route-readiness", async (req, res) => {
       } catch (e) {
         consolidation = { eligible: false, reason: "resolver_error", error: e.message };
       }
-      try {
-        const { appendRuntimeLog } = require("./utils/runtimeLog");
-        appendRuntimeLog({
-          sessionId: "66ed74",
-          hypothesisId: "H20",
-          location: "src/server.js:/api/route-readiness:consolidationResult",
-          message: "Consolidation resolver outcome",
-          data: {
-            eligible: consolidation?.eligible === true,
-            reason: consolidation?.reason ?? null,
-            targetAssetId: consolidation?.targetAssetId ?? null,
-          },
-          timestamp: Date.now(),
-        });
-      } catch (_) {}
     }
+    const simulation = await runner.simulateExecutionPreflight(_amountOverrides, mode, { silent: true, maxFlows: 12 })
+      .catch((e) => ({ ok: false, failedFlow: { reason: "simulation_error", error: e.message } }));
+    const executablePlanRoutes = Array.isArray(preview.plan)
+      ? preview.plan.map((r) => (r && typeof r === "object"
+        ? { fromAsset: r.fromAsset, toAsset: r.toAsset, label: r.label || null }
+        : null)).filter(Boolean)
+      : [];
     res.json({
       ...payload,
       mode,
@@ -806,10 +1219,12 @@ app.get("/api/route-readiness", async (req, res) => {
       builtChains: payload.flowChains?.length || 0,
       rawPlannedRoutes: preview.rawPlanCount || 0,
       executablePlannedRoutes: preview.executablePlanCount || 0,
+      executablePlanRoutes,
       canInitiate: (preview.executablePlanCount || 0) > 0,
       hasQualifiedChainStart,
       executablePlanCount: executablePlanCountGet,
       consolidation,
+      simulation,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -1302,11 +1717,14 @@ app.get("/api/wallet/balances", async (req, res) => {
   for (const key of ['evm','btc','solana','starknet','sui','tron']) {
     if (safeStatus[key]?.source === 'envkey' && safeStatus[key]?.address) {
       const addr = safeStatus[key].address;
-      safeStatus[key].address = addr.slice(0,6) + '…' + addr.slice(-4);
-      safeStatus[key].addressRedacted = true;
+      safeStatus[key].addressDisplay = addr.slice(0,6) + '…' + addr.slice(-4);
+      safeStatus[key].addressRedacted = false;
     }
     if (safeStatus[key]?.wif) delete safeStatus[key].wif;
   }
+  // #region agent log
+  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H7',location:'src/server.js:/api/wallet/balances',message:'wallet balances response shape',data:{evm:{has:!!safeStatus?.evm,source:safeStatus?.evm?.source||null,addressPrefix:(safeStatus?.evm?.address||'').slice(0,10),addressDisplayPrefix:(safeStatus?.evm?.addressDisplay||'').slice(0,10)}},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion agent log
   res.json(safeStatus);
 });
 
@@ -1406,7 +1824,13 @@ app.post("/api/orders/:id/redeem", async (req, res) => {
 });
 
 // ── START ─────────────────────────────────────────────────────
+// #region agent log
+fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H1',location:'src/server.js:beforeListen',message:'about to listen',data:{pid:process.pid,port:config?.port,envPort:process.env.PORT||null},timestamp:Date.now()})}).catch(()=>{});
+// #endregion agent log
 server.listen(config.port, () => {
+  // #region agent log
+  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H4',location:'src/server.js:listenCallback',message:'listening callback fired',data:{pid:process.pid,port:config?.port},timestamp:Date.now()})}).catch(()=>{});
+  // #endregion agent log
   console.log(`\n✅  Garden Test Suite running`);
   console.log(`   Dashboard:   http://localhost:${config.port}`);
   console.log(`   Environment: ${config.env.toUpperCase()}`);

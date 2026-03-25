@@ -8,6 +8,19 @@ const GAS_PER_TX = 2;
 const BEAM_WIDTH = 6;
 const MAX_DEPTH = 15;
 
+/**
+ * allTests: for each bitcoin→* matrix cell, pick among all liquid catalog routes (uniform), not only max scoreHop
+ * (BTC↔BTC-family pairs score highest, so iBTC on Base often won every time).
+ * Default: on. Set ALLTESTS_RANDOM_BTC_DEST=false to restore deterministic “best score” picks.
+ */
+function allTestsRandomBitcoinDestEnabled() {
+  const v = process.env.ALLTESTS_RANDOM_BTC_DEST;
+  if (v === undefined || String(v).trim() === "") return true;
+  const s = String(v).toLowerCase();
+  if (s === "0" || s === "false" || s === "no") return false;
+  return s === "1" || s === "true" || s === "yes";
+}
+
 class AgentMemoryFallback {
   constructor() {
     this.chainGas = new Map();
@@ -328,6 +341,7 @@ function buildChainReactionFlow(routes, opts = {}) {
   const gasBalances = opts.gasBalances || new Map();
   const memory = opts.memory || null;
   const seedAllowlist = opts.seedAllowlist || null;
+  const closeCycle = opts.closeCycle === true;
 
   const connected = routes.filter((r) => {
     const fw = r.fromChain || getWalletTypeFromChain(getChainKey(r.fromAsset));
@@ -405,6 +419,44 @@ function buildChainReactionFlow(routes, opts = {}) {
     }
     if (!routesForPath.length) continue;
 
+    const startAsset = seed.assetId;
+    const lastAsset = path.assets[path.assets.length - 1];
+    /**
+     * X = first hop after seed. Cycle close is only last→X (Q→X). Asset list becomes S1→…→Q→X
+     * (terminal asset is X again). No last→seed (Q→S1) fallback.
+     */
+    const firstHopDest = path.assets.length >= 2 ? path.assets[1] : null;
+
+    let closedOk = false;
+    let lastGasFail = null;
+    if (closeCycle && firstHopDest && firstHopDest !== lastAsset) {
+      const closingEdge = (adj.get(lastAsset) || []).find((e) => e.toAssetId === firstHopDest);
+      if (closingEdge) {
+        const closedAssets = [...path.assets, firstHopDest];
+        const gas = estimatePathGas(closedAssets, gasBalances, memory);
+        if (gas.feasible) {
+          path.assets = closedAssets;
+          routesForPath.push(closingEdge.route);
+          closedOk = true;
+          // #region agent log
+          fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'planner',hypothesisId:'H26',location:'src/agents/routeOptimizerAgent.js:buildChainReactionFlow:cycleClosed',message:'Appended closing hop Q->X; path ends on X again',data:{startAsset,firstHopDest,lastAsset,pathEndsWith:firstHopDest,newPathLen:path.assets.length,newRouteLen:routesForPath.length,feasible:true},timestamp:Date.now()})}).catch(()=>{});
+          // #endregion
+        } else {
+          lastGasFail = { gas, closedAssetsLen: closedAssets.length };
+        }
+      }
+    }
+
+    // #region agent log
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'planner',hypothesisId:'H25',location:'src/agents/routeOptimizerAgent.js:buildChainReactionFlow:closeCycleCheck',message:'Cycle closure (Q->X only) check',data:{mode:opts.mode||null,closeCycle,uniqueChainsOnly:opts.chainRoutesUniqueChains===true,startAsset,firstHopDest,lastAsset,closedOk},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
+
+    if (closeCycle && !closedOk && lastGasFail) {
+      // #region agent log
+      fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'planner',hypothesisId:'H27',location:'src/agents/routeOptimizerAgent.js:buildChainReactionFlow:cycleCloseGasFail',message:'Q->X closing hop failed gas check',data:{startAsset,firstHopDest,lastAsset,newPathLen:lastGasFail.closedAssetsLen,feasible:false,gasIssues:lastGasFail.gas?.gasIssues||[]},timestamp:Date.now()})}).catch(()=>{});
+      // #endregion
+    }
+
     chains.push({
       startAsset: seed.assetId,
       seedBalance: seed.balance,
@@ -412,7 +464,7 @@ function buildChainReactionFlow(routes, opts = {}) {
       routes: routesForPath,
       length: routesForPath.length,
       pathScore: path.score,
-      gasEstimate: path.gasEstimate,
+      gasEstimate: estimatePathGas(path.assets, gasBalances, memory),
     });
   }
 
@@ -498,6 +550,197 @@ function resolveConnectedTypesAndRoutes(routes, connectedWalletTypes) {
     return !connectedTypes.size || (connectedTypes.has(fw) && connectedTypes.has(tw));
   });
   return { connectedTypes, connectedRoutes };
+}
+
+function minAmtForAssetFromRoutes(connectedRoutes, assetId) {
+  let m = null;
+  for (const r of connectedRoutes) {
+    if (r.fromAsset !== assetId) continue;
+    const v = Number(r.amount || r.fromMeta?.min_amount || 50000);
+    if (m === null || v < m) m = v;
+  }
+  return m ?? 50000;
+}
+
+/** Source can fund min trade + (EVM) gas threshold — skips illiquid sources. */
+function isSourceLiquidForRoute(assetId, balances, gasBalances, connectedRoutes) {
+  const minAmt = minAmtForAssetFromRoutes(connectedRoutes, assetId);
+  const bal = balances.get(assetId);
+  if (bal === null || bal === undefined) return false;
+  if (!isAtLeastAtomic(bal, minAmt)) return false;
+  const ck = getChainKey(assetId);
+  if (getWalletTypeFromChain(ck) === "evm") {
+    const gas = gasBalances.get(ck);
+    const gasBig = toComparableBigInt(gas);
+    if (gas !== undefined && gasBig !== null && gasBig < MIN_GAS_WEI) return false;
+  }
+  return true;
+}
+
+/** Map chain route prefix -> asset ids that appear as liquid sources on that chain. */
+function buildLiquidSourceAssetsByChain(connectedRoutes, balances, gasBalances) {
+  const by = new Map();
+  for (const r of connectedRoutes) {
+    const ck = getChainRouteStepKey(r.fromAsset);
+    const a = r.fromAsset;
+    if (!isSourceLiquidForRoute(a, balances, gasBalances, connectedRoutes)) continue;
+    if (!by.has(ck)) by.set(ck, new Set());
+    by.get(ck).add(a);
+  }
+  const out = new Map();
+  for (const [k, set] of by) out.set(k, [...set].sort((x, y) => String(x).localeCompare(String(y))));
+  return out;
+}
+
+/** One random funded source asset per chain prefix (Garden network), for allChains seeds. */
+function pickOneRandomAssetPerChainPrefix(connectedRoutes, balances, gasBalances) {
+  const by = new Map();
+  for (const r of connectedRoutes) {
+    const ck = getChainRouteStepKey(r.fromAsset);
+    if (!by.has(ck)) by.set(ck, new Set());
+    by.get(ck).add(r.fromAsset);
+  }
+  const picked = new Map();
+  for (const [ck, assetsSet] of by) {
+    const liquid = [...assetsSet].filter((a) => isSourceLiquidForRoute(a, balances, gasBalances, connectedRoutes));
+    if (!liquid.length) continue;
+    const chosen = liquid[Math.floor(Math.random() * liquid.length)];
+    picked.set(ck, chosen);
+  }
+  return picked;
+}
+
+function pickBestLiquidRouteAmong(
+  candidates,
+  balances,
+  gasBalances,
+  connectedRoutes,
+  pairStats,
+  pickOpts = {}
+) {
+  if (!candidates?.length) return null;
+  const ok = candidates.filter((r) =>
+    isSourceLiquidForRoute(r.fromAsset, balances, gasBalances, connectedRoutes)
+  );
+  if (!ok.length) return null;
+  const fromChainKey = pickOpts.fromChainKey || "";
+  const bitcoinSource =
+    /^bitcoin/.test(String(fromChainKey)) &&
+    allTestsRandomBitcoinDestEnabled() &&
+    ok.length > 1;
+  if (bitcoinSource) {
+    return ok[Math.floor(Math.random() * ok.length)];
+  }
+  ok.sort(
+    (a, b) =>
+      scoreHop(b.fromAsset, b.toAsset, pairStats) - scoreHop(a.fromAsset, a.toAsset, pairStats)
+  );
+  return ok[0];
+}
+
+/**
+ * allTests: one best liquid direct route per ordered chain pair (C×C), including same-chain when a route exists.
+ * Skips pairs with no catalog edge or no liquid source.
+ */
+function buildAllTestsChainMatrixCoverage(connectedRoutes, balances, gasBalances, pairStats) {
+  const pairBuckets = new Map();
+  for (const r of connectedRoutes) {
+    const fc = getChainRouteStepKey(r.fromAsset);
+    const tc = getChainRouteStepKey(r.toAsset);
+    const key = `${fc}::${tc}`;
+    if (!pairBuckets.has(key)) pairBuckets.set(key, []);
+    pairBuckets.get(key).push(r);
+  }
+  const chainKeys = [
+    ...new Set(
+      connectedRoutes.flatMap((r) => [getChainRouteStepKey(r.fromAsset), getChainRouteStepKey(r.toAsset)])
+    ),
+  ].sort((a, b) => String(a).localeCompare(String(b)));
+  const out = [];
+  const seenEdge = new Set();
+  for (const ci of chainKeys) {
+    for (const cj of chainKeys) {
+      const candidates = pairBuckets.get(`${ci}::${cj}`) || [];
+      const best = pickBestLiquidRouteAmong(candidates, balances, gasBalances, connectedRoutes, pairStats, {
+        fromChainKey: ci,
+      });
+      if (!best || best.fromAsset === best.toAsset) continue;
+      const ek = `${best.fromAsset}::${best.toAsset}`;
+      if (seenEdge.has(ek)) continue;
+      seenEdge.add(ek);
+      out.push(best);
+    }
+  }
+  return out;
+}
+
+function orderAssetsForChainFallback(ck, pickedMap, liquidByChain) {
+  const arr = liquidByChain.get(ck) || [];
+  const preferred = pickedMap.get(ck);
+  if (!preferred) return [...arr];
+  const rest = arr.filter((a) => a !== preferred);
+  return [preferred, ...rest];
+}
+
+/**
+ * allChains: same C×C matrix, but prefers routes that use the random per-chain pick as src/dst when possible;
+ * falls back to other liquid assets on the same chains so illiquid picks are replaced.
+ */
+function buildAllChainsPickedMatrixCoverage(
+  connectedRoutes,
+  balances,
+  gasBalances,
+  pairStats,
+  pickedMap,
+  liquidByChain
+) {
+  const routeIndex = new Map();
+  for (const r of connectedRoutes) {
+    routeIndex.set(`${r.fromAsset}::${r.toAsset}`, r);
+  }
+  const chainKeys = [
+    ...new Set(
+      connectedRoutes.flatMap((r) => [getChainRouteStepKey(r.fromAsset), getChainRouteStepKey(r.toAsset)])
+    ),
+  ].sort((a, b) => String(a).localeCompare(String(b)));
+  const out = [];
+  const seenEdge = new Set();
+  for (const ci of chainKeys) {
+    for (const cj of chainKeys) {
+      const fromOrder = orderAssetsForChainFallback(ci, pickedMap, liquidByChain);
+      const toOrder = orderAssetsForChainFallback(cj, pickedMap, liquidByChain);
+      let chosen = null;
+      outer: for (const fa of fromOrder) {
+        for (const ta of toOrder) {
+          if (fa === ta) continue;
+          const r = routeIndex.get(`${fa}::${ta}`);
+          if (!r) continue;
+          if (!isSourceLiquidForRoute(fa, balances, gasBalances, connectedRoutes)) continue;
+          chosen = r;
+          break outer;
+        }
+      }
+      if (!chosen) continue;
+      const ek = `${chosen.fromAsset}::${chosen.toAsset}`;
+      if (seenEdge.has(ek)) continue;
+      seenEdge.add(ek);
+      out.push(chosen);
+    }
+  }
+  return out;
+}
+
+function mergeRoutesDedupe(matrixPrefix, restRoutes) {
+  const edgeKey = (r) => `${r.fromAsset}::${r.toAsset}`;
+  const seen = new Set(matrixPrefix.map(edgeKey));
+  const out = [...matrixPrefix];
+  for (const r of restRoutes) {
+    const k = edgeKey(r);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(r);
+  }
+  return out;
 }
 
 /**
@@ -1082,6 +1325,7 @@ class RouteOptimizerAgent {
     const gasBalances = opts.gasBalances || new Map();
 
     let seedAllowlist = null;
+    let pickedMapForChains = null;
 
     const { connectedTypes, connectedRoutes } = resolveConnectedTypesAndRoutes(
       routes,
@@ -1091,10 +1335,20 @@ class RouteOptimizerAgent {
     if (mode === "allChains") {
       if (opts.seedAllowlist instanceof Set && opts.seedAllowlist.size > 0) {
         seedAllowlist = opts.seedAllowlist;
+        pickedMapForChains = new Map();
+        for (const assetId of seedAllowlist) {
+          pickedMapForChains.set(getChainRouteStepKey(assetId), assetId);
+        }
       } else {
-        seedAllowlist = this.pickOneSeedPerChain(connectedRoutes, balances, gasBalances);
+        pickedMapForChains = pickOneRandomAssetPerChainPrefix(connectedRoutes, balances, gasBalances);
+        seedAllowlist = new Set(pickedMapForChains.values());
       }
     }
+
+    const closeCycle = true;
+    // #region agent log
+    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'planner',hypothesisId:'H29',location:'src/agents/routeOptimizerAgent.js:run:opts',message:'Planner run options',data:{mode,closeCycle,chainRoutesUniqueChains:mode==='allChains',seedAllowlistSize:seedAllowlist?.size??null,connectedRoutes:connectedRoutes.length},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
 
     const flow = buildChainReactionFlow(connectedRoutes, {
       connectedWalletTypes: connectedTypes,
@@ -1104,20 +1358,51 @@ class RouteOptimizerAgent {
       seedAllowlist,
       chainRoutesUniqueChains: mode === "allChains",
       seedOrderMode: mode === "allChains" ? "chains" : "allAssets",
+      closeCycle,
     });
 
     const pairStats = this.memory?.getAllPairStats?.() || null;
+    const liquidByChain = buildLiquidSourceAssetsByChain(connectedRoutes, balances, gasBalances);
+
+    let matrixPrefix = [];
+    if (mode === "allTests") {
+      matrixPrefix = buildAllTestsChainMatrixCoverage(connectedRoutes, balances, gasBalances, pairStats);
+    } else {
+      const pm =
+        pickedMapForChains ||
+        pickOneRandomAssetPerChainPrefix(connectedRoutes, balances, gasBalances);
+      matrixPrefix = buildAllChainsPickedMatrixCoverage(
+        connectedRoutes,
+        balances,
+        gasBalances,
+        pairStats,
+        pm,
+        liquidByChain
+      );
+    }
+
+    const chainKeys = [
+      ...new Set(
+        connectedRoutes.flatMap((r) => [getChainRouteStepKey(r.fromAsset), getChainRouteStepKey(r.toAsset)])
+      ),
+    ];
+    const chainDim = chainKeys.length;
+    const maxTotalDefault = Math.min(
+      2048,
+      Math.max(160, chainDim * chainDim + matrixPrefix.length + 100)
+    );
+
     let routesForPlan = flow.allRoutes;
     if (mode === "allChains") {
       const matrix = computeChainPairMatrix(connectedRoutes, pairStats, null);
       const interleaved = interleaveRepresentativeRoutesByFromChain(matrix.representativeRoutes);
-      const edgeKeys = new Set(interleaved.map((r) => `${r.fromAsset}::${r.toAsset}`));
-      const rest = flow.allRoutes.filter((r) => !edgeKeys.has(`${r.fromAsset}::${r.toAsset}`));
-      routesForPlan = [...interleaved, ...rest];
+      routesForPlan = mergeRoutesDedupe(matrixPrefix, [...interleaved, ...flow.allRoutes]);
+    } else {
+      routesForPlan = mergeRoutesDedupe(matrixPrefix, flow.allRoutes);
     }
 
     const rawPlan = planFromAllRoutes(routesForPlan, {
-      maxTotal: Number.isFinite(opts.maxTotal) ? opts.maxTotal : 160,
+      maxTotal: Number.isFinite(opts.maxTotal) ? opts.maxTotal : maxTotalDefault,
       perPairLimit: Number.isFinite(opts.perPairLimit) ? opts.perPairLimit : 3,
     });
 

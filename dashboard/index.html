@@ -749,6 +749,42 @@
 </div>
 
 <script>
+// ── AMOUNTS: match backend `routeOptimizerAgent` formatUnitsAtomic (atomic → 0.xxxx) ──
+function toBigIntSafe(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null;
+    return BigInt(Math.floor(value));
+  }
+  const s = String(value).trim();
+  if (!s) return null;
+  try {
+    if (/[eE]/.test(s)) return BigInt(Math.floor(Number(s)));
+    return BigInt(s.includes('.') ? s.split('.')[0] : s);
+  } catch (_) {
+    return null;
+  }
+}
+
+/** Same logic as src/agents/routeOptimizerAgent.js formatUnitsAtomic */
+function formatUnitsAtomic(value, decimals = 8) {
+  const v = toBigIntSafe(value);
+  if (v === null) return null;
+  const d = Number.isFinite(Number(decimals)) ? Math.max(0, Math.floor(Number(decimals))) : 8;
+  const base = 10n ** BigInt(d);
+  const whole = v / base;
+  const frac = v % base;
+  if (frac === 0n) return whole.toString();
+  const fracStr = frac.toString().padStart(d, '0').replace(/0+$/, '');
+  return `${whole.toString()}.${fracStr}`;
+}
+
+function formatUnitsAtomicDisplay(value, decimals = 8) {
+  const s = formatUnitsAtomic(value, decimals);
+  return s === null ? '—' : s;
+}
+
 // ── STATE ──
 let ws = null;
 let pendingApproval = null;
@@ -761,6 +797,62 @@ let routeMetrics = { discovered: 0, planned: 0 };
 // ── WEBSOCKET ──
 let _wsRetryDelay = 1000;
 let _wsConnected = false;
+let _runStatusPollTimer = null;
+/** True only after GET /api/run/status reported suiteRunning — poll must not reset tradeable-only UI. */
+let _hydratedSuitePoll = false;
+
+function stopRunStatusPoll() {
+  if (_runStatusPollTimer) {
+    clearInterval(_runStatusPollTimer);
+    _runStatusPollTimer = null;
+  }
+}
+
+function startRunStatusPoll() {
+  if (_runStatusPollTimer) return;
+  _runStatusPollTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/api/run/status');
+      if (!r.ok) return;
+      const j = await r.json();
+      if (j.suiteRunning) return;
+      stopRunStatusPoll();
+      if (!_hydratedSuitePoll) return;
+      _hydratedSuitePoll = false;
+      const btnRun = document.getElementById('btnRunAll');
+      const stop = document.getElementById('btnStop');
+      if (!btnRun) return;
+      btnRun.disabled = false;
+      btnRun.innerHTML = '▶ Run All Tests';
+      if (stop) stop.style.display = 'none';
+      const lr = document.getElementById('lastRunLabel');
+      if (lr) lr.textContent = 'Last run: suite finished while you were away';
+    } catch (_) {}
+  }, 4000);
+}
+
+async function hydrateRunUiFromServer() {
+  try {
+    const r = await fetch('/api/run/status');
+    if (!r.ok) return;
+    const j = await r.json();
+    if (!j.suiteRunning) {
+      stopRunStatusPoll();
+      _hydratedSuitePoll = false;
+      return;
+    }
+    const env = String(j.env || 'testnet').toUpperCase();
+    const modeNote = j.mode === 'allChains' ? 'all chains' : 'all tests';
+    document.getElementById('btnRunAll').disabled = true;
+    document.getElementById('btnRunAll').innerHTML = '<span class="spinner"></span> Running…';
+    document.getElementById('btnStop').style.display = 'inline-flex';
+    document.getElementById('lastRunLabel').textContent =
+      `Running… (${env}) · ${modeNote} — session resumed`;
+    _hydratedSuitePoll = true;
+    startRunStatusPoll();
+  } catch (_) {}
+}
+
 function connectWS() {
   if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) return;
   const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -780,6 +872,7 @@ function connectWS() {
     loadChains();
     checkStuckOrders();
     updateEnvKeyNotice();
+    hydrateRunUiFromServer();
   };
   ws.onclose = () => {
     _wsConnected = false;
@@ -881,6 +974,8 @@ function handleTestEnd({ label, status, error, steps }) {
   }
 }
 function handleSuiteAborted(data) {
+  _hydratedSuitePoll = false;
+  stopRunStatusPoll();
   document.getElementById('lastRunLabel').textContent = `⏹ Aborted — ${data.stopped || 0} completed, ${data.remaining || 0} skipped`;
   document.getElementById('btnRunAll').disabled = false;
   document.getElementById('btnRunAll').innerHTML = '▶ Run All Tests';
@@ -888,6 +983,8 @@ function handleSuiteAborted(data) {
 }
 
 function handleSuiteEnd(d) {
+  _hydratedSuitePoll = false;
+  stopRunStatusPoll();
   const executed = typeof d.executed === 'number'
     ? d.executed
     : ((d.passed || 0) + (d.failed || 0) + (d.aborted || 0));
@@ -1000,6 +1097,8 @@ async function updateEnvKeyNotice() {
 }
 
 async function stopAll() {
+  _hydratedSuitePoll = false;
+  stopRunStatusPoll();
   // Reset dashboard Run All button
   const dashBtn = document.getElementById('btnRunAll');
   if (dashBtn) { dashBtn.disabled = false; dashBtn.innerHTML = '▶ Run All Tests'; }
@@ -1549,7 +1648,8 @@ function showReadinessModal(readiness) {
     chainPairMatrix, beamHopTotal, beamHopRunnable,
     requiredAmountSufficient, requiredAmountSummary, topThreeConditions,
     seedAllowlistSize, builtChains, canInitiate, rawPlannedRoutes, executablePlannedRoutes,
-    consolidation, hasQualifiedChainStart, executablePlanCount,
+    executablePlanRoutes,
+    consolidation, hasQualifiedChainStart, executablePlanCount, simulation,
   } = readiness;
   const isAllChains = _selectedRunMode === 'allChains';
   // Count categories
@@ -1576,173 +1676,129 @@ function showReadinessModal(readiness) {
     ? (canRun ? 100 : seedReadinessPct)
     : readinessPct;
   const barColor = displayReadinessPct >= 80 ? 'var(--green)' : displayReadinessPct >= 30 ? 'var(--yellow)' : 'var(--red)';
-  const coverageTitle = isAllChains
-    ? (canRun ? 'Run readiness (strict gate open)' : 'Seed funding (chain-start wallets)')
-    : 'Balance coverage';
-  const matrix =
-    isAllChains && chainPairMatrix && chainPairMatrix.fanoutTotal > 0
-      ? chainPairMatrix
-      : null;
-  const fanoutMax = matrix && Number.isFinite(matrix.fanoutTotal) ? matrix.fanoutTotal : 0;
-  const matrixSummaryLine = matrix
-    ? `Fan-out (N−1) from best chain <code style="font-size:10px">${(matrix.bestFanoutChainKey || '').replace(/</g, '')}</code>: ${matrix.coveredFanout}/${matrix.fanoutTotal} catalog hops · ${matrix.executableFanout} executable from wallet · per-chain table in API <code>perChainFanout</code>.`
-    : '';
-  const coverageFootnote = isAllChains
-    ? (matrix
-      ? `${matrixSummaryLine} Beam hops (one path per seed): ${beamHopRunnable != null ? beamHopRunnable : '—'}/${beamHopTotal != null ? beamHopTotal : '—'}.`
-      : `Hop depth (every candidate beam): ${readinessPct}% · ${runnableRoutes}/${totalRoutes} hops — not the same as “routes this run”.`)
-    : '';
-
-  const assetRows = assets.map(a => {
-    const balStr = a.balanceNormalized !== undefined && a.balanceNormalized !== null
-      ? String(a.balanceNormalized)
-      : (a.balance !== null ? String(a.balance) : '—');
-    const isChainFunded = a.reason === 'chain_funded';
-    const shortfallStr = a.needMoreNormalized !== undefined && a.needMoreNormalized !== null
-      ? String(a.needMoreNormalized)
-      : (a.needMoreAtomic !== undefined && a.needMoreAtomic !== null ? String(a.needMoreAtomic) : '—');
-
-    const icon = a.sufficient
-      ? (isChainFunded ? '<span style="color:var(--cyan)">🔗</span>' : '<span style="color:var(--green)">✅</span>')
-      : a.reason === 'balance_unknown'
-        ? '<span style="color:var(--yellow)">❓</span>'
-        : '<span style="color:var(--red)">❌</span>';
-
-    const reasonText = a.sufficient
-      ? (isChainFunded
-        ? '<span style="color:var(--cyan);font-size:10px">Funded by previous trade output</span>'
-        : '')
-      : a.reason === 'balance_unknown'
-        ? '<span style="color:var(--yellow);font-size:10px">Balance not cached — refresh balances or check RPC Issues</span>'
-        : a.reason === 'insufficient_gas'
-          ? '<span style="color:var(--red);font-size:10px">Insufficient native gas for tx fees</span>'
-          : a.reason === 'insufficient_balance'
-            ? '<span style="color:var(--red);font-size:10px">Balance below minimum trade amount</span>'
-            : '';
-
-    const balColor = a.balance === null ? 'var(--muted)' : a.sufficient ? 'var(--green)' : 'var(--red)';
-
-    // Chain-reaction badges
-    const chainBadge = a.isChainStart
-      ? `<span style="background:rgba(34,197,94,.15);color:var(--green);font-size:9px;padding:1px 6px;border-radius:8px;margin-left:6px">⚡ Chain Start → ${a.chainLength} hops</span>`
-      : isChainFunded
-        ? '<span style="background:rgba(6,182,212,.1);color:var(--cyan);font-size:9px;padding:1px 6px;border-radius:8px;margin-left:6px">🔗 Chain-funded</span>'
-        : '';
-
-    return `<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.04);${!a.sufficient && !isChainFunded ? 'opacity:.7' : ''}">
-      <span style="flex-shrink:0;width:20px;text-align:center">${icon}</span>
-      ${a.icon ? `<img src="${a.icon}" style="width:20px;height:20px;border-radius:50%;flex-shrink:0" onerror="this.style.display='none'">` : ''}
-      <div style="flex:1;min-width:0">
-        <div style="font-weight:600;font-size:13px">${a.ticker} <span style="color:var(--muted);font-weight:400;font-size:11px">on ${(a.chainRaw||a.chain||'').replace(/_/g,' ')}</span>${chainBadge}</div>
-        <div style="display:flex;gap:12px;font-size:11px;margin-top:2px">
-          <span style="color:var(--muted)">Balance: <span style="color:${balColor};font-family:'JetBrains Mono',monospace">${balStr}</span></span>
-          <span style="color:var(--muted)">Need More: <span style="font-family:'JetBrains Mono',monospace">${shortfallStr}</span></span>
-        </div>
-        ${reasonText ? `<div style="margin-top:3px">${reasonText}</div>` : ''}
-      </div>
-      <div style="text-align:right;flex-shrink:0">
-        <div style="font-size:12px;font-weight:600;color:var(--muted)">${a.routeCount} pair${a.routeCount!==1?'s':''}</div>
-      </div>
-    </div>`;
-  }).join('');
-
-  // Flow chain summary
-  const consolidationBanner = (isAllChains && consolidation && consolidation.eligible)
-    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(168,85,247,.08)">
-        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:#c4b5fd;margin-bottom:6px">Fallback native target (no qualified beam seed)</div>
-        <div style="font-size:13px;font-weight:600">${(consolidation.targetName || consolidation.targetAssetId || '').replace(/</g,'')}</div>
-        <div style="font-size:10px;color:var(--muted);margin-top:6px;line-height:1.45">Random EVM native on a chain with sufficient gas and at least one Garden quote/liquidity path to another asset on that chain. Shown when no funded chain-start seed produced a beam in this mode, or when nothing else is executable. Other catalog swaps may still be runnable. A second check runs on Run.</div>
-      </div>`
-    : '';
-
-  const cycleTourBanner = `<div style="font-size:10px;color:var(--muted);line-height:1.55;margin-bottom:10px;padding:10px 12px;background:rgba(255,255,255,.04);border-radius:10px;border:1px solid rgba(255,255,255,.07)">
-    <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--fg);margin-bottom:6px">Cycle tour (both modes)</div>
-    <div style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--fg);margin-bottom:6px">f(a_i) = a_{(i mod n) + 1} · a₁→a₂→⋯→aₙ→a₁</div>
-    <div style="font-size:11px;line-height:1.5"><b>allChains</b> — recurrence on <b>chain</b> prefixes (sorted): beam seeds use the chain cycle; N−1 fan-out rows follow the same ring from the best source chain.</div>
-    <div style="font-size:11px;line-height:1.5;margin-top:6px"><b>allTests</b> — same formula; ordering is over <b>every funded seed asset</b> (globally sorted asset ids), then scored multi-hop beams + standalone routes.</div>
-  </div>`;
-
-  const matrixPairRows = (matrix && Array.isArray(matrix.rows) && matrix.rows.length)
-    ? (() => {
-        const lim = 48;
-        const slice = matrix.rows.slice(0, lim);
-        const more = matrix.rows.length > lim ? ` … +${matrix.rows.length - lim} more` : '';
-        return slice.map((row) => {
-          const short = (k) => (k || '').replace(/_sepolia|_testnet|_mainnet/g, '').replace(/_/g, ' ') || '—';
-          const st = row.covered
-            ? (row.fromExecutable ? 'var(--green)' : 'var(--yellow)')
-            : 'var(--muted)';
-          const lab = row.covered
-            ? `${row.fromTicker || '?'} → ${row.toTicker || '?'}`
-            : '—';
-          return `<div style="font-size:10px;line-height:1.5;color:${st}"><span style="color:var(--muted)">${short(row.fromChain)}</span> → <span style="color:var(--muted)">${short(row.toChain)}</span> <span style="font-family:'JetBrains Mono',monospace">${lab}</span></div>`;
-        }).join('') + (more ? `<div style="font-size:10px;color:var(--muted);margin-top:6px">${more}</div>` : '');
-      })()
-    : '';
-
-  const allTestsModeHint = !isAllChains
-    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(6,182,212,.06)">
-        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--cyan);margin-bottom:6px">allTests — all assets</div>
-        <div style="font-size:11px;line-height:1.55;color:var(--muted)">See <b>Cycle tour</b> above: planner walks <b>all funded seed assets</b> (sorted), not only one chain at a time.</div>
-      </div>`
-    : '';
-
-  const perChainFanoutHtml = (matrix && Array.isArray(matrix.perChainFanout) && matrix.perChainFanout.length)
-    ? `<div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.5">Per chain (covered / N−1): ${matrix.perChainFanout.map((p) => {
-        const short = (k) => (k || '').replace(/_sepolia|_testnet|_mainnet/g, '').replace(/_/g, ' ') || '—';
-        return `<span style="display:inline-block;margin:0 8px 4px 0">${short(p.chainKey)}: <strong>${p.covered}</strong>/${p.fanoutSlots}</span>`;
-      }).join('')}</div>`
-    : '';
-
-  const chainMatrixBlock = matrix
-    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(34,197,94,.06)">
-        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--green);margin-bottom:6px">⬡ allChains — N−1 fan-out (catalog)</div>
-        <div style="font-size:11px;line-height:1.55;margin-bottom:8px;color:var(--fg)">
-          <strong>${matrix.coveredFanout}</strong> / <strong>${matrix.fanoutTotal}</strong> hops covered
-          <span style="color:var(--muted)"> (${matrix.distinctChains} chains ⇒ <strong>N−1 = ${fanoutMax}</strong> slots from one source chain; best source: <code style="font-size:10px">${(matrix.bestFanoutChainKey || '').replace(/</g, '')}</code>)</span>
-        </div>
-        ${perChainFanoutHtml}
-        <div style="font-size:10px;color:var(--muted);margin-bottom:8px;line-height:1.45">Rows follow the ring <span style="font-family:'JetBrains Mono',monospace;font-size:9px">a₁→⋯→aₙ→a₁</span> from the best source chain. “Covered” = at least one swap exists. Plan prepends these hops (same recurrence as above), then beam/standalone routes.</div>
-        <div style="max-height:180px;overflow-y:auto;padding-right:4px;border-top:1px solid rgba(255,255,255,.06);padding-top:8px">
-          ${matrixPairRows || '<div style="font-size:11px;color:var(--muted)">No pairs</div>'}
-        </div>
-      </div>`
-    : '';
-
-  const chainSummary = (flowChains && flowChains.length)
-    ? `<div style="padding:10px 14px;border-bottom:1px solid var(--border);background:rgba(6,182,212,.04)">
-        <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--cyan);margin-bottom:6px">⚡ Beam preview (one path per funded seed)</div>
-        ${flowChains.map((fc, i) => {
-          const assetLabels = (fc.assets || []).map(a => {
-            const t = a.split(':').pop()?.toUpperCase() || a;
-            const c = a.split(':')[0]?.replace(/_.*/, '') || '';
-            return `${t}<span style="color:var(--muted);font-size:9px">(${c})</span>`;
-          }).join(' → ');
-          const gasOk = fc.feasible !== false;
-          return `<div style="font-size:11px;margin-bottom:4px;line-height:1.6">
-            <span style="color:${gasOk ? 'var(--green)' : 'var(--yellow)'}">Chain ${i+1}:</span> ${assetLabels}
-            <span style="color:var(--muted);margin-left:6px">(${fc.length} hops${!gasOk ? ', ⚠️ gas issue' : ''})</span>
-          </div>`;
-        }).join('')}
-      </div>`
-    : '';
-
-  const runBtnStyle = canRun
-    ? 'background:var(--green);color:#000;cursor:pointer'
-    : 'background:var(--bg3);color:var(--muted);cursor:not-allowed;border:1px solid var(--border)';
-  const runBtnText = canRun
-    ? (isAllChains
-      ? `▶ Run ${executablePlannedRoutes ?? 0} route${(executablePlannedRoutes||0)!==1?'s':''} — N−1 fan-out + catalog (wallet-funded source) · ${effectiveFundedSeeds.length} funded seed${effectiveFundedSeeds.length!==1?'s':''}`
-      : `▶ Run ${executablePlannedRoutes ?? runnableRoutes} Routes (${effectiveFundedSeeds.length} seed${effectiveFundedSeeds.length!==1?'s':''})`)
-    : `🔒 No executable beam plan from funded sources`;
-  const requiredSummary = requiredAmountSummary || { sufficientCount: 0, insufficientCount: 0, unknownCount: 0 };
-  const requiredColor = requiredAmountSufficient ? 'var(--green)' : 'var(--yellow)';
   const modeAllTestsStyle = _selectedRunMode === 'allTests'
     ? 'background:var(--cyan);color:#021015;border-color:var(--cyan)'
     : 'background:var(--bg3);color:var(--muted);border-color:var(--border)';
   const modeAllChainsStyle = _selectedRunMode === 'allChains'
     ? 'background:var(--cyan);color:#021015;border-color:var(--cyan)'
     : 'background:var(--bg3);color:var(--muted);border-color:var(--border)';
+
+  const walletLine = (a, invalid = false) => {
+    const dm = a.decimals != null ? Number(a.decimals) : 8;
+    const balStr = a.balanceNormalized !== undefined && a.balanceNormalized !== null && a.balanceNormalized !== ''
+      ? String(a.balanceNormalized)
+      : (a.balance !== null && a.balance !== undefined ? formatUnitsAtomicDisplay(a.balance, dm) : '—');
+    const shortfallStr = a.needMoreNormalized !== undefined && a.needMoreNormalized !== null && a.needMoreNormalized !== ''
+      ? String(a.needMoreNormalized)
+      : (a.needMoreAtomic !== undefined && a.needMoreAtomic !== null
+        ? formatUnitsAtomicDisplay(a.needMoreAtomic, dm)
+        : '—');
+    const chainStr = String(a.chainRaw || a.chain || '').replace(/_/g, ' ');
+    const name = `${String(a.ticker || '').toUpperCase()} on ${chainStr}`.trim();
+    const invalidTag = invalid ? ` <span style="color:var(--red)">(invalid)</span>` : '';
+    return `<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04)">
+      <div style="font-size:12px;font-weight:600">${name}${invalidTag}</div>
+      <div style="font-size:11px;color:var(--muted);margin-top:2px;display:flex;justify-content:space-between;gap:12px">
+        <span>balance - <span style="font-family:'JetBrains Mono',monospace;color:var(--fg)">${balStr}</span></span>
+        <span>need more - <span style="font-family:'JetBrains Mono',monospace;color:var(--fg)">${shortfallStr}</span></span>
+      </div>
+    </div>`;
+  };
+
+  const validAssets = assets.filter((a) => a.sufficient === true);
+  const invalidAssets = assets.filter((a) => a.sufficient !== true);
+
+  const walletValidHtml = validAssets.length
+    ? validAssets.map((a) => walletLine(a, false)).join('')
+    : `<div style="font-size:11px;color:var(--muted)">no valid assets</div>`;
+
+  const walletInvalidHtml = invalidAssets.length
+    ? invalidAssets.map((a) => walletLine(a, true)).join('')
+    : '';
+
+  const mergeFlowChains = (chains = []) => {
+    const paths = [];
+    for (const fc of chains) {
+      const seq = Array.isArray(fc.assets) ? fc.assets.filter(Boolean) : [];
+      if (!seq.length) continue;
+      let merged = false;
+      for (const p of paths) {
+        const pLast = p.assets[p.assets.length - 1];
+        const pFirst = p.assets[0];
+        const sFirst = seq[0];
+        const sLast = seq[seq.length - 1];
+        if (pLast === sFirst) {
+          p.assets = p.assets.concat(seq.slice(1));
+          p.hops += Number(fc.length || Math.max(0, seq.length - 1));
+          p.gasOk = p.gasOk && (fc.feasible !== false);
+          merged = true;
+          break;
+        }
+        if (sLast === pFirst) {
+          p.assets = seq.slice(0, -1).concat(p.assets);
+          p.hops += Number(fc.length || Math.max(0, seq.length - 1));
+          p.gasOk = p.gasOk && (fc.feasible !== false);
+          merged = true;
+          break;
+        }
+      }
+      if (!merged) {
+        paths.push({
+          assets: seq.slice(),
+          hops: Number(fc.length || Math.max(0, seq.length - 1)),
+          gasOk: fc.feasible !== false,
+        });
+      }
+    }
+    return paths;
+  };
+  const mergedFlowPaths = mergeFlowChains(flowChains || []);
+  const formatAssetShort = (id) => {
+    if (!id) return '—';
+    const t = String(id).split(':').pop()?.toUpperCase() || String(id);
+    const c = String(id).split(':')[0]?.replace(/_.*/, '') || '';
+    return `${t}(${c})`;
+  };
+  const plannedHops = Array.isArray(executablePlanRoutes) ? executablePlanRoutes : [];
+  const plannedHopsHtml = plannedHops.length
+    ? plannedHops.map((r) => {
+        const line = r.label || `${formatAssetShort(r.fromAsset)} → ${formatAssetShort(r.toAsset)}`;
+        return `<div style="font-size:11px;color:var(--muted);line-height:1.55;margin:3px 0;font-family:'JetBrains Mono',monospace">${line}</div>`;
+      }).join('')
+    : `<div style="font-size:11px;color:var(--muted)">—</div>`;
+  const routesHtml = mergedFlowPaths.length
+    ? mergedFlowPaths.map((p) => {
+        const label = (p.assets || []).map((a) => {
+          const t = String(a).split(':').pop()?.toUpperCase() || String(a);
+          const c = String(a).split(':')[0]?.replace(/_.*/, '') || '';
+          return `${t}(${c})`;
+        }).join(' -> ');
+        return `<div style="font-size:11px;color:var(--muted);line-height:1.6;margin:4px 0">${label}</div>`;
+      }).join('')
+    : `<div style="font-size:11px;color:var(--muted)">no beam chains</div>`;
+
+  const simOk = simulation?.ok === true;
+  const simFailed = simulation?.failedFlow || null;
+  const simSkippedCount = Array.isArray(simulation?.skippedFlows) ? simulation.skippedFlows.length : (Number(simulation?.skippedFlowsCount || 0) || 0);
+  const simSummaryLine = simOk
+    ? `✅ preflight ok${simSkippedCount ? ` (skipped ${simSkippedCount} illiquid)` : ''}`
+    : (simulation
+        ? `❌ preflight failed: ${String(simFailed?.error || simFailed?.reason || 'unknown')}`
+        : '— preflight not available');
+
+  const planSummaryLine = `planned routes: ${Number(executablePlannedRoutes || 0)}/${Number(rawPlannedRoutes || 0)} executable`;
+  const gateSummaryLine = canRun
+    ? '✅ strict gate open (can initiate)'
+    : '⛔ strict gate closed (no executable planned routes)';
+
+  const consolidationLine = consolidation?.eligible
+    ? `⚠️ consolidation suggested: ${String(consolidation?.target?.name || consolidation?.target?.id || '')}`.trim()
+    : (consolidation?.reason ? `ℹ️ consolidation: ${String(consolidation.reason)}` : '');
+
+  const runBtnStyle = canRun
+    ? 'background:var(--green);color:#000;cursor:pointer'
+    : 'background:var(--bg3);color:var(--muted);cursor:not-allowed;border:1px solid var(--border)';
+  const runBtnText = 'RUN';
 
   const runBypassHtml = !canRun
     ? `<button type="button" id="readinessRunBypassBtn" onclick="if(confirm('Strict readiness gate is closed (no executable planned routes with current balances). Trades may skip or fail. Continue?')){ document.getElementById('readinessOverlay').remove(); _proceedToTradeSizeModal(_selectedRunMode); }" style="padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;border:1px solid rgba(234,179,8,.45);background:rgba(234,179,8,.08);color:var(--yellow);cursor:pointer;width:100%;margin-top:8px">▶ Run anyway — bypass gate</button>`
@@ -1753,63 +1809,64 @@ function showReadinessModal(readiness) {
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:16px;width:620px;max-width:95vw;max-height:min(90vh,calc(100vh - 24px));display:flex;flex-direction:column;overflow:hidden;flex-shrink:0;margin:auto">
         <div style="flex-shrink:0;padding:20px 24px 16px;border-bottom:1px solid var(--border)">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
-            <div style="font-size:17px;font-weight:700">🚀 Route Readiness — Chain Reaction</div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <div style="font-size:17px;font-weight:700">Route Readiness</div>
+              <div style="display:flex;gap:6px">
+                <button type="button" onclick="_setRunModeFromModal('allTests')" style="padding:6px 10px;border-radius:8px;border:1px solid;font-size:11px;font-weight:700;cursor:pointer;${modeAllTestsStyle}">allTests</button>
+                <button type="button" onclick="_setRunModeFromModal('allChains')" style="padding:6px 10px;border-radius:8px;border:1px solid;font-size:11px;font-weight:700;cursor:pointer;${modeAllChainsStyle}">allChains</button>
+              </div>
+            </div>
             <button onclick="document.getElementById('readinessOverlay').remove()" style="background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;padding:0 4px">×</button>
           </div>
-          <div style="margin-bottom:12px">
-            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
-              <span style="font-size:12px;color:var(--muted)">${coverageTitle}</span>
-              <span style="font-size:14px;font-weight:700;color:${barColor}">${displayReadinessPct}%${isAllChains && canRun ? ' <span style="font-size:11px;font-weight:500;color:var(--muted)">(execute)</span>' : ''}</span>
-            </div>
-            <div style="background:var(--bg3);border-radius:8px;height:12px;overflow:hidden;border:1px solid var(--border)">
+          <div style="margin-top:10px">
+            <div style="font-size:12px;color:var(--muted);margin-bottom:6px">${displayReadinessPct}% loading</div>
+            <div style="background:var(--bg3);border-radius:8px;height:10px;overflow:hidden;border:1px solid var(--border)">
               <div style="height:100%;width:0%;background:${barColor};border-radius:7px;transition:width 1s ease-out" id="readinessBar"></div>
             </div>
-            ${coverageFootnote ? `<div style="font-size:10px;color:var(--muted);margin-top:6px;line-height:1.45">${coverageFootnote}</div>` : ''}
-            ${isAllChains ? `<div style="font-size:10px;color:var(--muted);margin-top:4px;line-height:1.45"><b>Seeds</b> = wallet-funded starting assets for a beam (chain cycle). <b>allChains</b> prepends ring-ordered N−1 fan-out, then beams (${planReadinessPct}% of broad plan rows executable).</div>` : ''}
-          </div>
-          <div style="display:flex;gap:12px;font-size:12px;flex-wrap:wrap">
-            <span style="color:var(--green)">⚡ ${effectiveFundedSeeds.length} seed${effectiveFundedSeeds.length!==1?'s':''} funded</span>
-            <span style="color:var(--cyan)">🔗 ${chainFunded.length} chain-funded</span>
-            ${unknownAssets.length > 0 ? `<span style="color:var(--yellow)">❓ ${unknownAssets.length} unknown</span>` : ''}
-            ${insufficientAssets.length > 0 ? `<span style="color:var(--red)">❌ ${insufficientAssets.length} insufficient</span>` : ''}
-            <span style="color:var(--muted);margin-left:auto" title="${matrix ? 'Best-chain fan-out: covered hops vs N−1.' : 'Runnable asset-rows vs total route rows.'}">${runnableRoutes}/${totalRoutes} ${matrix ? 'fan-out covered' : 'hops runnable'}</span>
           </div>
         </div>
-        <div style="flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch">
-        ${consolidationBanner}
-        ${cycleTourBanner}
-        ${allTestsModeHint}
-        ${chainMatrixBlock}
-        ${chainSummary}
-        <div>
-          ${assets.length ? assetRows : '<div style="text-align:center;padding:40px;color:var(--muted)">No routes found — connect wallets first</div>'}
+        <div style="flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding:16px 24px">
+          <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.03);border-radius:12px;margin-bottom:14px">
+            <div style="font-size:12px;font-weight:800;margin-bottom:6px">planner + gate preview</div>
+            <div style="font-size:11px;color:var(--muted);line-height:1.6">
+              <div>${gateSummaryLine}</div>
+              <div>${planSummaryLine}</div>
+              <div>${simSummaryLine}</div>
+              ${consolidationLine ? `<div>${consolidationLine}</div>` : ''}
+            </div>
+          </div>
+          <div style="font-size:12px;font-weight:700;margin-bottom:10px">wallet balance:</div>
+          <div style="padding-bottom:10px">${walletValidHtml}</div>
+          ${invalidAssets.length ? `<div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.10);padding-top:10px">${walletInvalidHtml}</div>` : ''}
+
+          <div style="margin-top:16px;border-top:1px solid rgba(255,255,255,.10);padding-top:12px">
+            <div style="font-size:12px;font-weight:700;margin-bottom:4px">planned single hops</div>
+            <div style="font-size:10px;color:var(--muted);line-height:1.45;margin-bottom:8px">
+              Same count as <span style="font-family:'JetBrains Mono',monospace">planned routes: ${Number(executablePlannedRoutes || 0)}/${Number(rawPlannedRoutes || 0)}</span> — one line per hop the runner may execute (cap 160, up to 3 per pair).
+            </div>
+            <div style="max-height:min(38vh,320px);overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:10px 12px;background:rgba(0,0,0,.18)">
+              ${plannedHopsHtml}
+            </div>
+          </div>
+
+          <div style="margin-top:16px;border-top:1px solid rgba(255,255,255,.10);padding-top:12px">
+            <div style="font-size:12px;font-weight:700;margin-bottom:4px">beam chains (multi-hop summaries)</div>
+            <div style="font-size:10px;color:var(--muted);line-height:1.45;margin-bottom:8px">
+              Fewer rows than planned hops: these are merged chain-reaction paths from seeds, not the full hop list.
+            </div>
+            ${routesHtml}
+          </div>
         </div>
-        </div>
-        <div style="flex-shrink:0;padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:flex-start;background:var(--bg2)">
-          <button onclick="document.getElementById('readinessOverlay').remove();showPanel('wallets')" class="btn btn-ghost" style="font-size:13px">💳 Wallets</button>
+        <div style="flex-shrink:0;padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center;background:var(--bg2)">
+          <button onclick="document.getElementById('readinessOverlay').remove();showPanel('wallets')" class="btn btn-ghost" style="font-size:13px">WALLET</button>
           <button onclick="document.getElementById('readinessOverlay').remove()" class="btn btn-ghost" style="font-size:13px">Cancel</button>
           <div style="flex:1"></div>
-          <div style="display:flex;flex-direction:column;gap:6px;min-width:220px;max-width:300px">
-            <div style="display:flex;gap:6px" title="Switch planner mode — refetches readiness from the server">
-              <button type="button" id="modeAllTestsBtn" onclick="_setRunModeFromModal('allTests')" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid;font-size:11px;font-weight:700;cursor:pointer;${modeAllTestsStyle}">allTests</button>
-              <button type="button" id="modeAllChainsBtn" onclick="_setRunModeFromModal('allChains')" style="flex:1;padding:7px 10px;border-radius:8px;border:1px solid;font-size:11px;font-weight:700;cursor:pointer;${modeAllChainsStyle}">allChains</button>
-            </div>
-            <div style="font-size:9px;color:var(--muted);line-height:1.35;margin:-2px 0 4px">allTests = all assets (sorted) + beams · allChains = chain cycle + N−1 fan-out · tap to switch</div>
-            <button type="button" id="readinessRunBtn"
-              onclick="document.getElementById('readinessOverlay').remove();_proceedToTradeSizeModal(_selectedRunMode)"
-              style="padding:10px 20px;border-radius:10px;font-size:13px;font-weight:700;border:none;width:100%;line-height:1.35;${runBtnStyle}"
-              ${canRun ? '' : 'disabled'}>
-              ${runBtnText} · ${_selectedRunMode}
-            </button>
-            ${runBypassHtml}
-            <div style="position:relative;background:var(--bg3);border-radius:6px;height:8px;overflow:hidden;border:1px solid var(--border)">
-              <div id="readinessRunBar" style="height:100%;width:0%;border-radius:5px;transition:width 1.2s ease-out;background:${barColor}"></div>
-            </div>
-            <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted)">
-              <span>${effectiveFundedSeeds.length}/${seedAssets.length || assets.length} seeds funded</span>
-              <span title="${matrix ? 'Best-chain N−1 fan-out coverage.' : 'Beam hop accounting, not Run button count.'}">${runnableRoutes}/${totalRoutes} ${matrix ? 'fan-out' : 'hops'}</span>
-            </div>
-          </div>
+          <button type="button" id="readinessRunBtn"
+            onclick="document.getElementById('readinessOverlay').remove();_proceedToTradeSizeModal(_selectedRunMode)"
+            style="padding:10px 20px;border-radius:10px;font-size:14px;font-weight:800;border:none;min-width:140px;${runBtnStyle}"
+            ${canRun ? '' : 'disabled'}>
+            ${runBtnText}
+          </button>
         </div>
       </div>
     </div>`);
@@ -1818,8 +1875,6 @@ function showReadinessModal(readiness) {
     setTimeout(() => {
       const bar = document.getElementById('readinessBar');
       if (bar) bar.style.width = displayReadinessPct + '%';
-      const runBar = document.getElementById('readinessRunBar');
-      if (runBar) runBar.style.width = displayReadinessPct + '%';
     }, 50);
   });
 }
@@ -2941,6 +2996,7 @@ function renderCombos(filter) {
     const toTicker   = assetLabel(c.to);
     const fromChain  = chainLabel(c.from);
     const toChain    = chainLabel(c.to);
+    const fromDec = Number(c.from?.decimals ?? 8);
     const fromDot    = c.fromWalletConnected ? `<span style="color:var(--green)">●</span>` : `<span style="color:var(--muted)">○</span>`;
     const toDot      = c.toWalletConnected   ? `<span style="color:var(--green)">●</span>` : `<span style="color:var(--muted)">○</span>`;
     const fromIcon   = c.from.icon ? `<img src="${c.from.icon}" style="width:18px;height:18px;border-radius:50%;margin-right:5px;vertical-align:middle" onerror="this.style.display='none'">` : '';
@@ -2949,13 +3005,14 @@ function renderCombos(filter) {
     // Balance info line (keep minimal, no instructions)
     let balanceLine = "";
     const balanceLow = c.canAfford === false;
-    if (c.walletBalance !== null) {
+    if (c.walletBalance !== null && c.walletBalance !== undefined) {
       const balColor = balanceLow ? "var(--red)" : "var(--green)";
-      balanceLine = `· <span style="color:${balColor}">Balance: ${Number(c.walletBalance).toLocaleString()}</span>`;
+      balanceLine = `· <span style="color:${balColor}">Balance: ${formatUnitsAtomicDisplay(c.walletBalance, fromDec)}</span>`;
     }
 
-    // Default input to policy minimum trade amount.
-    const suggested = c.minAmount;
+    // Default input respects server suggestedAmount (atomic); fallback to minAmount.
+    const suggested = (c.suggestedAmount !== null && c.suggestedAmount !== undefined) ? Number(c.suggestedAmount) : c.minAmount;
+    const suggestedHuman = formatUnitsAtomicDisplay(suggested, fromDec);
 
     return `
     <div class="combo-card ${statusClass}" id="combo-${safeId}">
@@ -2974,15 +3031,16 @@ function renderCombos(filter) {
         <span class="combo-badge ${badgeClass}">${badgeText}</span>
       </div>
       <div style="font-size:11px;color:var(--muted);margin-bottom:8px">
-        Min: ${Number(c.minAmount).toLocaleString()} – Max: ${Number(c.maxAmount).toLocaleString()} ${balanceLine}
+        Min: ${formatUnitsAtomicDisplay(c.minAmount, fromDec)} – Max: ${formatUnitsAtomicDisplay(c.maxAmount, fromDec)} ${balanceLine}
       </div>
       ${c.canTrade ? `
       <div class="combo-amount-row">
         <input class="combo-amount-input" id="amt-${safeId}"
-          type="number" value="${suggested}" min="${c.minAmount}" max="${c.maxAmount}" step="1">
-        <span style="font-size:11px;color:var(--muted);flex:1">${fromTicker} (atomic units)</span>
+          type="number" value="${suggested}" min="${c.minAmount}" max="${c.maxAmount}" step="1"
+          title="Atomic smallest units; ≈ ${suggestedHuman} ${fromTicker} @ ${fromDec} decimals">
+        <span style="font-size:11px;color:var(--muted);flex:1;line-height:1.35">≈ <span style="font-family:'JetBrains Mono',monospace;color:var(--fg)">${suggestedHuman}</span> ${fromTicker} · <span style="opacity:.85">input = atomic</span></span>
         <button class="btn btn-green"
-          onclick="confirmTrade('${safeId}','${c.from.assetId}','${c.to.assetId}','${c.from.walletType}','${c.to.walletType}','${fromTicker}','${toTicker}')"
+          onclick="confirmTrade('${safeId}','${c.from.assetId}','${c.to.assetId}','${c.from.walletType}','${c.to.walletType}','${fromTicker}','${toTicker}',${fromDec})"
           style="font-size:11px;padding:5px 12px">▶ Run</button>
       </div>` : `
       <div style="font-size:11px;color:var(--muted)">
@@ -3047,7 +3105,9 @@ async function executeTopArb() {
   const toLabel   = top.to.name   || top.to.assetId;
   if (!amount || amount <= 0) return;
 
-  if (!confirm(`Execute arbitrage trade?\n\n${fromLabel} → ${toLabel}\nAmount (atomic): ${amount.toLocaleString()}\nEstimated edge: ${(top.edge * 100).toFixed(2)}%\n\nThis will initiate a real transaction.`)) {
+  const arbDec = Number(top.from?.decimals ?? 8);
+  const arbHuman = formatUnitsAtomic(amount, arbDec);
+  if (!confirm(`Execute arbitrage trade?\n\n${fromLabel} → ${toLabel}\nAmount: ${arbHuman} (atomic: ${amount.toLocaleString()})\nEstimated edge: ${(top.edge * 100).toFixed(2)}%\n\nThis will initiate a real transaction.`)) {
     return;
   }
 
@@ -3097,11 +3157,13 @@ function filterCombos(filter) {
 
 let _singleTradeRunning = false;
 
-async function confirmTrade(safeId, fromAssetId, toAssetId, fromWalletType, toWalletType, fromTicker, toTicker) {
+async function confirmTrade(safeId, fromAssetId, toAssetId, fromWalletType, toWalletType, fromTicker, toTicker, fromDecimals) {
   const input  = document.getElementById(`amt-${safeId}`);
-  const amount = parseInt(input?.value || 50000);
+  const amount = parseInt(input?.value || 50000, 10);
+  const dec = Number(fromDecimals);
+  const human = formatUnitsAtomic(amount, Number.isFinite(dec) ? dec : 8);
 
-  if (!confirm(`Confirm trade:\n\n${fromTicker} → ${toTicker}\nFrom: ${fromAssetId}\nTo:   ${toAssetId}\nAmount: ${amount.toLocaleString()}\n\nThis will initiate a real transaction.`)) return;
+  if (!confirm(`Confirm trade:\n\n${fromTicker} → ${toTicker}\nFrom: ${fromAssetId}\nTo:   ${toAssetId}\nAmount: ${human} ${fromTicker}\n(atomic: ${amount.toLocaleString()})\n\nThis will initiate a real transaction.`)) return;
 
   try {
     const r = await fetch("/api/run/combination", {
@@ -3156,21 +3218,21 @@ function showTradeSizeModal(tradeable) {
   if (btcAssets.length) {
     const c = tradeable.find(x => btcAssets.includes(x.from.assetId));
     const bal = c ? Number(c.walletBalance || 0) : 0;
-    html += _groupRow("₿ Bitcoin Source (sats)", "btc_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance");
+    html += _groupRow("₿ Bitcoin Source (sats)", "btc_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance", Number(c?.from?.decimals ?? 8));
   }
 
   // Synthetic BTC group — one value for all
   if (synthBtcAssets.length) {
     const c = tradeable.find(x => synthBtcAssets.includes(x.from.assetId));
     const bal = c ? Number(c.walletBalance || 0) : 0;
-    html += _groupRow("🔵 Synthetic BTC (cBTC, wBTC, sBTC…)", "synthbtc_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance — applied to all synthetic BTC assets");
+    html += _groupRow("🔵 Synthetic BTC (cBTC, wBTC, sBTC…)", "synthbtc_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance — applied to all synthetic BTC assets", Number(c?.from?.decimals ?? 8));
   }
 
   // Stablecoins group
   if (stableAssets.length) {
     const c = tradeable.find(x => stableAssets.includes(x.from.assetId));
     const bal = c ? Number(c.walletBalance || 0) : 0;
-    html += _groupRow("💵 Stablecoins (USDC / USDT)", "stable_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance — applied to all stablecoin assets");
+    html += _groupRow("💵 Stablecoins (USDC / USDT)", "stable_group", bal, c?.minAmount, c?.maxAmount, "%", "% of balance — applied to all stablecoin assets", Number(c?.from?.decimals ?? 6));
   }
 
   // Other assets — group by ticker so all WETH chains share one row
@@ -3188,7 +3250,7 @@ function showTradeSizeModal(tradeable) {
       const chainsLabel = assetIds.length > 1 ? `${ticker} (${assetIds.length} chains)` : `${ticker} (${assetIds[0].split(":")[0].replace(/_/g," ")})`;
       const bal = c ? Number(c.walletBalance || 0) : 0;
       // Use ticker as key so all assetIds with same ticker share one amount
-      html += _groupRow(chainsLabel, "ticker_" + ticker.toLowerCase(), bal, c?.minAmount, c?.maxAmount, "%", `% of balance — applied to all ${ticker} assets`);
+      html += _groupRow(chainsLabel, "ticker_" + ticker.toLowerCase(), bal, c?.minAmount, c?.maxAmount, "%", `% of balance — applied to all ${ticker} assets`, Number(c?.from?.decimals ?? 8));
     }
   }
 
@@ -3205,9 +3267,11 @@ function showTradeSizeModal(tradeable) {
   document.body.insertAdjacentHTML("beforeend", html);
 }
 
-function _groupRow(label, key, balance, minAmt, maxAmt, unit, hint) {
+function _groupRow(label, key, balance, minAmt, maxAmt, unit, hint, decimals = 8) {
+  const dec = Number.isFinite(Number(decimals)) ? Math.max(0, Math.floor(Number(decimals))) : 8;
   const defaultPct = 50;
   const suggestedAmt = balance > 0 ? Math.max(Number(minAmt||0), Math.floor(balance * defaultPct / 100)) : (minAmt || 50000);
+  const sugHuman = formatUnitsAtomicDisplay(suggestedAmt, dec);
   return `
     <div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:14px;margin-bottom:10px">
       <div style="font-size:12px;font-weight:600;margin-bottom:8px">${label}</div>
@@ -3220,15 +3284,16 @@ function _groupRow(label, key, balance, minAmt, maxAmt, unit, hint) {
           <span style="font-size:11px;color:var(--muted)">%</span>
         </div>
         <span style="color:var(--muted);font-size:13px">=</span>
-        <div style="display:flex;align-items:center;gap:6px">
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
           <input id="amt_${key}" type="number" value="${suggestedAmt}" min="${minAmt||1}" max="${maxAmt||999999999}" step="1"
+            title="≈ ${sugHuman} (${dec} decimals)"
             style="width:130px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text);font-size:12px;font-family:'JetBrains Mono',monospace"
             oninput="updatePctFromAmt('${key}', ${balance})">
-          <span style="font-size:11px;color:var(--muted)">atomic units</span>
+          <span style="font-size:11px;color:var(--muted)">atomic · ≈ <span style="font-family:'JetBrains Mono',monospace;color:var(--fg)">${sugHuman}</span></span>
         </div>
-        ${balance > 0 ? `<span style="font-size:11px;color:var(--muted)">bal: ${Number(balance).toLocaleString()}</span>` : ""}
+        ${balance > 0 ? `<span style="font-size:11px;color:var(--muted)">bal: ${formatUnitsAtomicDisplay(balance, dec)}</span>` : ""}
       </div>
-      ${minAmt ? `<div style="font-size:10px;color:var(--muted);margin-top:5px">Min: ${Number(minAmt).toLocaleString()} · Max: ${Number(maxAmt).toLocaleString()} · ${hint}</div>` : ""}
+      ${minAmt ? `<div style="font-size:10px;color:var(--muted);margin-top:5px">Min: ${formatUnitsAtomicDisplay(minAmt, dec)} · Max: ${formatUnitsAtomicDisplay(maxAmt, dec)} · ${hint}</div>` : ""}
     </div>`;
 }
 
@@ -4195,7 +4260,8 @@ async function loadWalletStates() {
     if (d.evm) {
       connectedWallets.evm = true; evmAddress = d.evm.address;
       const _evmEl = document.getElementById('evm-addr');
-      _evmEl.textContent = shortenAddr(d.evm.address) + srcBadge(d.evm.source, 'metamask');
+      const _evmDisplay = d.evm.addressDisplay || d.evm.address;
+      _evmEl.textContent = shortenAddr(_evmDisplay) + srcBadge(d.evm.source, 'metamask');
       _evmEl.dataset.full = d.evm.address;
       _evmEl.title = d.evm.address + ' (click to copy)';
       _evmEl.style.color = srcColor(d.evm.source);
@@ -4557,6 +4623,7 @@ async function saveRpc(chain) {
 
 // ── INIT ──
 connectWS();
+hydrateRunUiFromServer();
 // Re-announce any already-connected browser wallets BEFORE loading states.
 // Fixes the refresh bug: MetaMask was connected before reload, server lost state
 // (restarted/envkey took over), browser silently re-registers with no popup.
