@@ -65,6 +65,7 @@ let _globalAbort = false;
 /** True while `runAll` is in progress (including gaps between routes, e.g. long sleeps). Used to hydrate dashboard after reconnect. */
 let _suiteRunActive = false;
 let _suiteRunMeta = null;
+let _abortEpoch = 0;
 
 function getSuiteRunStatus() {
   if (!_suiteRunActive || !_suiteRunMeta) return { suiteRunning: false };
@@ -197,6 +198,7 @@ function abortTest(testId) {
 
 function abortAll() {
   _globalAbort = true;
+  _abortEpoch++;
   _activeTests.forEach(ctrl => { ctrl.abort = true; });
 }
 
@@ -327,6 +329,7 @@ async function maybeNonEvmAllChainsGasPrefundViaGarden(ctx) {
     label,
     step,
     checkAbort,
+    forcePrefund = false,
   } = ctx;
   const wallets = walletState.getStatus();
   let assets = [];
@@ -347,7 +350,7 @@ async function maybeNonEvmAllChainsGasPrefundViaGarden(ctx) {
 
   if (fromChain === "solana") {
     const lamports = getSolanaNativeLamports(wallets);
-    if (lamports !== null && lamports >= MIN_SOL_LAMPORTS_FOR_FEES) {
+    if (!forcePrefund && lamports !== null && lamports >= MIN_SOL_LAMPORTS_FOR_FEES) {
       return { ok: true, skipped: true, reason: "sol_fee_ok" };
     }
     if (lamports === 0n) {
@@ -441,6 +444,7 @@ async function maybeAllChainsGasPrefundViaGarden({
   testId,
   step,
   checkAbort,
+  forcePrefund = false,
 }) {
   if (executionMode !== "allChains" || skipGasPrefund) {
     // #region agent log
@@ -470,7 +474,7 @@ async function maybeAllChainsGasPrefundViaGarden({
   }
   const { gasWei, isNativeToken, tokenBalance } = evmRead;
   if (isNativeToken) return { ok: true, skipped: true, reason: "source_is_native" };
-  if (gasWei >= MIN_NATIVE_WEI_FOR_GAS) {
+  if (!forcePrefund && gasWei >= MIN_NATIVE_WEI_FOR_GAS) {
     // #region agent log
     fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
       method: "POST",
@@ -600,6 +604,7 @@ async function maybeAllChainsGasPrefundViaGarden({
       testId,
       step,
       checkAbort,
+      forcePrefund,
     });
   }
 
@@ -719,11 +724,38 @@ async function runRoute({
   toMeta,
   executionMode = "allTests",
   skipGasPrefund = false,
+  suiteEpoch = null,
 }) {
   const testId = `${fromAsset}->${toAsset}-${Date.now()}`;
   const ctrl   = { abort: false };
   _activeTests.set(testId, ctrl);
   const steps  = [];
+
+  // #region agent log
+  fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+    body: JSON.stringify({
+      sessionId: "8d11f5",
+      runId: "pre",
+      hypothesisId: "H_dest_gas_1",
+      location: "src/tests/runner.js:runRoute:entry",
+      message: "runRoute entry",
+      data: {
+        executionMode,
+        fromChain,
+        toChain,
+        fromAsset,
+        toAsset,
+        amount: String(amount),
+        skipGasPrefund: !!skipGasPrefund,
+        hasFromMeta: !!fromMeta,
+        hasToMeta: !!toMeta,
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
 
   function step(name, status, detail = "", txHash = null) {
     const s = { name, status, detail, txHash, ts: new Date().toISOString() };
@@ -732,7 +764,11 @@ async function runRoute({
   }
 
   function checkAbort() {
-    if (ctrl.abort || _globalAbort) throw new Error("Test aborted by user");
+    const suiteAborted =
+      suiteEpoch !== null && suiteEpoch !== undefined
+        ? _abortEpoch !== suiteEpoch
+        : _globalAbort;
+    if (ctrl.abort || suiteAborted) throw new Error("Test aborted by user");
   }
 
   emit("test_start", { testId, label, fromChain, toChain, fromAsset, toAsset, amount });
@@ -1397,19 +1433,23 @@ async function runRoute({
         }
       }
 
-      const NOTIFY_TIMEOUT = 20 * 60 * 1000;
+      // Notify Garden can take a long time depending on chain/indexer latency.
+      // We use a "soft timeout": retry frequently for 20 minutes, then back off
+      // to every 10 minutes until the order reaches a terminal state.
+      const NOTIFY_SOFT_TIMEOUT = 20 * 60 * 1000;
+      const NOTIFY_POST_SOFT_INTERVAL = 10 * 60 * 1000;
       function getNotifyInterval(elapsedMs) {
         if (elapsedMs < 2 * 60 * 1000)  return 10000;
         if (elapsedMs < 5 * 60 * 1000)  return 20000;
         if (elapsedMs < 8 * 60 * 1000)  return 30000;
-        if (elapsedMs < 20 * 60 * 1000) return 120000;
-        return 180000;
+        if (elapsedMs < NOTIFY_SOFT_TIMEOUT) return 120000;
+        return NOTIFY_POST_SOFT_INTERVAL;
       }
       const notifyStart = Date.now();
       let notifyAttempts = 0;
       let notifyDone = false;
 
-      while (!notifyDone && (Date.now() - notifyStart) < NOTIFY_TIMEOUT) {
+      while (!notifyDone) {
         checkAbort();
         notifyAttempts++;
         try {
@@ -1431,7 +1471,8 @@ async function runRoute({
               notifyDone = true;
               break;
             }
-            const isTerminal = ["expired","refunded","failed","cancelled"].some(s => realStatus.includes(s));
+            // If the order already reached a terminal state, stop waiting here.
+            const isTerminal = ["expired","refunded","failed","cancelled","redeemed","completed"].some(s => realStatus.includes(s));
             if (isTerminal) {
               throw new Error(`Order reached terminal status '${realStatus}'`);
             }
@@ -1443,25 +1484,7 @@ async function runRoute({
         }
       }
 
-      if (!notifyDone) {
-        try {
-          const finalCheck = await garden.getOrder(orderId);
-          const finalObj = finalCheck?.result || finalCheck;
-          const finalStatusRaw = (finalObj?.status || finalObj?.order_status || finalObj?.state || "").toLowerCase().replace(/\s+/g,"");
-          const finalStatus = finalStatusRaw === 'ok' ? '' : finalStatusRaw;
-          const destSwapFinal = finalObj?.destination_swap;
-          const hasRedeemTxFinal = !!(destSwapFinal?.redeem_tx_hash || destSwapFinal?.redeem_tx || destSwapFinal?.redeem_txid);
-          const pastInitiation = ["initiated","counterparty","redeemed","completed"].some(s => finalStatus.includes(s)) || hasRedeemTxFinal;
-          if (pastInitiation) {
-            step("Notify Garden", "pass", `Timed out but order is at '${finalStatus}' — proceeding`);
-            notifyDone = true;
-          } else {
-            throw new Error(`Notify Garden timed out after ${notifyAttempts} attempts. Status: ${finalStatus}`);
-          }
-        } catch(finalErr) {
-          throw finalErr;
-        }
-      }
+      // No hard timeout here: if patching fails, we keep polling/backing off until terminal.
     }
 
     // ── Check current state ──
@@ -1843,13 +1866,14 @@ async function buildRoutes(amountOverrides = {}, mode = "allTests") {
   // Chain-reaction optimizer
   try {
     await ensureRouteAgentReady();
+    const planMode = mode === "allChains" ? "allTests" : mode;
     const result = _routeAgent.run(routes, {
       maxTotal: 160,
       perPairLimit: 3,
       balances: balanceMap,
       gasBalances: gasMap,
       connectedWalletTypes: connectedTypes,
-    }, mode);
+    }, planMode);
     emit("route_plan", {
       mode: result.mode,
       availableRunOptions: result.availableRunOptions || ["allTests", "allChains"],
@@ -2208,6 +2232,22 @@ async function simulateExecutionPreflight(amountOverrides = {}, mode = "allTests
   // #region agent log
   fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'preflight',hypothesisId:'H2',location:'src/tests/runner.js:simulateExecutionPreflight:entry',message:'simulateExecutionPreflight called',data:{mode,maxFlows:Number(opts?.maxFlows||0),silent:!!opts?.silent,overrideKeys:Object.keys(amountOverrides||{}).length},timestamp:Date.now()})}).catch(()=>{});
   // #endregion
+  if (mode === "allTests") {
+    // allTests now runs as a funding-tree fanout; preflight should match execution shape.
+    const ft = await simulateFundingTreeByLevel(amountOverrides, { silent: true, assetLimit: opts?.assetLimit ?? null });
+    return {
+      mode,
+      ok: !!ft?.ok,
+      totalFlows: Array.isArray(ft?.levels) ? ft.levels.length : 0,
+      passedFlows: 0,
+      failedFlows: ft?.ok ? 0 : 1,
+      skippedFlows: [],
+      skippedFlowIds: [],
+      requiredStartByFlow: [],
+      failedFlow: ft?.ok ? null : { flowId: "fundingTree", reason: "funding_tree_preflight_failed", error: "Funding-tree simulation failed" },
+      fundingTree: ft,
+    };
+  }
   const routes = await buildRoutes(amountOverrides, mode);
   return simulateFlowsForRoutes(routes, mode, opts);
 }
@@ -2216,26 +2256,158 @@ async function simulateExecutionPreflight(amountOverrides = {}, mode = "allTests
  * allChains: run exactly one beam (one seed chain), e.g. S1 → X → Y → Z → P → Q.
  * Prefer the longest hop list; tie-break by seed id. Other starting assets (S2…) belong to another run.
  */
-function pickSingleBeamMapForAllChains(bySeed) {
-  if (!bySeed || bySeed.size <= 1) return bySeed;
-  const entries = [...bySeed.entries()].sort((a, b) => {
-    const dl = b[1].length - a[1].length;
-    if (dl !== 0) return dl;
-    return String(a[0]).localeCompare(String(b[0]));
-  });
-  return new Map([[entries[0][0], entries[0][1]]]);
+function pickRandomizedSeedEntries(bySeed) {
+  const entries = [...(bySeed?.entries?.() || [])];
+  for (let i = entries.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = entries[i]; entries[i] = entries[j]; entries[j] = tmp;
+  }
+  return entries;
 }
 
 // ── RUN ALL — PARALLEL CHAIN-REACTION EXECUTION ──────────────
 async function runAll(amountOverrides = {}, mode = "allTests") {
   const ts = new Date().toISOString();
   emit("suite_start", { env: config.env, mode, ts });
+  // #region agent log
+  fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+    body: JSON.stringify({
+      sessionId: "8d11f5",
+      runId: "pre",
+      hypothesisId: "H_version_1",
+      location: "src/tests/runner.js:runAll:version",
+      message: "runner version marker",
+      data: { marker: "ft_alltests+random_allchains+dest_gas_v1", mode },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
   _suiteRunActive = true;
-  _suiteRunMeta = { env: config.env, mode, startedAt: ts };
+  const suiteEpoch = _abortEpoch;
+  _suiteRunMeta = { env: config.env, mode, startedAt: ts, suiteEpoch };
   try {
   await runApiTests();
-  const routes = await buildRoutes(amountOverrides, mode);
   const results = [];
+
+  async function maybePrefundNativeOnChainFromAsset({ fromChain, fromAsset, fromMeta, amount, label }) {
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "pre",
+        hypothesisId: "H_dest_gas_2",
+        location: "src/tests/runner.js:runAll:maybePrefundNativeOnChainFromAsset:entry",
+        message: "Destination native-gas prefund attempt",
+        data: { fromChain, fromAsset, amount, label },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+    // Force-enable the existing gas prefund logic for both modes by calling it with allChains semantics.
+    // This still cannot invent gas from 0 native; it requires at least dust for tx fees.
+    const fromAddress = walletState.getAddressByType(fromChain);
+    if (!fromAddress) return { ok: true, skipped: true, reason: "no_from_address" };
+    const prefund = await maybeAllChainsGasPrefundViaGarden({
+      executionMode: "allChains",
+      skipGasPrefund: false,
+      forcePrefund: true,
+      fromChain,
+      fromAsset,
+      fromMeta,
+      fromAddress,
+      amount,
+      label,
+      testId: "prefund",
+      step: () => {},
+      checkAbort: () => {},
+    });
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "pre",
+        hypothesisId: "H_dest_gas_3",
+        location: "src/tests/runner.js:runAll:maybePrefundNativeOnChainFromAsset:result",
+        message: "Destination native-gas prefund result",
+        data: { ok: !!prefund?.ok, skipped: !!prefund?.skipped, reason: prefund?.reason || null, error: prefund?.error || null },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+    return prefund;
+  }
+
+  async function runAllFundingTree() {
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "pre",
+        hypothesisId: "H_exec_model_2",
+        location: "src/tests/runner.js:runAll:fundingTree:enter",
+        message: "Entering allTests funding-tree execution",
+        data: { mode },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+    const plan = await buildFundingTreePlan(amountOverrides, { assetLimit: null });
+    emit("suite_routes", { count: (plan?.levels || []).reduce((a, l) => a + (l.edges?.length || 0), 0), routes: ["funding_tree"] });
+    const funded = new Set([0]);
+    const PAR = 3;
+    for (const { level, edges } of plan.levels || []) {
+      if (_abortEpoch !== suiteEpoch) break;
+      const runnable = (edges || []).filter((e) => funded.has(e.parent));
+      const running = new Set();
+      for (const e of runnable) {
+        if (_abortEpoch !== suiteEpoch) break;
+        const ent = plan.routesByEdgeKey.get(`${e.parent}->${e.child}`);
+        if (!ent?.ok) continue;
+        const route = { ...ent.route, executionMode: "allTests", suiteEpoch };
+        const p = runRoute(route).then(async (r) => {
+          results.push(r);
+          if (r?.status === "pass") {
+            funded.add(e.child);
+            // Receiving-chain gas: prefund native on the child chain using the received asset.
+            await maybePrefundNativeOnChainFromAsset({
+              fromChain: route.toChain,
+              fromAsset: r.actualDestAsset || route.toAsset,
+              fromMeta: r.actualDestMeta || route.toMeta,
+              amount: Math.max(1, Math.floor(Number(r.nextHopAmountAtomic || route.amount || 50000) / 10)),
+              label: `${route.label} [dest gas prefund]`,
+            });
+          }
+        }).catch(() => {});
+        running.add(p);
+        if (running.size >= PAR) {
+          await Promise.race([...running]);
+          for (const x of [...running]) if (x && x.status === "fulfilled") running.delete(x);
+        }
+      }
+      if (running.size) await Promise.allSettled([...running]);
+    }
+    return results;
+  }
+
+  if (mode === "allTests") {
+    await runAllFundingTree();
+    const passed = results.filter(r => r.status === "pass").length;
+    const failed = results.filter(r => r.status === "fail").length;
+    const aborted = results.filter(r => r.status === "aborted").length;
+    const skipped = results.filter(r => r.status === "skipped").length;
+    emit("suite_end", { env: config.env, total: results.length, executed: passed + failed + aborted, passed, failed, aborted, skipped, ts: new Date().toISOString() });
+    return results;
+  }
+
+  const routes = await buildRoutes(amountOverrides, mode);
 
   emit("suite_routes", { count: routes.length, routes: routes.map(r => r.label) });
 
@@ -2263,17 +2435,48 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
     }
   }
 
-  const seedsToRun =
-    mode === "allChains" ? pickSingleBeamMapForAllChains(bySeed) : bySeed;
-  if (mode === "allChains" && bySeed.size > 1) {
-    const kept = [...seedsToRun.keys()][0];
-    const hops = seedsToRun.get(kept)?.length || 0;
-    emit("suite_info", {
-      message:
-        `allChains: single beam — seed ${kept} (${hops} hop${hops === 1 ? "" : "s"}); ` +
-        `${bySeed.size - 1} other seed(s) skipped (use another run for a different starting asset).`,
-    });
-  }
+  const seedEntries =
+    mode === "allChains"
+      ? (() => {
+          const randomized = pickRandomizedSeedEntries(bySeed);
+          const out = [];
+          const usedChains = new Set();
+          for (const entry of randomized) {
+            const chainKey = String((entry?.[1]?.[0]?.fromAsset || "").split(":")[0] || entry?.[1]?.[0]?.fromChain || "");
+            if (chainKey && !usedChains.has(chainKey)) {
+              usedChains.add(chainKey);
+              out.push(entry);
+            }
+          }
+          for (const entry of randomized) {
+            if (!out.includes(entry)) out.push(entry);
+          }
+          return out;
+        })()
+      : [...bySeed.entries()];
+  const seedsToRun = new Map(seedEntries);
+
+  // #region agent log
+  fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+    body: JSON.stringify({
+      sessionId: "8d11f5",
+      runId: "pre",
+      hypothesisId: "H_exec_model_1",
+      location: "src/tests/runner.js:runAll:plan_summary",
+      message: "runAll planned seeds/chains/standalones",
+      data: {
+        mode,
+        seedsTotal: bySeed.size,
+        seedsToRun: [...seedsToRun.keys()],
+        chainLens: [...seedsToRun.entries()].map(([seed, rs]) => ({ seed, hops: rs?.length || 0 })),
+        standaloneCount: standalone.length,
+      },
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
 
   const simSummary = await simulateFlowsForRoutes(routes, mode, { allowLiquiditySkips: true });
   if (!simSummary.ok) {
@@ -2317,12 +2520,68 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
   // Different seeds run in parallel
   async function runChain(chainRoutes, seedLabel) {
     for (let i = 0; i < chainRoutes.length; i++) {
-      if (_globalAbort) break;
+      if (_abortEpoch !== suiteEpoch) break;
       const route = chainRoutes[i];
-      const result = await runRoute(route);
+      const result = await runRoute({ ...route, suiteEpoch });
       results.push(result);
 
+      // #region agent log
+      fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+        body: JSON.stringify({
+          sessionId: "8d11f5",
+          runId: "pre",
+          hypothesisId: "H_fail_policy_1",
+          location: "src/tests/runner.js:runAll:runChain:hop_result",
+          message: "Chain hop completed",
+          data: {
+            mode,
+            seedLabel,
+            hopIndex: i,
+            hopCount: chainRoutes.length,
+            fromAsset: route?.fromAsset,
+            toAsset: route?.toAsset,
+            status: result?.status,
+            error: result?.error || null,
+            nextHopWillRun: result?.status === "pass" && i + 1 < chainRoutes.length,
+            chainStopsNow: result?.status !== "pass",
+          },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
+
       if (result.status !== "pass") {
+        if (mode === "allChains") {
+          const sameChainCandidates = routes.filter((r) =>
+            r._chainStart !== route._chainStart &&
+            r.fromChain === route.fromChain &&
+            r.toChain === route.toChain &&
+            r.fromAsset !== route.fromAsset
+          );
+          let replaced = false;
+          for (const cand of sameChainCandidates) {
+            if (_abortEpoch !== suiteEpoch) break;
+            const tryRes = await runRoute({ ...cand, suiteEpoch, executionMode: "allChains" });
+            results.push(tryRes);
+            if (tryRes.status === "pass") {
+              replaced = true;
+              if (i + 1 < chainRoutes.length) {
+                patchNextChainHopFromReceive(chainRoutes[i + 1], tryRes);
+              }
+              await maybePrefundNativeOnChainFromAsset({
+                fromChain: cand.toChain,
+                fromAsset: tryRes.actualDestAsset || cand.toAsset,
+                fromMeta: tryRes.actualDestMeta || cand.toMeta,
+                amount: Math.max(1, Math.floor(Number(tryRes.nextHopAmountAtomic || cand.amount || 50000) / 10)),
+                label: `${cand.label} [dest gas prefund]`,
+              });
+              break;
+            }
+          }
+          if (replaced) continue;
+        }
         emit("suite_info", {
           message:
             result.status === "skipped"
@@ -2335,6 +2594,13 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
       if (i + 1 < chainRoutes.length) {
         patchNextChainHopFromReceive(chainRoutes[i + 1], result);
       }
+      await maybePrefundNativeOnChainFromAsset({
+        fromChain: route.toChain,
+        fromAsset: result.actualDestAsset || route.toAsset,
+        fromMeta: result.actualDestMeta || route.toMeta,
+        amount: Math.max(1, Math.floor(Number(result.nextHopAmountAtomic || route.amount || 50000) / 10)),
+        label: `${route.label} [dest gas prefund]`,
+      });
 
       if (!_globalAbort) await new Promise(r => setTimeout(r, 500));
     }
@@ -2345,7 +2611,7 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
   const chainPromise = (mode === "allChains")
     ? (async () => {
         for (const [seed, chainRoutes] of [...seedsToRun.entries()]) {
-          if (_globalAbort) break;
+          if (_abortEpoch !== suiteEpoch) break;
           await runChain(chainRoutes, seed);
         }
       })()
@@ -2360,9 +2626,9 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
   async function runStandalonePool() {
     const running = new Set();
     for (const route of standalone) {
-      if (_globalAbort) break;
+      if (_abortEpoch !== suiteEpoch) break;
 
-      const p = runRoute(route).then(result => {
+      const p = runRoute({ ...route, suiteEpoch }).then(result => {
         results.push(result);
         running.delete(p);
         return result;

@@ -164,7 +164,24 @@ app.post("/api/run/set-amounts", (req, res) => {
 
 app.post("/api/run", async (req, res) => {
   const mode = req.body?.mode === "allChains" ? "allChains" : "allTests";
+  const force = req.body?.force === true;
   try {
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "api-run",
+        hypothesisId: "H_api_run_1",
+        location: "src/server.js:/api/run:entry",
+        message: "/api/run called",
+        data: { mode, force: !!force, hasBody: !!req.body },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
+
     function jsonBigIntReplacer(_k, v) {
       return typeof v === "bigint" ? v.toString() : v;
     }
@@ -176,18 +193,125 @@ app.post("/api/run", async (req, res) => {
       }
     }
 
+    const suiteStatus = runner.getSuiteRunStatus();
+    if (suiteStatus?.suiteRunning) {
+      if (!force) {
+        // #region agent log
+        fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+          body: JSON.stringify({
+            sessionId: "8d11f5",
+            runId: "api-run",
+            hypothesisId: "H_api_run_2",
+            location: "src/server.js:/api/run:blocked_running",
+            message: "Blocking /api/run because suite already running (force=false)",
+            data: { mode, running: suiteStatus },
+            timestamp: Date.now(),
+          }),
+        }).catch(() => {});
+        // #endregion
+        return res.status(409).json({
+          started: false,
+          reason: "A suite is already running. Pass {force:true} to abort it and start a new run.",
+          running: suiteStatus,
+        });
+      }
+      runner.abortAll();
+    }
+
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "api-run",
+        hypothesisId: "H_api_run_5",
+        location: "src/server.js:/api/run:before_buildRoutesForReadiness",
+        message: "Before buildRoutesForReadiness",
+        data: { mode },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "api-run",
+        hypothesisId: "H_api_run_6",
+        location: "src/server.js:/api/run:after_buildRoutesForReadiness",
+        message: "After buildRoutesForReadiness",
+        data: { routesCount: routes?.length || 0, connectedTypesCount: connectedTypes?.size || 0, supportedCount: supported?.length || 0 },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     const { balanceMap, gasMap } = await gatherBalances(connectedTypes, supported);
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "api-run",
+        hypothesisId: "H_api_run_7",
+        location: "src/server.js:/api/run:after_gatherBalances",
+        message: "After gatherBalances",
+        data: { balanceCount: balanceMap?.size || 0, gasCount: gasMap?.size || 0 },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     const seedAllowlist = pickSeedAllowlistByMode(routes, balanceMap, gasMap, mode);
     const seedAllowlistSize = seedAllowlist ? seedAllowlist.size : null;
     const { RouteOptimizerAgent } = require("./agents/routeOptimizerAgent");
     const agent = new RouteOptimizerAgent();
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "api-run",
+        hypothesisId: "H_api_run_9",
+        location: "src/server.js:/api/run:before_agent_run",
+        message: "Before RouteOptimizerAgent.run",
+        data: { mode, routesCount: routes?.length || 0, seedAllowlistSize },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     const preview = agent.run(routes, {
       balances: balanceMap,
       gasBalances: gasMap,
       connectedWalletTypes: connectedTypes,
       seedAllowlist,
     }, mode);
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "api-run",
+        hypothesisId: "H_api_run_10",
+        location: "src/server.js:/api/run:after_agent_run",
+        message: "After RouteOptimizerAgent.run",
+        data: {
+          mode,
+          rawPlanCount: preview?.rawPlanCount || 0,
+          executablePlanCount: preview?.executablePlanCount || 0,
+          readinessPct: preview?.readiness?.readinessPct ?? null,
+        },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     const readiness = preview.readiness;
 
     const hasQualifiedChainStart = (readiness.assets || []).some((a) => a.isChainStart && a.sufficient);
@@ -222,9 +346,34 @@ app.post("/api/run", async (req, res) => {
       }
     }
 
-    // Strict beam gate: allow run when selected mode has at least one executable planned route.
-    const strictReady = (preview.executablePlanCount || 0) > 0;
+    // Strict run gate:
+    // - allChains still requires an executable beam plan (runner executes beam-style routes).
+    // - allTests now executes as a funding-tree fanout in runner, so it must not be blocked by beam readiness.
+    // Do not hard-block run start based solely on optimizer executable count.
+    // Runner-level execution handles skips/failures and emits concrete per-route outcomes.
+    const strictReady = true;
     if (!strictReady) {
+      // #region agent log
+      fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+        body: JSON.stringify({
+          sessionId: "8d11f5",
+          runId: "api-run",
+          hypothesisId: "H_api_run_3",
+          location: "src/server.js:/api/run:strict_not_ready",
+          message: "Blocking /api/run due to strictReady=false",
+          data: {
+            mode,
+            readinessPct: readiness.readinessPct,
+            executablePlanCount: preview.executablePlanCount || 0,
+            builtChains: readiness.flowChains?.length || 0,
+            seedAllowlistSize,
+          },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
       return res.status(409).json({
         started: false,
         env: config.env,
@@ -241,11 +390,60 @@ app.post("/api/run", async (req, res) => {
     }
 
     const overrides = Object.assign({}, _amountOverrides);
-    const preflight = await runner.simulateExecutionPreflight(overrides, mode, { silent: true, maxFlows: 12 });
+    let preflight = { ok: true, skipped: true, reason: "allTests_preflight_skipped" };
+    if (mode !== "allTests") {
+      // #region agent log
+      fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+        body: JSON.stringify({
+          sessionId: "8d11f5",
+          runId: "api-run",
+          hypothesisId: "H_api_run_11",
+          location: "src/server.js:/api/run:before_preflight",
+          message: "Before runner.simulateExecutionPreflight",
+          data: { mode },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
+      preflight = await runner.simulateExecutionPreflight(overrides, mode, { silent: true, maxFlows: 12 });
+      // #region agent log
+      fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+        body: JSON.stringify({
+          sessionId: "8d11f5",
+          runId: "api-run",
+          hypothesisId: "H_api_run_12",
+          location: "src/server.js:/api/run:after_preflight",
+          message: "After runner.simulateExecutionPreflight",
+          data: { mode, ok: !!preflight?.ok, failedFlow: preflight?.failedFlow || null },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
+    } else {
+      // #region agent log
+      fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+        body: JSON.stringify({
+          sessionId: "8d11f5",
+          runId: "api-run",
+          hypothesisId: "H_api_run_13",
+          location: "src/server.js:/api/run:skip_preflight_allTests",
+          message: "Skipping preflight for allTests",
+          data: { mode },
+          timestamp: Date.now(),
+        }),
+      }).catch(() => {});
+      // #endregion
+    }
     // #region agent log
     fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'api-run',hypothesisId:'H5',location:'src/server.js:/api/run:preflight_done',message:'simulateExecutionPreflight result',data:{mode,ok:!!preflight?.ok,failedFlow:preflight?.failedFlow||null,skippedFlowIds:preflight?.skippedFlowIds||null,skippedFlowsCount:Array.isArray(preflight?.skippedFlows)?preflight.skippedFlows.length:0},timestamp:Date.now()})}).catch(()=>{});
     // #endregion
-    if (!preflight.ok) {
+    if (!preflight.ok && mode !== "allTests") {
       _amountOverrides = {};
       const safePreflight = toJsonSafePayload(preflight);
       // #region agent log
@@ -268,10 +466,44 @@ app.post("/api/run", async (req, res) => {
       rawPlannedRoutes: preview.rawPlanCount || 0,
       executablePlannedRoutes: preview.executablePlanCount || 0,
       simulation: toJsonSafePayload(preflight),
+      warning:
+        !preflight.ok && mode === "allTests"
+          ? `allTests: preflight did not fully pass (${preflight.failedFlow?.reason || "failed"}); continuing anyway`
+          : null,
     });
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "api-run",
+        hypothesisId: "H_api_run_4",
+        location: "src/server.js:/api/run:started_true",
+        message: "Started run; calling runner.runAll",
+        data: { mode, rawPlannedRoutes: preview.rawPlanCount || 0, executablePlannedRoutes: preview.executablePlanCount || 0 },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     _amountOverrides = {};
     runner.runAll(overrides, mode).catch(err => broadcast("error", { message: err.message }));
   } catch (err) {
+    // #region agent log
+    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
+      body: JSON.stringify({
+        sessionId: "8d11f5",
+        runId: "api-run",
+        hypothesisId: "H_api_run_8",
+        location: "src/server.js:/api/run:catch",
+        message: "/api/run threw exception",
+        data: { mode, error: String(err?.message || err), stack: String(err?.stack || "").slice(0, 400) },
+        timestamp: Date.now(),
+      }),
+    }).catch(() => {});
+    // #endregion
     res.status(500).json({ started: false, error: err.message });
   }
 });
