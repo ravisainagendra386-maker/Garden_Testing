@@ -8,6 +8,14 @@ const GAS_PER_TX = 2;
 const BEAM_WIDTH = 6;
 const MAX_DEPTH = 15;
 
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+  }
+  return arr;
+}
+
 /**
  * allTests: for each bitcoin→* matrix cell, pick among all liquid catalog routes (uniform), not only max scoreHop
  * (BTC↔BTC-family pairs score highest, so iBTC on Base often won every time).
@@ -67,6 +75,8 @@ class AgentMemoryFallback {
       usdOut: Number(result?.usdOut || 0),
       slippagePct: Number(result?.slippagePct || 0),
       durationSec: Number(result?.durationSec || 0),
+      agent: "routeOptimizer",
+      error: result?.error || null,
     });
   }
 
@@ -271,7 +281,7 @@ function beamSearchPath(seedId, adj, opts = {}) {
     }
 
     if (!candidates.length) break;
-    candidates.sort((a, b) => b.score - a.score);
+    shuffleArray(candidates);          // random hop selection at every depth
     beam = candidates.slice(0, beamWidth);
   }
 
@@ -438,23 +448,13 @@ function buildChainReactionFlow(routes, opts = {}) {
           path.assets = closedAssets;
           routesForPath.push(closingEdge.route);
           closedOk = true;
-          // #region agent log
-          fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'planner',hypothesisId:'H26',location:'src/agents/routeOptimizerAgent.js:buildChainReactionFlow:cycleClosed',message:'Appended closing hop Q->X; path ends on X again',data:{startAsset,firstHopDest,lastAsset,pathEndsWith:firstHopDest,newPathLen:path.assets.length,newRouteLen:routesForPath.length,feasible:true},timestamp:Date.now()})}).catch(()=>{});
-          // #endregion
         } else {
           lastGasFail = { gas, closedAssetsLen: closedAssets.length };
         }
       }
     }
 
-    // #region agent log
-    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'planner',hypothesisId:'H25',location:'src/agents/routeOptimizerAgent.js:buildChainReactionFlow:closeCycleCheck',message:'Cycle closure (Q->X only) check',data:{mode:opts.mode||null,closeCycle,uniqueChainsOnly:opts.chainRoutesUniqueChains===true,startAsset,firstHopDest,lastAsset,closedOk},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
-
     if (closeCycle && !closedOk && lastGasFail) {
-      // #region agent log
-      fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'planner',hypothesisId:'H27',location:'src/agents/routeOptimizerAgent.js:buildChainReactionFlow:cycleCloseGasFail',message:'Q->X closing hop failed gas check',data:{startAsset,firstHopDest,lastAsset,newPathLen:lastGasFail.closedAssetsLen,feasible:false,gasIssues:lastGasFail.gas?.gasIssues||[]},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
     }
 
     chains.push({
@@ -1346,9 +1346,6 @@ class RouteOptimizerAgent {
     }
 
     const closeCycle = true;
-    // #region agent log
-    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'planner',hypothesisId:'H29',location:'src/agents/routeOptimizerAgent.js:run:opts',message:'Planner run options',data:{mode,closeCycle,chainRoutesUniqueChains:mode==='allChains',seedAllowlistSize:seedAllowlist?.size??null,connectedRoutes:connectedRoutes.length},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
 
     const flow = buildChainReactionFlow(connectedRoutes, {
       connectedWalletTypes: connectedTypes,

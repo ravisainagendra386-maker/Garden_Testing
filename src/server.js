@@ -10,33 +10,56 @@ const runner      = require("./tests/runner");
 const garden      = require("./api/garden");
 const walletState = require("./wallet/state");
 const envkey      = require("./wallet/envkey");
+const crypto         = require("crypto");
 const arbitrageAgent = require("./agents/arbitrageAgent");
 
+// ── AUTH ──────────────────────────────────────────────────────
+const _sessions = new Set();
+
+function authMiddleware(req, res, next) {
+  const auth  = req.headers["authorization"] || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (!token || !_sessions.has(token)) return res.status(401).json({ error: "Unauthorized" });
+  next();
+}
+
 const app = express();
-app.use(cors());
+app.use(cors({ origin: ["http://localhost:3000", "http://127.0.0.1:3000"] }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, "../dashboard")));
+
+app.post("/api/login", (req, res) => {
+  const { email, password } = req.body || {};
+  if (!process.env.DASHBOARD_EMAIL || !process.env.DASHBOARD_PASSWORD)
+    return res.status(500).json({ error: "DASHBOARD_EMAIL / DASHBOARD_PASSWORD not set in .env" });
+  if (email !== process.env.DASHBOARD_EMAIL || password !== process.env.DASHBOARD_PASSWORD)
+    return res.status(401).json({ error: "Invalid credentials" });
+  const token = crypto.randomBytes(32).toString("hex");
+  _sessions.add(token);
+  res.json({ token });
+});
+
+app.post("/api/logout", (req, res) => {
+  const auth  = req.headers["authorization"] || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  _sessions.delete(token);
+  res.json({ ok: true });
+});
+
+// All /api/* routes below this line require a valid session token.
+app.use("/api", (req, res, next) => {
+  if (req.path === "/health") return next();
+  return authMiddleware(req, res, next);
+});
 
 const server = http.createServer(app);
 const wss    = new WebSocket.Server({ server, path: '/ws' });
 
-// #region agent log
-fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H1',location:'src/server.js:startup',message:'process/server created',data:{pid:process.pid,node:process.version,cwd:process.cwd(),argv:process.argv.slice(0,5)},timestamp:Date.now()})}).catch(()=>{});
-// #endregion agent log
-
 server.on("error", (err) => {
-  // #region agent log
-  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H2',location:'src/server.js:server.error',message:'http server error event',data:{name:err?.name,code:err?.code,message:err?.message,errno:err?.errno,syscall:err?.syscall,address:err?.address,port:err?.port},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion agent log
-
   if (err && err.code === "EADDRINUSE") {
     const envPortExplicit = Object.prototype.hasOwnProperty.call(process.env, "PORT") && process.env.PORT !== "";
     const basePort = Number(config?.port || 0);
     const fallbackEnabled = Number.isFinite(basePort) && basePort > 0;
-    // #region agent log
-    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H5',location:'src/server.js:EADDRINUSE',message:'port in use handling',data:{envPortExplicit,configPort:basePort,fallbackEnabled},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
-
     if (!fallbackEnabled) return;
 
     const maxAttempts = 10;
@@ -49,9 +72,6 @@ server.on("error", (err) => {
       );
       // Ensure the rest of the app (and dashboard banner) uses the actual bound port.
       config.port = nextPort;
-      // #region agent log
-      fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H6',location:'src/server.js:retryListen',message:'retrying listen on candidate port',data:{attempt,fromPort:basePort,toPort:nextPort,envPortExplicit},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion agent log
       try { server.listen(nextPort); return; } catch (_) {}
     }
 
@@ -61,9 +81,6 @@ server.on("error", (err) => {
 });
 
 wss.on("error", (err) => {
-  // #region agent log
-  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H3',location:'src/server.js:wss.error',message:'websocket server error event',data:{name:err?.name,code:err?.code,message:err?.message},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion agent log
 });
 
 function broadcast(event, data) {
@@ -166,22 +183,6 @@ app.post("/api/run", async (req, res) => {
   const mode = req.body?.mode === "allChains" ? "allChains" : "allTests";
   const force = req.body?.force === true;
   try {
-    // #region agent log
-    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-      body: JSON.stringify({
-        sessionId: "8d11f5",
-        runId: "api-run",
-        hypothesisId: "H_api_run_1",
-        location: "src/server.js:/api/run:entry",
-        message: "/api/run called",
-        data: { mode, force: !!force, hasBody: !!req.body },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
-
     function jsonBigIntReplacer(_k, v) {
       return typeof v === "bigint" ? v.toString() : v;
     }
@@ -196,21 +197,6 @@ app.post("/api/run", async (req, res) => {
     const suiteStatus = runner.getSuiteRunStatus();
     if (suiteStatus?.suiteRunning) {
       if (!force) {
-        // #region agent log
-        fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-          body: JSON.stringify({
-            sessionId: "8d11f5",
-            runId: "api-run",
-            hypothesisId: "H_api_run_2",
-            location: "src/server.js:/api/run:blocked_running",
-            message: "Blocking /api/run because suite already running (force=false)",
-            data: { mode, running: suiteStatus },
-            timestamp: Date.now(),
-          }),
-        }).catch(() => {});
-        // #endregion
         return res.status(409).json({
           started: false,
           reason: "A suite is already running. Pass {force:true} to abort it and start a new run.",
@@ -220,98 +206,18 @@ app.post("/api/run", async (req, res) => {
       runner.abortAll();
     }
 
-    // #region agent log
-    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-      body: JSON.stringify({
-        sessionId: "8d11f5",
-        runId: "api-run",
-        hypothesisId: "H_api_run_5",
-        location: "src/server.js:/api/run:before_buildRoutesForReadiness",
-        message: "Before buildRoutesForReadiness",
-        data: { mode },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
     const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
-    // #region agent log
-    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-      body: JSON.stringify({
-        sessionId: "8d11f5",
-        runId: "api-run",
-        hypothesisId: "H_api_run_6",
-        location: "src/server.js:/api/run:after_buildRoutesForReadiness",
-        message: "After buildRoutesForReadiness",
-        data: { routesCount: routes?.length || 0, connectedTypesCount: connectedTypes?.size || 0, supportedCount: supported?.length || 0 },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
     const { balanceMap, gasMap } = await gatherBalances(connectedTypes, supported);
-    // #region agent log
-    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-      body: JSON.stringify({
-        sessionId: "8d11f5",
-        runId: "api-run",
-        hypothesisId: "H_api_run_7",
-        location: "src/server.js:/api/run:after_gatherBalances",
-        message: "After gatherBalances",
-        data: { balanceCount: balanceMap?.size || 0, gasCount: gasMap?.size || 0 },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
     const seedAllowlist = pickSeedAllowlistByMode(routes, balanceMap, gasMap, mode);
     const seedAllowlistSize = seedAllowlist ? seedAllowlist.size : null;
     const { RouteOptimizerAgent } = require("./agents/routeOptimizerAgent");
     const agent = new RouteOptimizerAgent();
-    // #region agent log
-    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-      body: JSON.stringify({
-        sessionId: "8d11f5",
-        runId: "api-run",
-        hypothesisId: "H_api_run_9",
-        location: "src/server.js:/api/run:before_agent_run",
-        message: "Before RouteOptimizerAgent.run",
-        data: { mode, routesCount: routes?.length || 0, seedAllowlistSize },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
     const preview = agent.run(routes, {
       balances: balanceMap,
       gasBalances: gasMap,
       connectedWalletTypes: connectedTypes,
       seedAllowlist,
     }, mode);
-    // #region agent log
-    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-      body: JSON.stringify({
-        sessionId: "8d11f5",
-        runId: "api-run",
-        hypothesisId: "H_api_run_10",
-        location: "src/server.js:/api/run:after_agent_run",
-        message: "After RouteOptimizerAgent.run",
-        data: {
-          mode,
-          rawPlanCount: preview?.rawPlanCount || 0,
-          executablePlanCount: preview?.executablePlanCount || 0,
-          readinessPct: preview?.readiness?.readinessPct ?? null,
-        },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
     const readiness = preview.readiness;
 
     const hasQualifiedChainStart = (readiness.assets || []).some((a) => a.isChainStart && a.sufficient);
@@ -353,27 +259,6 @@ app.post("/api/run", async (req, res) => {
     // Runner-level execution handles skips/failures and emits concrete per-route outcomes.
     const strictReady = true;
     if (!strictReady) {
-      // #region agent log
-      fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-        body: JSON.stringify({
-          sessionId: "8d11f5",
-          runId: "api-run",
-          hypothesisId: "H_api_run_3",
-          location: "src/server.js:/api/run:strict_not_ready",
-          message: "Blocking /api/run due to strictReady=false",
-          data: {
-            mode,
-            readinessPct: readiness.readinessPct,
-            executablePlanCount: preview.executablePlanCount || 0,
-            builtChains: readiness.flowChains?.length || 0,
-            seedAllowlistSize,
-          },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {});
-      // #endregion
       return res.status(409).json({
         started: false,
         env: config.env,
@@ -392,63 +277,12 @@ app.post("/api/run", async (req, res) => {
     const overrides = Object.assign({}, _amountOverrides);
     let preflight = { ok: true, skipped: true, reason: "allTests_preflight_skipped" };
     if (mode !== "allTests") {
-      // #region agent log
-      fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-        body: JSON.stringify({
-          sessionId: "8d11f5",
-          runId: "api-run",
-          hypothesisId: "H_api_run_11",
-          location: "src/server.js:/api/run:before_preflight",
-          message: "Before runner.simulateExecutionPreflight",
-          data: { mode },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {});
-      // #endregion
       preflight = await runner.simulateExecutionPreflight(overrides, mode, { silent: true, maxFlows: 12 });
-      // #region agent log
-      fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-        body: JSON.stringify({
-          sessionId: "8d11f5",
-          runId: "api-run",
-          hypothesisId: "H_api_run_12",
-          location: "src/server.js:/api/run:after_preflight",
-          message: "After runner.simulateExecutionPreflight",
-          data: { mode, ok: !!preflight?.ok, failedFlow: preflight?.failedFlow || null },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {});
-      // #endregion
     } else {
-      // #region agent log
-      fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-        body: JSON.stringify({
-          sessionId: "8d11f5",
-          runId: "api-run",
-          hypothesisId: "H_api_run_13",
-          location: "src/server.js:/api/run:skip_preflight_allTests",
-          message: "Skipping preflight for allTests",
-          data: { mode },
-          timestamp: Date.now(),
-        }),
-      }).catch(() => {});
-      // #endregion
     }
-    // #region agent log
-    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'api-run',hypothesisId:'H5',location:'src/server.js:/api/run:preflight_done',message:'simulateExecutionPreflight result',data:{mode,ok:!!preflight?.ok,failedFlow:preflight?.failedFlow||null,skippedFlowIds:preflight?.skippedFlowIds||null,skippedFlowsCount:Array.isArray(preflight?.skippedFlows)?preflight.skippedFlows.length:0},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     if (!preflight.ok && mode !== "allTests") {
       _amountOverrides = {};
       const safePreflight = toJsonSafePayload(preflight);
-      // #region agent log
-      fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'82b36e'},body:JSON.stringify({sessionId:'82b36e',runId:'api-run',hypothesisId:'H5',location:'src/server.js:/api/run:preflight_block',message:'Blocking run due to preflight not ok',data:{mode,reason:`${preflight.failedFlow?.error||preflight.failedFlow?.reason||'unknown'}`},timestamp:Date.now()})}).catch(()=>{});
-      // #endregion
       return res.status(409).json({
         started: false,
         env: config.env,
@@ -471,39 +305,9 @@ app.post("/api/run", async (req, res) => {
           ? `allTests: preflight did not fully pass (${preflight.failedFlow?.reason || "failed"}); continuing anyway`
           : null,
     });
-    // #region agent log
-    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-      body: JSON.stringify({
-        sessionId: "8d11f5",
-        runId: "api-run",
-        hypothesisId: "H_api_run_4",
-        location: "src/server.js:/api/run:started_true",
-        message: "Started run; calling runner.runAll",
-        data: { mode, rawPlannedRoutes: preview.rawPlanCount || 0, executablePlannedRoutes: preview.executablePlanCount || 0 },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
     _amountOverrides = {};
     runner.runAll(overrides, mode).catch(err => broadcast("error", { message: err.message }));
   } catch (err) {
-    // #region agent log
-    fetch("http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Debug-Session-Id": "8d11f5" },
-      body: JSON.stringify({
-        sessionId: "8d11f5",
-        runId: "api-run",
-        hypothesisId: "H_api_run_8",
-        location: "src/server.js:/api/run:catch",
-        message: "/api/run threw exception",
-        data: { mode, error: String(err?.message || err), stack: String(err?.stack || "").slice(0, 400) },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
     res.status(500).json({ started: false, error: err.message });
   }
 });
@@ -578,28 +382,27 @@ app.post("/api/switch-env", (req, res) => {
 });
 
 // ── Asset ID resolver ─────────────────────────────────────────
-// CHANGE: No long-lived cache — always fetch fresh assets
 let _cachedAssets = null;
 let _cachedAssetsTs = 0;
-const ASSET_CACHE_TTL = 30 * 1000; // 30 seconds max (was 5 min)
+let _assetsInFlight = null;                  // dedup: concurrent callers share one fetch
+const ASSET_CACHE_TTL = 120 * 1000;          // 2 min — Garden asset list rarely changes mid-session
 
 async function getAssets() {
   const now = Date.now();
-  // Short TTL to avoid hammering API on rapid calls, but effectively "fresh"
   if (_cachedAssets && (now - _cachedAssetsTs) < ASSET_CACHE_TTL) return _cachedAssets;
-  try {
-    _cachedAssets = await garden.getAssets();
-    _cachedAssetsTs = now;
-  } catch (_) {
-    _cachedAssets = [];
-  }
-  return _cachedAssets;
+  if (_assetsInFlight) return _assetsInFlight; // already fetching — share the in-flight promise
+  _assetsInFlight = garden.getAssets()
+    .then(r => { _cachedAssets = r; _cachedAssetsTs = Date.now(); return r; })
+    .catch(() => { _cachedAssets = []; return []; })
+    .finally(() => { _assetsInFlight = null; });
+  return _assetsInFlight;
 }
 
-// Force-clear asset cache (called before route building)
+// Force-clear asset cache — only call on explicit user actions (env switch, debug refresh)
 function clearAssetCache() {
   _cachedAssets = null;
   _cachedAssetsTs = 0;
+  _assetsInFlight = null;
 }
 
 async function resolveAssetId(simplified) {
@@ -771,24 +574,21 @@ function assetFamily(asset) {
 }
 
 // ── HELPER: Check if pair is plausible per Garden route policy ─
-// Per docs: /policy returns isolation_groups and blacklist_pairs
-// BTC family only trades with BTC family (isolation group)
 function isPairPlausible(from, to) {
-  const ff = assetFamily(from), tf = assetFamily(to);
-  if (ff === tf) return true;
-  if (ff === 'btc' && tf !== 'btc') return false;
-  if (tf === 'btc' && ff !== 'btc') return false;
-  return true;
+  return from.id !== to.id; // all asset combinations allowed across all families
 }
 
 // ── HELPER: Build routes from assets + connected wallets ──────
-// CHANGE: Always fresh — no valid-pairs cache filtering
+let _buildRoutesInFlight = null; // dedup: concurrent callers share one pending build
 async function buildRoutesForReadiness() {
+  if (_buildRoutesInFlight) return _buildRoutesInFlight;
+  _buildRoutesInFlight = _doBuildRoutesForReadiness().finally(() => { _buildRoutesInFlight = null; });
+  return _buildRoutesInFlight;
+}
+async function _doBuildRoutesForReadiness() {
   const connectedTypes = getConnectedWalletTypes();
   if (connectedTypes.size === 0) return { routes: [], connectedTypes };
 
-  // Always fetch fresh assets
-  clearAssetCache();
   const ar = await getAssets();
   const assets = ar.result || ar.assets || ar || [];
   if (!assets.length) return { routes: [], connectedTypes };
@@ -935,8 +735,6 @@ async function buildCombinationsResponse() {
   const quoteStats = { calls: 0, hits: 0, misses: 0, errors: 0 };
   const startedAt = Date.now();
 
-  // CHANGE: Always fresh assets
-  clearAssetCache();
   const assetsFetchStartedAt = Date.now();
   const ar      = await getAssets();
   const assetsFetchMs = Date.now() - assetsFetchStartedAt;
@@ -1058,19 +856,9 @@ async function buildCombinationsResponse() {
         // (user requested: "if wallet balance is between min trade and toMin+0.4% then use max balance")
         if (balBig >= minBig && balBig <= target) {
           const v = balBig > maxBig ? maxBig : balBig;
-          // #region agent log
-          if (Date.now() % 20 === 0) {
-            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H16',location:'src/server.js:computeSuggestedAmount:likeKind:maxBal',message:'likeKind suggested uses max wallet balance (balance between min and target)',data:{from:from?.id,to:to?.id,minAmount:String(minBig),toMinAmount:String(minToBig),targetTo:String(targetTo),balance:String(balBig),suggested:String(v)},timestamp:Date.now()})}).catch(()=>{});
-          }
-          // #endregion agent log
           return Number(v);
         }
 
-        // #region agent log
-        if (Date.now() % 20 === 1) {
-          fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H16',location:'src/server.js:computeSuggestedAmount:likeKind:target',message:'likeKind suggested uses target (to.min+0.4%)',data:{from:from?.id,to:to?.id,minAmount:String(minBig),toMinAmount:String(minToBig),targetTo:String(targetTo),balance:String(balBig),suggested:String(target)},timestamp:Date.now()})}).catch(()=>{});
-        }
-        // #endregion agent log
         return Number(target);
       }
 
@@ -1129,19 +917,6 @@ async function buildCombinationsResponse() {
           const qr = q?.result || q;
           const toAtomic = extractToAtomic(qr);
 
-          // #region agent log
-          if (toAtomic == null && quoteStats.calls <= 5) {
-            let topKeys = null;
-            let destKeys = null;
-            let quoteKeys = null;
-            let quoteDestKeys = null;
-            try { topKeys = Object.keys(qr || {}).slice(0, 30); } catch (_) {}
-            try { destKeys = Object.keys(qr?.destination || {}).slice(0, 30); } catch (_) {}
-            try { quoteKeys = Object.keys(qr?.quote || {}).slice(0, 30); } catch (_) {}
-            try { quoteDestKeys = Object.keys(qr?.quote?.destination || {}).slice(0, 30); } catch (_) {}
-            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H14',location:'src/server.js:computeSuggestedAmount:quoteShape',message:'quote missing destination amount field',data:{from:from?.id,to:to?.id,fromAmount:minAmount,hasResult:!!q?.result,topKeys,destKeys,quoteKeys,quoteDestKeys},timestamp:Date.now()})}).catch(()=>{});
-          }
-          // #endregion agent log
           quoteCache.set(cacheKey, { toAmount: toAtomic });
           _quoteCacheGlobal.set(cacheKey, { toAmount: toAtomic, ts: Date.now() });
           toAtMin = toBigIntOrNull(toAtomic);
@@ -1150,21 +925,12 @@ async function buildCombinationsResponse() {
           quoteCache.set(cacheKey, { toAmount: null });
           toAtMin = null;
 
-          // #region agent log
-          if (quoteStats.errors <= 5) {
-            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H15',location:'src/server.js:computeSuggestedAmount:quoteError',message:'quote call failed',data:{from:from?.id,to:to?.id,fromAmount:minAmount,message:err?.message||null,name:err?.name||null,status:err?.status||null},timestamp:Date.now()})}).catch(()=>{});
-          }
-          // #endregion agent log
-
           // If Garden cannot quote due to insufficient liquidity, but both sides are BTC-pegged (8 decimals),
           // assume 1:1 for the purpose of meeting destination min trade amounts.
           const msg = String(err?.message || "");
           const insufficientLiq = (err?.status === 400) && msg.toLowerCase().includes("insufficient liquidity");
           if (insufficientLiq && isBtcPegged) {
             toAtMin = minBig; // 1:1 peg assumption => toAtMin at minFrom equals minFrom
-            // #region agent log
-            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H17',location:'src/server.js:computeSuggestedAmount:btcPegFallback',message:'using BTC-peg 1:1 fallback due to insufficient liquidity',data:{from:from?.id,to:to?.id,decimalsFrom:from?.decimals,decimalsTo:to?.decimals,minAmount:String(minBig),toMinAmount:String(minToBig),targetTo:String(targetTo)},timestamp:Date.now()})}).catch(()=>{});
-            // #endregion agent log
           }
         }
         }
@@ -1176,21 +942,11 @@ async function buildCombinationsResponse() {
           let v = requiredFrom;
           if (v < minBig) v = minBig;
           if (v > maxBig) v = maxBig;
-          // #region agent log
-          if (quoteStats.calls <= 3) {
-            fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H12',location:'src/server.js:computeSuggestedAmount:requiredFrom',message:'computed requiredFrom for to.min+0.5%',data:{from:from?.id,to:to?.id,minAmount:String(minBig),targetTo:String(targetTo),toAtMin:String(toAtMin),requiredFrom:String(requiredFrom),balance:String(balBig),suggested:String(v)},timestamp:Date.now()})}).catch(()=>{});
-          }
-          // #endregion agent log
           return Number(v);
         }
       }
 
       // If we couldn't compute/afford a destination-min-satisfying amount, keep it conservative.
-      // #region agent log
-      if (String(from?.id || "").toLowerCase().includes("eth") && (String(to?.id || "").toLowerCase().includes("usdc") || String(to?.name || "").toLowerCase().includes("usdc"))) {
-        fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'post-fix',hypothesisId:'H13',location:'src/server.js:computeSuggestedAmount:fallbackMin',message:'suggestedAmount fallback -> minAmount (quote/rate unavailable or cannot afford required)',data:{from:from?.id,to:to?.id,minAmount:String(minBig),toMinAmount:String(minToBig),targetTo:String(targetTo),toAtMin:toAtMin===null?null:String(toAtMin),balance:String(balBig)},timestamp:Date.now()})}).catch(()=>{});
-      }
-      // #endregion agent log
       return Number(minBig);
     }
 
@@ -1324,30 +1080,6 @@ async function buildCombinationsResponse() {
     }
   }
 
-  // #region agent log
-  try {
-    let tReq = 0, tBal = 0, tMin = 0;
-    for (const c of combinations) {
-      const bal = toBigIntOrNull(c.walletBalance);
-      const min = toBigIntOrNull(c.minAmount);
-      const minTo = toBigIntOrNull(c.toMinAmount);
-      if (bal === null || min === null || minTo === null || c.canAfford === false) { tMin++; continue; }
-      const sug = toBigIntOrNull(c.suggestedAmount);
-      const max = toBigIntOrNull(c.maxAmount);
-      const maxBal = (max !== null && bal !== null && bal > max) ? max : bal;
-      const isMaxBal = sug !== null && maxBal !== null && sug === maxBal;
-      if (!isMaxBal) tReq++;
-      else if (bal >= min) tBal++;
-      else tMin++;
-    }
-    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H8',location:'src/server.js:buildCombinationsResponse',message:'suggestedAmount tier counts (to.min via USD -> required send)',data:{total:combinations.length,tReq,tBal,tMin},timestamp:Date.now()})}).catch(()=>{});
-  } catch (_) {}
-  // #endregion agent log
-
-  // #region agent log
-  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H10',location:'src/server.js:buildCombinationsResponse',message:'buildCombinationsResponse perf',data:{ms:Date.now()-startedAt,assetsFetchMs,assets:assets.length,supported:supported.length,combinations:combinations.length,quoteEnabledCount,quoteCalls:quoteStats.calls,quoteHits:quoteStats.hits,quoteMisses:quoteStats.misses,quoteErrors:quoteStats.errors,quoteCacheSize:quoteCache.size},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion agent log
-
   // CHANGE: No valid-pairs cache filtering — always show all connected combos
   combinations.sort((a, b) => {
     if (a.canTrade && !b.canTrade) return -1;
@@ -1369,20 +1101,10 @@ async function buildCombinationsResponse() {
 }
 
 app.get("/api/combinations", async (req, res) => {
-  const reqStartedAt = Date.now();
-  // #region agent log
-  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H11',location:'src/server.js:/api/combinations:entry',message:'combinations request start',data:{qs:req.query||null},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion agent log
   try {
     const payload = await buildCombinationsResponse();
-    // #region agent log
-    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H11',location:'src/server.js:/api/combinations:success',message:'combinations request success',data:{ms:Date.now()-reqStartedAt,total:payload?.total},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
     res.json(payload);
   } catch (err) {
-    // #region agent log
-    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H11',location:'src/server.js:/api/combinations:error',message:'combinations request error',data:{ms:Date.now()-reqStartedAt,message:err?.message,name:err?.name},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion agent log
     res.status(500).json({ error: err.message });
   }
 });
@@ -1391,9 +1113,6 @@ app.get("/api/combinations", async (req, res) => {
 app.get("/api/route-readiness", async (req, res) => {
   try {
     const mode = req.query?.mode === "allChains" ? "allChains" : "allTests";
-    // #region agent log
-    fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'66ed74'},body:JSON.stringify({sessionId:'66ed74',runId:'server',hypothesisId:'H28',location:'src/server.js:/api/route-readiness:entry',message:'route-readiness request received',data:{mode,hasQueryMode:typeof req.query?.mode==='string'},timestamp:Date.now()})}).catch(()=>{});
-    // #endregion
     const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
 
     if (!routes.length) {
@@ -1954,9 +1673,6 @@ app.get("/api/wallet/balances", async (req, res) => {
     }
     if (safeStatus[key]?.wif) delete safeStatus[key].wif;
   }
-  // #region agent log
-  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H7',location:'src/server.js:/api/wallet/balances',message:'wallet balances response shape',data:{evm:{has:!!safeStatus?.evm,source:safeStatus?.evm?.source||null,addressPrefix:(safeStatus?.evm?.address||'').slice(0,10),addressDisplayPrefix:(safeStatus?.evm?.addressDisplay||'').slice(0,10)}},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion agent log
   res.json(safeStatus);
 });
 
@@ -2056,13 +1772,7 @@ app.post("/api/orders/:id/redeem", async (req, res) => {
 });
 
 // ── START ─────────────────────────────────────────────────────
-// #region agent log
-fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H1',location:'src/server.js:beforeListen',message:'about to listen',data:{pid:process.pid,port:config?.port,envPort:process.env.PORT||null},timestamp:Date.now()})}).catch(()=>{});
-// #endregion agent log
 server.listen(config.port, () => {
-  // #region agent log
-  fetch('http://127.0.0.1:7282/ingest/f4ac0055-0c9e-4897-b3eb-77966339412a',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'8d11f5'},body:JSON.stringify({sessionId:'8d11f5',runId:'pre-fix',hypothesisId:'H4',location:'src/server.js:listenCallback',message:'listening callback fired',data:{pid:process.pid,port:config?.port},timestamp:Date.now()})}).catch(()=>{});
-  // #endregion agent log
   console.log(`\n✅  Garden Test Suite running`);
   console.log(`   Dashboard:   http://localhost:${config.port}`);
   console.log(`   Environment: ${config.env.toUpperCase()}`);

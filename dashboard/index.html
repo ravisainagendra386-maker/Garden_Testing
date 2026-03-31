@@ -192,9 +192,70 @@
   ::-webkit-scrollbar { width: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* ── LOGIN OVERLAY ── */
+  #loginOverlay {
+    position: fixed; inset: 0; background: var(--bg);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 9999;
+  }
+  #loginOverlay.hidden { display: none; }
+  .login-box {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 16px; padding: 40px 36px; width: 360px;
+  }
+  .login-title { font-size: 18px; font-weight: 700; margin-bottom: 6px; }
+  .login-sub { font-size: 13px; color: var(--muted); margin-bottom: 28px; }
+  .login-field { margin-bottom: 16px; }
+  .login-field label { display: block; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 6px; }
+  .login-field input {
+    width: 100%; padding: 10px 12px; background: var(--bg3);
+    border: 1px solid var(--border); border-radius: 8px;
+    color: var(--text); font-family: inherit; font-size: 14px; outline: none;
+  }
+  .login-field input:focus { border-color: var(--accent); }
+  .login-pw-wrap { position: relative; }
+  .login-pw-wrap input { padding-right: 40px; }
+  .login-pw-toggle {
+    position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+    background: none; border: none; cursor: pointer; color: var(--muted);
+    font-size: 16px; line-height: 1; padding: 2px;
+  }
+  .login-pw-toggle:hover { color: var(--text); }
+  #loginPassword::-ms-reveal,
+  #loginPassword::-webkit-credentials-auto-fill-button { display: none; }
+  .login-error { font-size: 12px; color: var(--red); margin-bottom: 14px; min-height: 18px; }
+  .login-btn {
+    width: 100%; padding: 11px; background: var(--accent); color: #000;
+    border: none; border-radius: 8px; font-family: inherit; font-size: 14px;
+    font-weight: 700; cursor: pointer; transition: background .2s;
+  }
+  .login-btn:hover { background: #16a34a; }
+  .login-btn:disabled { opacity: .5; cursor: not-allowed; }
 </style>
 </head>
 <body>
+
+<!-- LOGIN OVERLAY -->
+<div id="loginOverlay">
+  <div class="login-box">
+    <div class="login-title">Garden Finance</div>
+    <div class="login-sub">Sign in to access the dashboard</div>
+    <div class="login-field">
+      <label>Email</label>
+      <input id="loginEmail" type="email" placeholder="you@gmail.com" autocomplete="email" />
+    </div>
+    <div class="login-field">
+      <label>Password</label>
+      <div class="login-pw-wrap">
+        <input id="loginPassword" type="password" placeholder="••••••••" autocomplete="current-password" />
+        <button type="button" class="login-pw-toggle" onclick="togglePasswordView(this)" tabindex="-1">👁</button>
+      </div>
+    </div>
+    <div class="login-error" id="loginError"></div>
+    <button class="login-btn" id="loginBtn" onclick="submitLogin()">Sign in</button>
+  </div>
+</div>
 
 <div class="app">
 
@@ -749,6 +810,66 @@
 </div>
 
 <script>
+// ── AUTH ──────────────────────────────────────────────────────
+(function() {
+  const token = sessionStorage.getItem('dash_token');
+  if (token) document.getElementById('loginOverlay').classList.add('hidden');
+
+  const _nativeFetch = window.fetch.bind(window);
+  window.fetch = function(url, opts) {
+    opts = opts || {};
+    if (typeof url === 'string' && url.startsWith('/api/')) {
+      const t = sessionStorage.getItem('dash_token');
+      if (t) opts = { ...opts, headers: { ...(opts.headers || {}), 'Authorization': 'Bearer ' + t } };
+    }
+    return _nativeFetch(url, opts).then(res => {
+      if (res.status === 401 && typeof url === 'string' && url.startsWith('/api/') && url !== '/api/login') {
+        sessionStorage.removeItem('dash_token');
+        document.getElementById('loginOverlay').classList.remove('hidden');
+      }
+      return res;
+    });
+  };
+})();
+
+function togglePasswordView(btn) {
+  const input = document.getElementById('loginPassword');
+  const show = input.type === 'password';
+  input.type = show ? 'text' : 'password';
+  btn.textContent = show ? '🙈' : '👁';
+}
+
+async function submitLogin() {
+  const btn = document.getElementById('loginBtn');
+  const err = document.getElementById('loginError');
+  const email = document.getElementById('loginEmail').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  err.textContent = '';
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    });
+    const d = await r.json();
+    if (!r.ok) { err.textContent = d.error || 'Login failed'; return; }
+    sessionStorage.setItem('dash_token', d.token);
+    window.location.reload();
+  } catch(e) {
+    err.textContent = 'Could not reach server';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Sign in';
+  }
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !document.getElementById('loginOverlay').classList.contains('hidden'))
+    submitLogin();
+});
+
 // ── AMOUNTS: match backend `routeOptimizerAgent` formatUnitsAtomic (atomic → 0.xxxx) ──
 function toBigIntSafe(value) {
   if (value === null || value === undefined) return null;
@@ -839,6 +960,13 @@ async function hydrateRunUiFromServer() {
     if (!j.suiteRunning) {
       stopRunStatusPoll();
       _hydratedSuitePoll = false;
+      const btnRun = document.getElementById('btnRunAll');
+      if (btnRun && btnRun.disabled) {
+        btnRun.disabled = false;
+        btnRun.innerHTML = '▶ Run All Tests';
+        const stopBtn = document.getElementById('btnStop');
+        if (stopBtn) stopBtn.style.display = 'none';
+      }
       return;
     }
     const env = String(j.env || 'testnet').toUpperCase();
@@ -1537,9 +1665,9 @@ async function runAll() {
 }
 
 let _runAllAfterModal = false;
-let _selectedRunMode = 'allTests';
+let _selectedRunMode = 'allChains';
 
-function _launchRunAll(mode = _selectedRunMode || 'allTests') {
+function _launchRunAll(mode = _selectedRunMode || 'allChains') {
   _selectedRunMode = mode === 'allChains' ? 'allChains' : 'allTests';
   const btn  = document.getElementById('btnRunAll');
   const stop = document.getElementById('btnStop');
@@ -1652,6 +1780,32 @@ function showReadinessModal(readiness) {
     consolidation, hasQualifiedChainStart, executablePlanCount, simulation,
   } = readiness;
   const isAllChains = _selectedRunMode === 'allChains';
+
+  // mergedFlowPaths needed early for anySeedSufficient / displayReadinessPct
+  const mergeFlowChains = (chains = []) => {
+    const paths = [];
+    for (const fc of chains) {
+      const seq = Array.isArray(fc.assets) ? fc.assets.filter(Boolean) : [];
+      if (!seq.length) continue;
+      let merged = false;
+      for (const p of paths) {
+        const pLast = p.assets[p.assets.length - 1];
+        const pFirst = p.assets[0];
+        const sFirst = seq[0];
+        const sLast = seq[seq.length - 1];
+        if (pLast === sFirst) { p.assets = p.assets.concat(seq.slice(1)); p.hops += Number(fc.length || Math.max(0, seq.length - 1)); p.gasOk = p.gasOk && (fc.feasible !== false); merged = true; break; }
+        if (sLast === pFirst) { p.assets = seq.slice(0, -1).concat(p.assets); p.hops += Number(fc.length || Math.max(0, seq.length - 1)); p.gasOk = p.gasOk && (fc.feasible !== false); merged = true; break; }
+      }
+      if (!merged) paths.push({ assets: seq.slice(), hops: Number(fc.length || Math.max(0, seq.length - 1)), gasOk: fc.feasible !== false });
+    }
+    return paths;
+  };
+  const mergedFlowPaths = mergeFlowChains(flowChains || []);
+  const anySeedSufficient = isAllChains && mergedFlowPaths.some(p => {
+    const seedId = p.assets?.[0];
+    return seedId && (assets || []).find(a => String(a.id) === String(seedId))?.sufficient === true;
+  });
+
   // Count categories
   const seedAssets = assets.filter(a => a.isChainStart);
   const fundedSeedFallback = assets.filter(a => a.sufficient && !a.isChainFundedSource);
@@ -1670,11 +1824,7 @@ function showReadinessModal(readiness) {
   const planReadinessPct = (rawPlannedRoutes > 0 && Number.isFinite(executablePlannedRoutes))
     ? Math.min(100, Math.round((executablePlannedRoutes / rawPlannedRoutes) * 100))
     : 0;
-  /* allChains: headline bar = ready-to-execute when strict gate passes, else funded-seeds / chain-start rows.
-     The API readinessPct is hop-level (runnable consecutive hops / total hops in ALL beams) — often single-digit. */
-  const displayReadinessPct = isAllChains
-    ? (canRun ? 100 : seedReadinessPct)
-    : readinessPct;
+  const displayReadinessPct = isAllChains ? (anySeedSufficient ? 100 : seedReadinessPct) : readinessPct;
   const barColor = displayReadinessPct >= 80 ? 'var(--green)' : displayReadinessPct >= 30 ? 'var(--yellow)' : 'var(--red)';
   const modeAllTestsStyle = _selectedRunMode === 'allTests'
     ? 'background:var(--cyan);color:#021015;border-color:var(--cyan)'
@@ -1705,54 +1855,18 @@ function showReadinessModal(readiness) {
     </div>`;
   };
 
-  const validAssets = assets.filter((a) => a.sufficient === true);
-  const invalidAssets = assets.filter((a) => a.sufficient !== true);
+  const validAssets = assets.filter((a) => {
+    const bal = typeof a.balance === 'bigint' ? Number(a.balance) : Number(a.balance ?? 0);
+    return bal > 0;
+  });
+  const invalidAssets = [];
 
   const walletValidHtml = validAssets.length
     ? validAssets.map((a) => walletLine(a, false)).join('')
-    : `<div style="font-size:11px;color:var(--muted)">no valid assets</div>`;
+    : `<div style="font-size:11px;color:var(--muted)">no wallet balance found</div>`;
 
-  const walletInvalidHtml = invalidAssets.length
-    ? invalidAssets.map((a) => walletLine(a, true)).join('')
-    : '';
+  const walletInvalidHtml = '';
 
-  const mergeFlowChains = (chains = []) => {
-    const paths = [];
-    for (const fc of chains) {
-      const seq = Array.isArray(fc.assets) ? fc.assets.filter(Boolean) : [];
-      if (!seq.length) continue;
-      let merged = false;
-      for (const p of paths) {
-        const pLast = p.assets[p.assets.length - 1];
-        const pFirst = p.assets[0];
-        const sFirst = seq[0];
-        const sLast = seq[seq.length - 1];
-        if (pLast === sFirst) {
-          p.assets = p.assets.concat(seq.slice(1));
-          p.hops += Number(fc.length || Math.max(0, seq.length - 1));
-          p.gasOk = p.gasOk && (fc.feasible !== false);
-          merged = true;
-          break;
-        }
-        if (sLast === pFirst) {
-          p.assets = seq.slice(0, -1).concat(p.assets);
-          p.hops += Number(fc.length || Math.max(0, seq.length - 1));
-          p.gasOk = p.gasOk && (fc.feasible !== false);
-          merged = true;
-          break;
-        }
-      }
-      if (!merged) {
-        paths.push({
-          assets: seq.slice(),
-          hops: Number(fc.length || Math.max(0, seq.length - 1)),
-          gasOk: fc.feasible !== false,
-        });
-      }
-    }
-    return paths;
-  };
-  const mergedFlowPaths = mergeFlowChains(flowChains || []);
   const formatAssetShort = (id) => {
     if (!id) return '—';
     const t = String(id).split(':').pop()?.toUpperCase() || String(id);
@@ -1795,14 +1909,64 @@ function showReadinessModal(readiness) {
     ? `⚠️ consolidation suggested: ${String(consolidation?.target?.name || consolidation?.target?.id || '')}`.trim()
     : (consolidation?.reason ? `ℹ️ consolidation: ${String(consolidation.reason)}` : '');
 
-  const runBtnStyle = canRun
+  const effectiveCanRun = isAllChains ? (canRun && anySeedSufficient) : canRun;
+  const runBtnStyle = effectiveCanRun
     ? 'background:var(--green);color:#000;cursor:pointer'
     : 'background:var(--bg3);color:var(--muted);cursor:not-allowed;border:1px solid var(--border)';
   const runBtnText = 'RUN';
 
-  const runBypassHtml = !canRun
-    ? `<button type="button" id="readinessRunBypassBtn" onclick="if(confirm('Strict readiness gate is closed (no executable planned routes with current balances). Trades may skip or fail. Continue?')){ document.getElementById('readinessOverlay').remove(); _proceedToTradeSizeModal(_selectedRunMode); }" style="padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;border:1px solid rgba(234,179,8,.45);background:rgba(234,179,8,.08);color:var(--yellow);cursor:pointer;width:100%;margin-top:8px">▶ Run anyway — bypass gate</button>`
-    : '';
+  // ── Consolidation UI: shown when allChains has no sufficient seed ──────────
+  // All assets with any balance (even below min) — candidates to consolidate from
+  const consolidationSources = isAllChains && !anySeedSufficient
+    ? (assets || []).filter(a => {
+        const bal = typeof a.balance === 'bigint' ? Number(a.balance) : Number(a.balance ?? 0);
+        return bal > 0;
+      })
+    : [];
+  // Target candidates: any asset that appears as a chain seed
+  const seedIds = new Set(mergedFlowPaths.map(p => p.assets?.[0]).filter(Boolean));
+  const consolidationTargets = (assets || []).filter(a => seedIds.has(String(a.id)));
+
+  const runBypassHtml = (isAllChains && !anySeedSufficient && consolidationSources.length)
+    ? `<div id="consolidationPanel" style="margin-top:10px;padding:12px;border:1px solid rgba(234,179,8,.25);border-radius:10px;background:rgba(234,179,8,.04)">
+        <div style="font-size:11px;font-weight:700;color:var(--yellow);margin-bottom:8px">⚡ consolidate to enable run</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;line-height:1.5">Select assets to swap into a single seed. Cumulative balance must meet the seed's min trade amount.</div>
+
+        <div style="font-size:10px;font-weight:600;margin-bottom:6px">source assets (select to include):</div>
+        <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:10px" id="consolidationSourceList">
+          ${consolidationSources.map(a => {
+            const dec = Number(a.decimals ?? 8);
+            const balStr = a.balanceNormalized || formatUnitsAtomicDisplay(a.balance, dec);
+            const chainStr = String(a.chainRaw || a.chain || '').replace(/_/g,'');
+            const label = `${String(a.ticker||'').toUpperCase()} on ${chainStr}`;
+            return `<label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:5px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03)" data-asset-id="${a.id}">
+              <input type="checkbox" data-asset-id="${a.id}" data-balance="${a.balance ?? 0}" data-decimals="${dec}" onchange="_consolidationUpdate()" style="cursor:pointer">
+              <span style="font-size:11px;flex:1">${label}</span>
+              <span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--muted)">${balStr}</span>
+            </label>`;
+          }).join('')}
+        </div>
+
+        <div style="font-size:10px;font-weight:600;margin-bottom:6px">consolidate into:</div>
+        <select id="consolidationTarget" onchange="_consolidationUpdate()" style="width:100%;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:5px 8px;font-size:11px;margin-bottom:10px">
+          <option value="">— pick target seed —</option>
+          ${consolidationTargets.map(a => {
+            const chainStr = String(a.chainRaw || a.chain || '').replace(/_/g,'');
+            const minStr = formatUnitsAtomicDisplay(a.min_amount ?? 50000, Number(a.decimals ?? 8));
+            return `<option value="${a.id}" data-min="${a.min_amount ?? 50000}" data-decimals="${Number(a.decimals??8)}">${String(a.ticker||'').toUpperCase()} on ${chainStr} (min ${minStr})</option>`;
+          }).join('')}
+        </select>
+
+        <div id="consolidationSummary" style="font-size:10px;color:var(--muted);margin-bottom:10px;min-height:16px"></div>
+
+        <button id="consolidationRunBtn" onclick="_runConsolidation()" disabled
+          style="width:100%;padding:8px;border-radius:8px;font-size:12px;font-weight:700;border:none;background:var(--bg3);color:var(--muted);cursor:not-allowed">
+          Consolidate &amp; Run allChains
+        </button>
+      </div>`
+    : (!effectiveCanRun && !isAllChains)
+      ? `<button type="button" onclick="if(confirm('Gate closed. Trades may fail. Continue?')){document.getElementById('readinessOverlay').remove();_proceedToTradeSizeModal(_selectedRunMode);}" style="padding:8px 12px;border-radius:8px;font-size:12px;font-weight:600;border:1px solid rgba(234,179,8,.45);background:rgba(234,179,8,.08);color:var(--yellow);cursor:pointer;width:100%;margin-top:8px">▶ Run anyway</button>`
+      : '';
 
   document.body.insertAdjacentHTML('beforeend', `
     <div id="readinessOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center;z-index:200;overflow:auto;overscroll-behavior:contain;padding:12px 0">
@@ -1826,35 +1990,143 @@ function showReadinessModal(readiness) {
           </div>
         </div>
         <div style="flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding:16px 24px">
-          <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.10);background:rgba(255,255,255,.03);border-radius:12px;margin-bottom:14px">
-            <div style="font-size:12px;font-weight:800;margin-bottom:6px">planner + gate preview</div>
-            <div style="font-size:11px;color:var(--muted);line-height:1.6">
-              <div>${gateSummaryLine}</div>
-              <div>${planSummaryLine}</div>
-              <div>${simSummaryLine}</div>
-              ${consolidationLine ? `<div>${consolidationLine}</div>` : ''}
-            </div>
-          </div>
+          ${consolidationLine ? `<div style="padding:8px 12px;border:1px solid rgba(234,179,8,.25);background:rgba(234,179,8,.06);border-radius:10px;margin-bottom:12px;font-size:11px;color:var(--yellow);line-height:1.5">${consolidationLine}</div>` : ''}
           <div style="font-size:12px;font-weight:700;margin-bottom:10px">wallet balance:</div>
           <div style="padding-bottom:10px">${walletValidHtml}</div>
-          ${invalidAssets.length ? `<div style="margin-top:10px;border-top:1px solid rgba(255,255,255,.10);padding-top:10px">${walletInvalidHtml}</div>` : ''}
 
           <div style="margin-top:16px;border-top:1px solid rgba(255,255,255,.10);padding-top:12px">
-            <div style="font-size:12px;font-weight:700;margin-bottom:4px">planned single hops</div>
-            <div style="font-size:10px;color:var(--muted);line-height:1.45;margin-bottom:8px">
-              Same count as <span style="font-family:'JetBrains Mono',monospace">planned routes: ${Number(executablePlannedRoutes || 0)}/${Number(rawPlannedRoutes || 0)}</span> — one line per hop the runner may execute (cap 160, up to 3 per pair).
-            </div>
-            <div style="max-height:min(38vh,320px);overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:10px 12px;background:rgba(0,0,0,.18)">
-              ${plannedHopsHtml}
-            </div>
-          </div>
+            ${(() => {
+              // Build asset-id → decimals lookup from the assets list already in scope
+              const assetDecMap = new Map((assets || []).map(a => [String(a.id || ''), Number(a.decimals ?? 8)]));
+              const fmtAmt = (atomic, assetId) => formatUnitsAtomicDisplay(atomic, assetDecMap.get(String(assetId || '')) ?? 8);
 
-          <div style="margin-top:16px;border-top:1px solid rgba(255,255,255,.10);padding-top:12px">
-            <div style="font-size:12px;font-weight:700;margin-bottom:4px">beam chains (multi-hop summaries)</div>
-            <div style="font-size:10px;color:var(--muted);line-height:1.45;margin-bottom:8px">
-              Fewer rows than planned hops: these are merged chain-reaction paths from seeds, not the full hop list.
-            </div>
-            ${routesHtml}
+              if (isAllChains) {
+                // ── allChains: show ALL available chains — one is randomly picked at run time ──
+                if (!mergedFlowPaths.length) {
+                  return `<div style="font-size:12px;font-weight:700;margin-bottom:8px">execution flow</div><div style="font-size:11px;color:var(--muted)">No chains planned — connect a funded wallet first.</div>`;
+                }
+
+                // asset id → meta lookup from assets array
+                const assetMetaMap = new Map((assets || []).map(a => [String(a.id || ''), a]));
+
+                const arrowHtml = `<div style="color:var(--muted);font-size:14px;align-self:flex-start;padding-top:6px;padding-left:3px;padding-right:3px">→</div>`;
+                const cycleArrow = `<div style="color:var(--cyan);font-size:14px;align-self:flex-start;padding-top:6px;padding-left:3px;padding-right:3px" title="cycle back to seed">↩</div>`;
+
+                const nodeBox = (assetId) => {
+                  const t = String(assetId).split(':').pop()?.toUpperCase() || assetId;
+                  const c = String(assetId).split(':')[0]?.replace(/_.*/, '') || '';
+                  return `<div style="display:inline-flex;flex-direction:column;align-items:center;gap:2px">
+                    <div style="background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.13);border-radius:8px;padding:5px 9px;font-size:11px;font-weight:700;font-family:'JetBrains Mono',monospace;white-space:nowrap">${t}</div>
+                    <div style="font-size:9px;color:var(--muted)">${c}</div>
+                  </div>`;
+                };
+
+                const fundedFlowPaths = mergedFlowPaths.filter(p => {
+                  const sId = p.assets?.[0];
+                  if (!sId) return false;
+                  const sMeta = assetMetaMap.get(String(sId));
+                  return (typeof sMeta?.balance === 'bigint' ? Number(sMeta.balance) : Number(sMeta?.balance ?? 0)) > 0;
+                });
+
+                const chainBlocks = fundedFlowPaths.map((p) => {
+                  const pathAssets = p.assets || [];
+                  if (!pathAssets.length) return '';
+
+                  const seedId = pathAssets[0];
+                  const seedMeta = assetMetaMap.get(String(seedId));
+                  const seedSufficient = seedMeta?.sufficient === true;
+                  const seedBal = seedMeta?.balance ?? null;
+                  const seedMin = seedMeta?.min_amount ?? null;
+                  const seedDec = Number(seedMeta?.decimals ?? 8);
+
+                  const balColor = seedSufficient ? 'var(--green)' : 'var(--red)';
+                  const balIcon = seedSufficient ? '✅' : '❌';
+                  const balLine = seedBal !== null
+                    ? `${balIcon} <span style="font-family:'JetBrains Mono',monospace;color:${balColor}">${fmtAmt(seedBal, seedId)}</span>`
+                    + (seedMin !== null ? ` / min <span style="font-family:'JetBrains Mono',monospace">${fmtAmt(seedMin, seedId)}</span>` : '')
+                    : `<span style="color:var(--muted)">balance unknown</span>`;
+
+                  const flowParts = [];
+                  for (let i = 0; i < pathAssets.length; i++) {
+                    flowParts.push(nodeBox(pathAssets[i]));
+                    if (i < pathAssets.length - 1) flowParts.push(arrowHtml);
+                  }
+
+                  // Cycle close indicator
+                  const lastId = pathAssets[pathAssets.length - 1];
+                  if (lastId !== seedId) {
+                    const hasCycle = (executablePlanRoutes || []).some(r => r.fromAsset === lastId && r.toAsset === seedId);
+                    flowParts.push(hasCycle ? cycleArrow : `<div style="color:var(--muted);font-size:12px;align-self:flex-start;padding-top:6px;padding-left:3px;padding-right:3px">⋯</div>`);
+                    const seedT = String(seedId).split(':').pop()?.toUpperCase() || seedId;
+                    const seedC = String(seedId).split(':')[0]?.replace(/_.*/, '') || '';
+                    flowParts.push(`<div style="display:inline-flex;flex-direction:column;align-items:center;gap:2px">
+                      <div style="background:rgba(255,255,255,.07);border:1px solid ${hasCycle ? 'var(--cyan)' : 'rgba(255,255,255,.13)'};border-radius:8px;padding:5px 9px;font-size:11px;font-weight:700;font-family:'JetBrains Mono',monospace;white-space:nowrap">${seedT}</div>
+                      <div style="font-size:9px;color:var(--muted)">${seedC}</div>
+                      <div style="font-size:9px;color:${hasCycle ? 'var(--cyan)' : 'var(--muted)'}">${hasCycle ? 'cycle ✓' : 'no cycle'}</div>
+                    </div>`);
+                  }
+
+                  return `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid rgba(255,255,255,.07);border-radius:10px;background:rgba(255,255,255,.02)">
+                    <div style="font-size:10px;color:var(--muted);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center">
+                      <span>${pathAssets.length - 1} hop${pathAssets.length - 1 !== 1 ? 's' : ''}</span>
+                      <span>${balLine}</span>
+                    </div>
+                    <div style="overflow-x:auto;padding-bottom:2px">
+                      <div style="display:inline-flex;align-items:flex-start;gap:0;flex-wrap:nowrap;min-width:max-content">${flowParts.join('')}</div>
+                    </div>
+                  </div>`;
+                }).join('');
+
+                return `
+                  <div style="font-size:12px;font-weight:700;margin-bottom:4px">available chains · ${fundedFlowPaths.length} seed${fundedFlowPaths.length !== 1 ? 's' : ''}</div>
+                  <div style="font-size:10px;color:var(--muted);margin-bottom:10px">one is randomly selected at run time</div>
+                  ${chainBlocks}`;
+              } else {
+                // ── allTests: same node-based flow format, one row per chain ─────
+                const assetMetaMapT = new Map((assets || []).map(a => [String(a.id || ''), a]));
+                const fundedTestPaths = mergedFlowPaths.filter(p => {
+                  const sId = p.assets?.[0];
+                  if (!sId) return false;
+                  const sMeta = assetMetaMapT.get(String(sId));
+                  return (typeof sMeta?.balance === 'bigint' ? Number(sMeta.balance) : Number(sMeta?.balance ?? 0)) > 0;
+                });
+
+                if (!fundedTestPaths.length) {
+                  return `<div style="font-size:12px;font-weight:700;margin-bottom:8px">execution flow</div><div style="font-size:11px;color:var(--muted)">no chains with wallet balance</div>`;
+                }
+
+                const nodeBox = (assetId) => {
+                  const t = String(assetId).split(':').pop()?.toUpperCase() || assetId;
+                  const c = String(assetId).split(':')[0]?.replace(/_.*/, '') || '';
+                  return `<div style="display:inline-flex;flex-direction:column;align-items:center;gap:2px">
+                    <div style="background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.13);border-radius:8px;padding:5px 9px;font-size:11px;font-weight:700;font-family:'JetBrains Mono',monospace;white-space:nowrap">${t}</div>
+                    <div style="font-size:9px;color:var(--muted)">${c}</div>
+                  </div>`;
+                };
+                const arrow = `<div style="color:var(--muted);font-size:14px;align-self:flex-start;padding-top:6px;padding-left:3px;padding-right:3px">→</div>`;
+
+                const chainBlocks = fundedTestPaths.map((p, idx) => {
+                  const pathAssets = p.assets || [];
+                  const parts = [];
+                  for (let i = 0; i < pathAssets.length; i++) {
+                    parts.push(nodeBox(pathAssets[i]));
+                    if (i < pathAssets.length - 1) parts.push(arrow);
+                  }
+                  const gasWarn = p.gasOk === false ? `<div style="font-size:9px;color:var(--yellow);margin-top:4px">⚠ gas may be insufficient</div>` : '';
+                  return `<div style="margin-bottom:14px">
+                    <div style="font-size:10px;color:var(--muted);margin-bottom:5px">chain ${idx + 1} · ${Math.max(0, pathAssets.length - 1)} hop${pathAssets.length - 1 !== 1 ? 's' : ''}</div>
+                    <div style="overflow-x:auto;padding-bottom:4px">
+                      <div style="display:inline-flex;align-items:flex-start;gap:0;flex-wrap:nowrap;min-width:max-content">${parts.join('')}</div>
+                    </div>
+                    ${gasWarn}
+                  </div>`;
+                }).join('');
+
+                return `
+                  <div style="font-size:12px;font-weight:700;margin-bottom:10px">execution flow · ${fundedTestPaths.length} chain${fundedTestPaths.length !== 1 ? 's' : ''} · ${Number(executablePlannedRoutes || 0)} of ${Number(rawPlannedRoutes || 0)} hops executable</div>
+                  ${chainBlocks}`;
+              }
+            })()}
           </div>
         </div>
         <div style="flex-shrink:0;padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center;background:var(--bg2)">
@@ -1864,7 +2136,7 @@ function showReadinessModal(readiness) {
           <button type="button" id="readinessRunBtn"
             onclick="document.getElementById('readinessOverlay').remove();_proceedToTradeSizeModal(_selectedRunMode)"
             style="padding:10px 20px;border-radius:10px;font-size:14px;font-weight:800;border:none;min-width:140px;${runBtnStyle}"
-            ${canRun ? '' : 'disabled'}>
+            ${effectiveCanRun ? '' : 'disabled'}>
             ${runBtnText}
           </button>
         </div>
@@ -1877,6 +2149,94 @@ function showReadinessModal(readiness) {
       if (bar) bar.style.width = displayReadinessPct + '%';
     }, 50);
   });
+}
+
+// ── Consolidation helpers ─────────────────────────────────────
+function _consolidationUpdate() {
+  const panel = document.getElementById('consolidationPanel');
+  if (!panel) return;
+  const checked = [...panel.querySelectorAll('input[type=checkbox]:checked')];
+  const targetSel = document.getElementById('consolidationTarget');
+  const summaryEl = document.getElementById('consolidationSummary');
+  const runBtn    = document.getElementById('consolidationRunBtn');
+  const targetOpt = targetSel?.options[targetSel.selectedIndex];
+  const targetMin = targetOpt ? Number(targetOpt.dataset.min || 50000) : null;
+  const targetDec = targetOpt ? Number(targetOpt.dataset.decimals || 8) : 8;
+
+  if (!checked.length || !targetSel?.value) {
+    if (summaryEl) summaryEl.textContent = '';
+    if (runBtn) { runBtn.disabled = true; runBtn.style.background = 'var(--bg3)'; runBtn.style.color = 'var(--muted)'; runBtn.style.cursor = 'not-allowed'; }
+    return;
+  }
+
+  // Sum selected balances (atomic, all in their native decimals — display only)
+  const lines = checked.map(cb => {
+    const id  = cb.dataset.assetId;
+    const bal = Number(cb.dataset.balance || 0);
+    const dec = Number(cb.dataset.decimals || 8);
+    const label = id.split(':').pop()?.toUpperCase() || id;
+    return `${label}: ${formatUnitsAtomicDisplay(bal, dec)}`;
+  });
+
+  const meetsMin = targetMin !== null; // we can't compare cross-asset totals without price feed here
+  if (summaryEl) summaryEl.innerHTML =
+    `<div style="line-height:1.7">${lines.join(' · ')}</div>` +
+    `<div style="color:var(--cyan);margin-top:3px">→ will swap into ${targetOpt?.text || ''} (min ${formatUnitsAtomicDisplay(targetMin, targetDec)})</div>` +
+    `<div style="color:var(--muted);margin-top:2px;font-size:9px">gas is checked at execution time via pre-hop substitution</div>`;
+
+  if (runBtn) {
+    runBtn.disabled = false;
+    runBtn.style.background = 'var(--cyan)';
+    runBtn.style.color = '#021015';
+    runBtn.style.cursor = 'pointer';
+  }
+}
+
+async function _runConsolidation() {
+  const panel = document.getElementById('consolidationPanel');
+  if (!panel) return;
+  const checked = [...panel.querySelectorAll('input[type=checkbox]:checked')];
+  const targetId = document.getElementById('consolidationTarget')?.value;
+  if (!checked.length || !targetId) return;
+
+  const runBtn = document.getElementById('consolidationRunBtn');
+  if (runBtn) { runBtn.disabled = true; runBtn.innerHTML = '<span class="spinner"></span> consolidating…'; }
+
+  // Build amount overrides: each source asset uses its full balance as the swap amount
+  const amounts = {};
+  for (const cb of checked) {
+    const id  = cb.dataset.assetId;
+    const bal = Number(cb.dataset.balance || 0);
+    if (bal > 0) amounts[id] = bal;
+  }
+
+  try {
+    // Store overrides and trigger an allTests run with just those source→target pairs
+    await fetch('/api/run/set-amounts', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amounts }),
+    });
+
+    const res = await fetch('/api/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'allChains', force: true }),
+    });
+    const data = await res.json();
+    if (!data.started) throw new Error(data.reason || 'Run did not start');
+
+    document.getElementById('readinessOverlay')?.remove();
+    // Refresh readiness after a short delay to reflect new balances
+    setTimeout(async () => {
+      try {
+        const r = await fetch('/api/route-readiness?mode=allChains');
+        const readiness = await r.json();
+        if (!readiness.error) showReadinessModal(readiness);
+      } catch (_) {}
+    }, 4000);
+  } catch (e) {
+    if (runBtn) { runBtn.disabled = false; runBtn.innerHTML = 'Consolidate &amp; Run allChains'; runBtn.style.background = 'var(--cyan)'; runBtn.style.color = '#021015'; runBtn.style.cursor = 'pointer'; }
+    alert('Consolidation failed: ' + (e.message || 'unknown error'));
+  }
 }
 
 async function _setRunModeFromModal(mode) {
@@ -4622,40 +4982,42 @@ async function saveRpc(chain) {
 }
 
 // ── INIT ──
-connectWS();
-hydrateRunUiFromServer();
-// Re-announce any already-connected browser wallets BEFORE loading states.
-// Fixes the refresh bug: MetaMask was connected before reload, server lost state
-// (restarted/envkey took over), browser silently re-registers with no popup.
-(async function reannounceWallets() {
-  try {
-    // Try to silently re-detect the previously connected wallet (no popup)
-    const _providers = getEvmProviders();
-    for (const _p of _providers) {
-      try {
-        const accounts = await _p.request({ method: 'eth_accounts' }); // no popup
-        if (accounts && accounts[0]) {
-          window._evmProvider = _p;
-          const info = providerInfo(_p);
-          window._evmWalletName = info.name;
-          await fetch('/api/wallet/evm', { method: 'POST', headers: {'Content-Type':'application/json'},
-            body: JSON.stringify({ address: accounts[0] }) });
-          evmAddress = accounts[0];
-          break; // stop after first one that has accounts
-        }
-      } catch(_) {}
-    }
-  } catch(_) {}
-  try {
-    if (window.solana && window.solana.isPhantom) {
-      const resp = await window.solana.connect({ onlyIfTrusted: true }); // no popup
-      const addr = resp.publicKey.toString();
-      await fetch('/api/wallet/solana', { method: 'POST', headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ address: addr }) });
-    }
-  } catch(_) {} // not previously trusted
-  loadWalletStates();
-})();
+if (sessionStorage.getItem('dash_token')) {
+  connectWS();
+  hydrateRunUiFromServer();
+  // Re-announce any already-connected browser wallets BEFORE loading states.
+  // Fixes the refresh bug: MetaMask was connected before reload, server lost state
+  // (restarted/envkey took over), browser silently re-registers with no popup.
+  (async function reannounceWallets() {
+    try {
+      // Try to silently re-detect the previously connected wallet (no popup)
+      const _providers = getEvmProviders();
+      for (const _p of _providers) {
+        try {
+          const accounts = await _p.request({ method: 'eth_accounts' }); // no popup
+          if (accounts && accounts[0]) {
+            window._evmProvider = _p;
+            const info = providerInfo(_p);
+            window._evmWalletName = info.name;
+            await fetch('/api/wallet/evm', { method: 'POST', headers: {'Content-Type':'application/json'},
+              body: JSON.stringify({ address: accounts[0] }) });
+            evmAddress = accounts[0];
+            break; // stop after first one that has accounts
+          }
+        } catch(_) {}
+      }
+    } catch(_) {}
+    try {
+      if (window.solana && window.solana.isPhantom) {
+        const resp = await window.solana.connect({ onlyIfTrusted: true }); // no popup
+        const addr = resp.publicKey.toString();
+        await fetch('/api/wallet/solana', { method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ address: addr }) });
+      }
+    } catch(_) {} // not previously trusted
+    loadWalletStates();
+  })();
+}
 </script>
 </body>
 </html>

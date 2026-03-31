@@ -3,7 +3,7 @@
 // Used by the Route Optimizer and Arbitrage Agent to learn from
 // past runs (ordering, failures, effective rates).
 
-const MAX_ENTRIES = 1000;
+const MAX_ENTRIES = 5000; // raised from 1000 — covers ~10 days at medium scale (100–1000/day)
 const _entries = [];
 
 function record(entry) {
@@ -22,6 +22,9 @@ function record(entry) {
     slippagePct:  Number(entry.slippagePct || 0),
     durationSec:  Number(entry.durationSec || 0),
     ts:           entry.ts || new Date().toISOString(),
+    agent:        entry.agent || null,
+    error:        entry.error || null,
+    steps:        Array.isArray(entry.steps) ? entry.steps : null,
   };
   _entries.push(safe);
   if (_entries.length > MAX_ENTRIES) _entries.shift();
@@ -34,6 +37,14 @@ function getAll() {
 
 function getSuccessful() {
   return getAll().filter(e => e.status === "pass");
+}
+
+function getById(testId) {
+  if (!testId) return null;
+  for (let i = _entries.length - 1; i >= 0; i--) {
+    if (_entries[i].testId === testId) return _entries[i];
+  }
+  return null;
 }
 
 // Aggregate basic stats per from→to asset pair
@@ -67,5 +78,6 @@ module.exports = {
   getAll,
   getSuccessful,
   getPairStats,
+  getById,
 };
 
