@@ -33,6 +33,7 @@ const garden = {
   getChains:        ()            => client.get("/chains").then(r => r.data),
   getAssets:        ()            => client.get("/assets").then(r => r.data),
   getPolicy:        (from, to)    => client.get("/policy", { params: { from, to } }).then(r => r.data),
+  getGlobalPolicy:  ()            => client.get("/v2/policy").then(r => r.data).catch(() => client.get("/policy").then(r => r.data).catch(() => null)),
   getLiquidity:     (from, to)    => client.get("/liquidity", { params: { from, to } }).then(r => r.data),
   getQuote: async (from, to, amt) => {
     const params = { from, to, from_amount: amt };

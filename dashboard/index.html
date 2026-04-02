@@ -1444,9 +1444,23 @@ function appendStep(step, container) {
 function addIssue(type, severity, title, detail, meta = {}) {
   issues.push({ type, severity, title, detail, meta, ts: new Date().toLocaleTimeString() });
   renderIssues();
+  updateIssueBadge();
+}
+function removeIssue(idx) {
+  issues.splice(idx, 1);
+  _issueExpanded.delete(idx);
+  // Re-index expanded set for shifted indices
+  const shifted = new Set();
+  for (const k of _issueExpanded) { if (k > idx) shifted.add(k - 1); else shifted.add(k); }
+  _issueExpanded.clear();
+  for (const k of shifted) _issueExpanded.add(k);
+  renderIssues();
+  updateIssueBadge();
+}
+function updateIssueBadge() {
   const badge = document.getElementById('issueCount');
   badge.textContent = issues.length;
-  badge.style.display = 'inline';
+  badge.style.display = issues.length > 0 ? 'inline' : 'none';
 }
 
 // Track which issues are expanded
@@ -1507,10 +1521,14 @@ function getIssueReasoning(issue) {
       fix: 'Ensure MetaMask is unlocked and on the correct network, then re-run the test.'
     };
   }
-  if (t.includes('400') || t.includes('notify garden')) {
+  if (t.includes('400') || d.includes('400') || t.includes('notify garden') || d.includes('quote expired')) {
     return {
-      why: 'Garden API returned 400 when notified of the initiation transaction — usually the tx was not yet confirmed on-chain at the time of the notification.',
-      fix: 'This is often transient. The runner now waits for on-chain confirmation before notifying. If it persists, check the RPC for the source chain.',
+      why: d.includes('quote expired')
+        ? 'The Garden quote expired before the transaction could be submitted. This happens when earlier hops took too long (RPC delays, chain congestion) and the quote\'s validity window passed.'
+        : 'Garden API returned 400 when notified of the initiation transaction — usually the tx was not yet confirmed on-chain at the time of the notification.',
+      fix: d.includes('quote expired')
+        ? 'This is usually transient. The runner will retry on the next cycle. Faster RPCs and shorter chains reduce the chance of expiry.'
+        : 'This is often transient. The runner now waits for on-chain confirmation before notifying. If it persists, check the RPC for the source chain.',
       canFixRpc: true
     };
   }
@@ -1518,6 +1536,19 @@ function getIssueReasoning(issue) {
     return {
       why: 'A step exceeded its maximum wait time. Common on testnet due to slow block production, chain congestion, or an unresponsive RPC.',
       fix: 'Verify your RPC endpoints are healthy. Testnet chains can be 5–30× slower than mainnet.'
+    };
+  }
+  if (d.includes('no gas') || d.includes('no supported native gas') || t.includes('no gas')) {
+    return {
+      why: 'The destination chain has zero native gas tokens in the wallet, and Garden does not support a swap to the native gas token on that chain. Without gas, no transactions can be submitted.',
+      fix: 'Manually send a small amount of native gas to your wallet on that chain, or fund it from a faucet if available on testnet.'
+    };
+  }
+  if (d.includes('no rpc') || t.includes('no rpc')) {
+    return {
+      why: 'No RPC endpoint is configured for this chain. The test suite cannot submit transactions or read on-chain state without an RPC.',
+      fix: 'Add an RPC URL for this chain in .env or click "Fix RPC" below.',
+      canFixRpc: true
     };
   }
   if (t.includes('health') || t.includes('api test')) {
@@ -1612,6 +1643,9 @@ function renderIssues(filter = 'all') {
         <div style="display:flex;align-items:center;gap:8px;flex-shrink:0">
           ${headerRpcBtn}
           <span class="badge sev-${i.severity}">${i.severity.toUpperCase()}</span>
+          <button onclick="event.stopPropagation();removeIssue(${idx})" title="Dismiss"
+            style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:14px;padding:2px 4px;line-height:1;opacity:.6;transition:opacity .15s"
+            onmouseover="this.style.opacity='1';this.style.color='var(--red)'" onmouseout="this.style.opacity='.6';this.style.color='var(--muted)'">&times;</button>
         </div>
       </div>
       <div class="issue-detail">${i.detail}</div>
@@ -1643,6 +1677,13 @@ function updateStats() {
 async function runAll() {
   const btn  = document.getElementById('btnRunAll');
   btn.disabled = true;
+
+  // Wait for balance scan to finish before querying readiness
+  if (!_evmBalancesReady && _evmBalancePromise) {
+    btn.innerHTML = '<span class="spinner"></span> Loading balances…';
+    await Promise.race([_evmBalancePromise, new Promise(r => setTimeout(r, 15000))]);
+  }
+
   btn.innerHTML = '<span class="spinner"></span> Checking readiness…';
 
   try {
@@ -1677,12 +1718,14 @@ function _launchRunAll(mode = _selectedRunMode || 'allChains') {
   suiteStats = { total: 0, passed: 0, failed: 0, skipped: 0 };
   updateStats();
   issues = [];
+  _issueExpanded.clear();
   renderIssues();
+  updateIssueBadge();
   document.getElementById('lastRunLabel').textContent = '⏳ Running tests…';
   fetch('/api/run', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ mode: _selectedRunMode })
+    body: JSON.stringify({ mode: _selectedRunMode, force: true })
   })
     .then(async (r) => {
       if (!r.ok) {
@@ -1801,9 +1844,18 @@ function showReadinessModal(readiness) {
     return paths;
   };
   const mergedFlowPaths = mergeFlowChains(flowChains || []);
+  // Each hop costs 0.35% — seed needs min_amount * (1/(1-0.0035))^N to cover all N hops.
+  // Single-seed model: 1 flowChain with N hops; use flowChains[0].length (hop count), not flowChains.length (always 1).
+  const _totalChainHops = Math.max(1, (flowChains || [])[0]?.length ?? (flowChains || []).length);
+  const _chainFeeMultiplier = 1 / Math.pow(1 - 0.0035, _totalChainHops);
   const anySeedSufficient = isAllChains && mergedFlowPaths.some(p => {
     const seedId = p.assets?.[0];
-    return seedId && (assets || []).find(a => String(a.id) === String(seedId))?.sufficient === true;
+    if (!seedId) return false;
+    const seedMeta = (assets || []).find(a => String(a.id) === String(seedId));
+    if (!seedMeta) return false;
+    const bal = typeof seedMeta.balance === 'bigint' ? Number(seedMeta.balance) : Number(seedMeta.balance ?? 0);
+    // Seed must arrive at each hop with at least min_amount after compounded 0.35% fees
+    return bal >= Math.ceil(Number(seedMeta.min_amount ?? 50000) * _chainFeeMultiplier);
   });
 
   // Count categories
@@ -1915,45 +1967,63 @@ function showReadinessModal(readiness) {
     : 'background:var(--bg3);color:var(--muted);cursor:not-allowed;border:1px solid var(--border)';
   const runBtnText = 'RUN';
 
-  // ── Consolidation UI: shown when allChains has no sufficient seed ──────────
+  // ── Consolidation UI: always shown in allChains mode ────────────────────────
   // All assets with any balance (even below min) — candidates to consolidate from
-  const consolidationSources = isAllChains && !anySeedSufficient
+  const consolidationSources = isAllChains
     ? (assets || []).filter(a => {
         const bal = typeof a.balance === 'bigint' ? Number(a.balance) : Number(a.balance ?? 0);
-        return bal > 0;
+        const min = Math.max(1, Number(a.min_amount ?? 0));
+        return bal > 0 && bal >= min; // must meet Garden's min trade size to be swappable
       })
     : [];
   // Target candidates: any asset that appears as a chain seed
   const seedIds = new Set(mergedFlowPaths.map(p => p.assets?.[0]).filter(Boolean));
   const consolidationTargets = (assets || []).filter(a => seedIds.has(String(a.id)));
+  // Auto-pick best target: prefer already-sufficient seed, then most-referenced destination
+  const _normId = id => String(id).replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, '');
+  const bestConsolidationTargetId = (() => {
+    const funded = consolidationTargets.find(a => a.sufficient === true);
+    if (funded) return String(funded.id);
+    const destCounts = new Map();
+    for (const r of (executablePlanRoutes || [])) {
+      const n = _normId(r.toAsset); destCounts.set(n, (destCounts.get(n) || 0) + 1);
+    }
+    let best = null, bestScore = -1;
+    for (const t of consolidationTargets) {
+      const score = destCounts.get(_normId(String(t.id))) || 0;
+      if (score > bestScore) { bestScore = score; best = t; }
+    }
+    return best?.id ? String(best.id) : (consolidationTargets[0]?.id ? String(consolidationTargets[0].id) : '');
+  })();
 
-  const runBypassHtml = (isAllChains && !anySeedSufficient && consolidationSources.length)
-    ? `<div id="consolidationPanel" style="margin-top:10px;padding:12px;border:1px solid rgba(234,179,8,.25);border-radius:10px;background:rgba(234,179,8,.04)">
-        <div style="font-size:11px;font-weight:700;color:var(--yellow);margin-bottom:8px">⚡ consolidate to enable run</div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;line-height:1.5">Select assets to swap into a single seed. Cumulative balance must meet the seed's min trade amount.</div>
+  const runBypassHtml = (isAllChains && consolidationSources.length)
+    ? `<div id="consolidationPanel" data-fee-multiplier="${_chainFeeMultiplier.toFixed(8)}" data-total-hops="${_totalChainHops}" style="margin-top:10px;padding:12px;border:1px solid rgba(234,179,8,.25);border-radius:10px;background:rgba(234,179,8,.04)">
+        <div style="font-size:11px;font-weight:700;color:var(--yellow);margin-bottom:8px">⚡ consolidate assets into one seed</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;line-height:1.5">Swap partial balances into a single well-funded seed, then run allChains. All assets pre-selected. Gas is checked before each hop.</div>
 
         <div style="font-size:10px;font-weight:600;margin-bottom:6px">source assets (select to include):</div>
         <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:10px" id="consolidationSourceList">
           ${consolidationSources.map(a => {
             const dec = Number(a.decimals ?? 8);
             const balStr = a.balanceNormalized || formatUnitsAtomicDisplay(a.balance, dec);
+            const minStr = formatUnitsAtomicDisplay(a.min_amount ?? 50000, dec);
             const chainStr = String(a.chainRaw || a.chain || '').replace(/_/g,'');
             const label = `${String(a.ticker||'').toUpperCase()} on ${chainStr}`;
             return `<label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:5px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03)" data-asset-id="${a.id}">
-              <input type="checkbox" data-asset-id="${a.id}" data-balance="${a.balance ?? 0}" data-decimals="${dec}" onchange="_consolidationUpdate()" style="cursor:pointer">
+              <input type="checkbox" checked data-asset-id="${a.id}" data-balance="${a.balance ?? 0}" data-decimals="${dec}" onchange="_consolidationUpdate()" style="cursor:pointer">
               <span style="font-size:11px;flex:1">${label}</span>
-              <span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--muted)">${balStr}</span>
+              <span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--muted)">${balStr} <span style="color:rgba(255,255,255,.3)">/ min ${minStr}</span></span>
             </label>`;
           }).join('')}
         </div>
 
         <div style="font-size:10px;font-weight:600;margin-bottom:6px">consolidate into:</div>
         <select id="consolidationTarget" onchange="_consolidationUpdate()" style="width:100%;background:var(--bg3);border:1px solid var(--border);color:var(--fg);border-radius:6px;padding:5px 8px;font-size:11px;margin-bottom:10px">
-          <option value="">— pick target seed —</option>
           ${consolidationTargets.map(a => {
             const chainStr = String(a.chainRaw || a.chain || '').replace(/_/g,'');
             const minStr = formatUnitsAtomicDisplay(a.min_amount ?? 50000, Number(a.decimals ?? 8));
-            return `<option value="${a.id}" data-min="${a.min_amount ?? 50000}" data-decimals="${Number(a.decimals??8)}">${String(a.ticker||'').toUpperCase()} on ${chainStr} (min ${minStr})</option>`;
+            const isSelected = String(a.id) === bestConsolidationTargetId;
+            return `<option value="${a.id}" data-min="${a.min_amount ?? 50000}" data-decimals="${Number(a.decimals??8)}" data-balance="${a.balance ?? 0}"${isSelected ? ' selected' : ''}>${String(a.ticker||'').toUpperCase()} on ${chainStr} (min ${minStr})</option>`;
           }).join('')}
         </select>
 
@@ -2021,6 +2091,7 @@ function showReadinessModal(readiness) {
                   </div>`;
                 };
 
+                // Only paths with funded seed
                 const fundedFlowPaths = mergedFlowPaths.filter(p => {
                   const sId = p.assets?.[0];
                   if (!sId) return false;
@@ -2028,59 +2099,111 @@ function showReadinessModal(readiness) {
                   return (typeof sMeta?.balance === 'bigint' ? Number(sMeta.balance) : Number(sMeta?.balance ?? 0)) > 0;
                 });
 
-                const chainBlocks = fundedFlowPaths.map((p) => {
-                  const pathAssets = p.assets || [];
-                  if (!pathAssets.length) return '';
+                if (!fundedFlowPaths.length) {
+                  return `<div style="font-size:12px;font-weight:700;margin-bottom:8px">execution flow</div><div style="font-size:11px;color:var(--muted)">No chains with wallet balance.</div>`;
+                }
 
-                  const seedId = pathAssets[0];
-                  const seedMeta = assetMetaMap.get(String(seedId));
-                  const seedSufficient = seedMeta?.sufficient === true;
-                  const seedBal = seedMeta?.balance ?? null;
-                  const seedMin = seedMeta?.min_amount ?? null;
-                  const seedDec = Number(seedMeta?.decimals ?? 8);
+                // ── Stitch ALL planned segments (funded + unfunded) from the funded seed ──
+                const normId = id => String(id).replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, '');
+                // Include ALL flow paths — entry point is still the funded seed, but display shows full chain
+                const pathByStartNorm = new Map(mergedFlowPaths.map(p => [normId(String(p.assets[0])), p]));
 
-                  const balColor = seedSufficient ? 'var(--green)' : 'var(--red)';
-                  const balIcon = seedSufficient ? '✅' : '❌';
-                  const balLine = seedBal !== null
-                    ? `${balIcon} <span style="font-family:'JetBrains Mono',monospace;color:${balColor}">${fmtAmt(seedBal, seedId)}</span>`
-                    + (seedMin !== null ? ` / min <span style="font-family:'JetBrains Mono',monospace">${fmtAmt(seedMin, seedId)}</span>` : '')
-                    : `<span style="color:var(--muted)">balance unknown</span>`;
+                // Cross-segment edges for cases where end-of-one ≠ start-of-next
+                const rMap = new Map();
+                const addEdge = (from, toNorm, toRaw) => {
+                  if (!rMap.has(from)) rMap.set(from, []);
+                  if (!rMap.get(from).some(x => x.toNorm === toNorm)) rMap.get(from).push({ toNorm, toRaw });
+                };
+                for (const r of (executablePlanRoutes || []))
+                  addEdge(normId(r.fromAsset), normId(r.toAsset), r.toAsset);
+                for (const fc of (flowChains || [])) {
+                  const seq = Array.isArray(fc.assets) ? fc.assets.filter(Boolean) : [];
+                  if (seq.length >= 2) addEdge(normId(seq[0]), normId(seq[seq.length - 1]), seq[seq.length - 1]);
+                }
 
-                  const flowParts = [];
-                  for (let i = 0; i < pathAssets.length; i++) {
-                    flowParts.push(nodeBox(pathAssets[i]));
-                    if (i < pathAssets.length - 1) flowParts.push(arrowHtml);
+                // Walk: direct segment match first (preserves internal assets), rMap fallback for gaps
+                const startPath = fundedFlowPaths[0];
+                const seedNorm  = normId(String(startPath.assets[0]));
+                const unified   = [...startPath.assets];
+                const visited   = new Set([seedNorm]);
+                let cycleComplete = false;
+
+                for (let iter = 0; iter < 20 && !cycleComplete; iter++) {
+                  const lastNorm = normId(String(unified[unified.length - 1]));
+                  if (lastNorm === seedNorm && unified.length > 1) { cycleComplete = true; break; }
+
+                  // 1. Direct: is there a planned segment starting exactly here?
+                  const direct = !visited.has(lastNorm) && pathByStartNorm.get(lastNorm);
+                  if (direct) {
+                    visited.add(lastNorm);
+                    unified.push(...direct.assets.slice(1)); // slice(1) — lastNorm already in unified
+                    continue;
                   }
 
-                  // Cycle close indicator
-                  const lastId = pathAssets[pathAssets.length - 1];
-                  if (lastId !== seedId) {
-                    const hasCycle = (executablePlanRoutes || []).some(r => r.fromAsset === lastId && r.toAsset === seedId);
-                    flowParts.push(hasCycle ? cycleArrow : `<div style="color:var(--muted);font-size:12px;align-self:flex-start;padding-top:6px;padding-left:3px;padding-right:3px">⋯</div>`);
-                    const seedT = String(seedId).split(':').pop()?.toUpperCase() || seedId;
-                    const seedC = String(seedId).split(':')[0]?.replace(/_.*/, '') || '';
-                    flowParts.push(`<div style="display:inline-flex;flex-direction:column;align-items:center;gap:2px">
-                      <div style="background:rgba(255,255,255,.07);border:1px solid ${hasCycle ? 'var(--cyan)' : 'rgba(255,255,255,.13)'};border-radius:8px;padding:5px 9px;font-size:11px;font-weight:700;font-family:'JetBrains Mono',monospace;white-space:nowrap">${seedT}</div>
-                      <div style="font-size:9px;color:var(--muted)">${seedC}</div>
-                      <div style="font-size:9px;color:${hasCycle ? 'var(--cyan)' : 'var(--muted)'}">${hasCycle ? 'cycle ✓' : 'no cycle'}</div>
-                    </div>`);
+                  // 2. Indirect: hop via rMap edge to next segment start
+                  let advanced = false;
+                  for (const { toNorm } of (rMap.get(lastNorm) || [])) {
+                    if (toNorm === seedNorm) { cycleComplete = true; advanced = true; break; }
+                    if (!visited.has(toNorm)) {
+                      const next = pathByStartNorm.get(toNorm);
+                      if (next) { visited.add(toNorm); unified.push(...next.assets); advanced = true; break; }
+                    }
                   }
+                  if (!advanced) break;
+                }
 
-                  return `<div style="margin-bottom:14px;padding:10px 12px;border:1px solid rgba(255,255,255,.07);border-radius:10px;background:rgba(255,255,255,.02)">
+                // Detect optimizer's closeCycle pattern: last asset == firstHopDest (closes to
+                // unified[1], not seed). Trim the duplicate tail so the display shows a clean cycle.
+                if (!cycleComplete && unified.length > 2) {
+                  const lastN = normId(String(unified[unified.length - 1]));
+                  if (lastN === seedNorm || lastN === normId(String(unified[1] || ''))) {
+                    unified.pop();
+                    cycleComplete = true;
+                  }
+                }
+
+                // ── Render single unified block ──
+                const seedId   = unified[0];
+                const lastId   = unified[unified.length - 1];
+                const seedMeta = assetMetaMap.get(String(seedId));
+                const seedBal  = seedMeta?.balance ?? null;
+                const seedMin  = seedMeta?.min_amount ?? null;
+                const needForChain = Math.ceil(Number(seedMin ?? 50000) * _chainFeeMultiplier);
+                const seedBalNum = typeof seedBal === 'bigint' ? Number(seedBal) : Number(seedBal ?? -1);
+                const balOk    = seedBal !== null && seedBalNum >= needForChain;
+                const balLine  = seedBal !== null
+                  ? `${balOk ? '✅' : '❌'} <span style="font-family:'JetBrains Mono',monospace;color:${balOk ? 'var(--green)' : 'var(--red)'}">${fmtAmt(seedBal, seedId)}</span>`
+                    + ` / need <span style="font-family:'JetBrains Mono',monospace">${fmtAmt(needForChain, seedId)}</span><span style="font-size:9px;color:var(--muted)"> (min + ${_totalChainHops} × 0.35% fee)</span>`
+                  : `<span style="color:var(--muted)">balance unknown</span>`;
+
+                const flowParts = [];
+                for (let i = 0; i < unified.length; i++) {
+                  flowParts.push(nodeBox(unified[i]));
+                  if (i < unified.length - 1) flowParts.push(arrowHtml);
+                }
+                if (lastId !== seedId) {
+                  flowParts.push(cycleComplete ? cycleArrow : `<div style="color:var(--muted);font-size:12px;align-self:flex-start;padding-top:6px;padding-left:3px;padding-right:3px">⋯</div>`);
+                  const sT = String(seedId).split(':').pop()?.toUpperCase() || seedId;
+                  const sC = String(seedId).split(':')[0]?.replace(/_.*/, '') || '';
+                  flowParts.push(`<div style="display:inline-flex;flex-direction:column;align-items:center;gap:2px">
+                    <div style="background:rgba(255,255,255,.07);border:1px solid ${cycleComplete ? 'var(--cyan)' : 'rgba(255,255,255,.13)'};border-radius:8px;padding:5px 9px;font-size:11px;font-weight:700;font-family:'JetBrains Mono',monospace;white-space:nowrap">${sT}</div>
+                    <div style="font-size:9px;color:var(--muted)">${sC}</div>
+                    <div style="font-size:9px;color:${cycleComplete ? 'var(--cyan)' : 'var(--muted)'}">${cycleComplete ? 'cycle ✓' : 'open'}</div>
+                  </div>`);
+                }
+                const totalHops = _totalChainHops; // 1 swap per chain, gas substitutions are runtime exemptions
+
+                return `
+                  <div style="font-size:12px;font-weight:700;margin-bottom:10px">execution flow · ${totalHops} hop${totalHops !== 1 ? 's' : ''}</div>
+                  <div style="padding:10px 12px;border:1px solid rgba(255,255,255,.07);border-radius:10px;background:rgba(255,255,255,.02)">
                     <div style="font-size:10px;color:var(--muted);margin-bottom:6px;display:flex;justify-content:space-between;align-items:center">
-                      <span>${pathAssets.length - 1} hop${pathAssets.length - 1 !== 1 ? 's' : ''}</span>
+                      <span>start: ${String(seedId).split(':').pop()?.toUpperCase()} on ${String(seedId).split(':')[0]?.replace(/_.*/, '')}</span>
                       <span>${balLine}</span>
                     </div>
                     <div style="overflow-x:auto;padding-bottom:2px">
                       <div style="display:inline-flex;align-items:flex-start;gap:0;flex-wrap:nowrap;min-width:max-content">${flowParts.join('')}</div>
                     </div>
                   </div>`;
-                }).join('');
-
-                return `
-                  <div style="font-size:12px;font-weight:700;margin-bottom:4px">available chains · ${fundedFlowPaths.length} seed${fundedFlowPaths.length !== 1 ? 's' : ''}</div>
-                  <div style="font-size:10px;color:var(--muted);margin-bottom:10px">one is randomly selected at run time</div>
-                  ${chainBlocks}`;
               } else {
                 // ── allTests: same node-based flow format, one row per chain ─────
                 const assetMetaMapT = new Map((assets || []).map(a => [String(a.id || ''), a]));
@@ -2130,7 +2253,6 @@ function showReadinessModal(readiness) {
           </div>
         </div>
         <div style="flex-shrink:0;padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center;background:var(--bg2)">
-          <button onclick="document.getElementById('readinessOverlay').remove();showPanel('wallets')" class="btn btn-ghost" style="font-size:13px">WALLET</button>
           <button onclick="document.getElementById('readinessOverlay').remove()" class="btn btn-ghost" style="font-size:13px">Cancel</button>
           <div style="flex:1"></div>
           <button type="button" id="readinessRunBtn"
@@ -2147,6 +2269,7 @@ function showReadinessModal(readiness) {
     setTimeout(() => {
       const bar = document.getElementById('readinessBar');
       if (bar) bar.style.width = displayReadinessPct + '%';
+      _consolidationUpdate();
     }, 50);
   });
 }
@@ -2169,26 +2292,59 @@ function _consolidationUpdate() {
     return;
   }
 
-  // Sum selected balances (atomic, all in their native decimals — display only)
+  const SWAP_FEE = 0.0035;
+  const feeMultiplier = Number(panel.dataset.feeMultiplier || 1);
+  const totalHops     = Number(panel.dataset.totalHops || 1);
+  const targetDec2    = Number(targetOpt?.dataset.decimals || 8);
+  const targetId      = targetSel.value;
+  const targetExistingBal = Number(targetOpt?.dataset.balance || 0);
+
+  // Projected total = target's existing balance (no swap, no fee)
+  //                 + sum of each source × (1 - 0.35% swap fee)
+  // Sources matching the target ID are excluded from the fee (already in wallet).
+  let swappedSourceTotal = 0;
+  let rawSourceTotal = 0;
   const lines = checked.map(cb => {
     const id  = cb.dataset.assetId;
     const bal = Number(cb.dataset.balance || 0);
     const dec = Number(cb.dataset.decimals || 8);
     const label = id.split(':').pop()?.toUpperCase() || id;
+    const isTarget = (id === targetId);
+    rawSourceTotal += isTarget ? 0 : bal;
+    swappedSourceTotal += isTarget ? 0 : Math.floor(bal * (1 - SWAP_FEE));
     return `${label}: ${formatUnitsAtomicDisplay(bal, dec)}`;
   });
+  const projectedTotal = targetExistingBal + swappedSourceTotal;
+  const feeDeducted = rawSourceTotal - swappedSourceTotal;
 
-  const meetsMin = targetMin !== null; // we can't compare cross-asset totals without price feed here
-  if (summaryEl) summaryEl.innerHTML =
-    `<div style="line-height:1.7">${lines.join(' · ')}</div>` +
-    `<div style="color:var(--cyan);margin-top:3px">→ will swap into ${targetOpt?.text || ''} (min ${formatUnitsAtomicDisplay(targetMin, targetDec)})</div>` +
-    `<div style="color:var(--muted);margin-top:2px;font-size:9px">gas is checked at execution time via pre-hop substitution</div>`;
+  const needAtomic  = targetMin !== null ? Math.ceil(targetMin * feeMultiplier) : null;
+  const meetsMin    = needAtomic !== null && projectedTotal >= needAtomic;
+  const shortfall   = needAtomic !== null ? Math.max(0, needAtomic - projectedTotal) : 0;
+
+  if (summaryEl) {
+    const targetBalLine = targetExistingBal > 0
+      ? `<div style="color:var(--muted);margin-top:3px">seed existing balance: ${formatUnitsAtomicDisplay(targetExistingBal, targetDec2)}</div>`
+      : '';
+    const feeLine = feeDeducted > 0
+      ? `<div style="color:var(--muted);margin-top:1px">swap fees (${checked.filter(c=>c.dataset.assetId!==targetId).length} × 0.35%): −${formatUnitsAtomicDisplay(feeDeducted, targetDec2)}</div>`
+      : '';
+    summaryEl.innerHTML =
+      `<div style="line-height:1.7">${lines.join(' · ')}</div>` +
+      `<div style="color:var(--cyan);margin-top:3px">→ will swap into ${targetOpt?.text || ''}</div>` +
+      targetBalLine + feeLine +
+      (needAtomic !== null
+        ? meetsMin
+          ? `<div style="color:var(--green);margin-top:2px;font-size:10px">✅ projected ${formatUnitsAtomicDisplay(projectedTotal, targetDec2)} ≥ need ${formatUnitsAtomicDisplay(needAtomic, targetDec2)} (min × (1/(1−0.35%))^${totalHops})</div>`
+          : `<div style="color:var(--red);margin-top:2px;font-size:10px">❌ projected ${formatUnitsAtomicDisplay(projectedTotal, targetDec2)} — short by ${formatUnitsAtomicDisplay(shortfall, targetDec2)} (need ${formatUnitsAtomicDisplay(needAtomic, targetDec2)})</div>`
+        : '') +
+      `<div style="color:var(--muted);margin-top:2px;font-size:9px">gas is checked at execution time · all swaps must pass before allChains starts</div>`;
+  }
 
   if (runBtn) {
-    runBtn.disabled = false;
-    runBtn.style.background = 'var(--cyan)';
-    runBtn.style.color = '#021015';
-    runBtn.style.cursor = 'pointer';
+    runBtn.disabled = !meetsMin;
+    runBtn.style.background = meetsMin ? 'var(--cyan)' : 'var(--bg3)';
+    runBtn.style.color      = meetsMin ? '#021015'     : 'var(--muted)';
+    runBtn.style.cursor     = meetsMin ? 'pointer'     : 'not-allowed';
   }
 }
 
@@ -2202,37 +2358,24 @@ async function _runConsolidation() {
   const runBtn = document.getElementById('consolidationRunBtn');
   if (runBtn) { runBtn.disabled = true; runBtn.innerHTML = '<span class="spinner"></span> consolidating…'; }
 
-  // Build amount overrides: each source asset uses its full balance as the swap amount
-  const amounts = {};
+  // Build sources list: each source uses its full wallet balance as the swap amount
+  const sources = [];
   for (const cb of checked) {
     const id  = cb.dataset.assetId;
     const bal = Number(cb.dataset.balance || 0);
-    if (bal > 0) amounts[id] = bal;
+    if (bal > 0 && id !== targetId) sources.push({ id, amount: bal });
   }
 
   try {
-    // Store overrides and trigger an allTests run with just those source→target pairs
-    await fetch('/api/run/set-amounts', {
+    // POST to the new endpoint — runs source→target swaps sequentially, then starts allChains
+    const res = await fetch('/api/consolidate-and-run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ amounts }),
-    });
-
-    const res = await fetch('/api/run', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode: 'allChains', force: true }),
+      body: JSON.stringify({ sources, targetId }),
     });
     const data = await res.json();
-    if (!data.started) throw new Error(data.reason || 'Run did not start');
+    if (!data.started) throw new Error(data.error || data.reason || 'Consolidation did not start');
 
     document.getElementById('readinessOverlay')?.remove();
-    // Refresh readiness after a short delay to reflect new balances
-    setTimeout(async () => {
-      try {
-        const r = await fetch('/api/route-readiness?mode=allChains');
-        const readiness = await r.json();
-        if (!readiness.error) showReadinessModal(readiness);
-      } catch (_) {}
-    }, 4000);
   } catch (e) {
     if (runBtn) { runBtn.disabled = false; runBtn.innerHTML = 'Consolidate &amp; Run allChains'; runBtn.style.background = 'var(--cyan)'; runBtn.style.color = '#021015'; runBtn.style.cursor = 'pointer'; }
     alert('Consolidation failed: ' + (e.message || 'unknown error'));
@@ -2258,6 +2401,11 @@ async function _setRunModeFromModal(mode) {
 
 async function _proceedToTradeSizeModal(mode = _selectedRunMode) {
   _selectedRunMode = mode === 'allChains' ? 'allChains' : 'allTests';
+  // allChains does not use the trade-size modal or combinations — go straight to run
+  if (_selectedRunMode === 'allChains') {
+    _launchRunAll('allChains');
+    return;
+  }
   const btn = document.getElementById('btnRunAll');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Loading…';
@@ -2400,14 +2548,16 @@ const CHAIN_ID_MAP = {
   '97':      'bnbchain',   // BNB Testnet
   '56':      'bnbchain',   // BNB Mainnet
   '10143':   'monad',      // Monad Testnet
-  '8150':    'botanix',    // Botanix Testnet
-  '5115':    'core',       // Core Testnet
+  '8150':    'alpen',      // Alpen Testnet (Garden's internal chain_id)
+  '5115':    'citrea',     // Citrea Testnet
+  '1115':    'core',       // Core Testnet
   '21000001':'corn',       // Corn Testnet
   '998':     'hyperevm',   // HyperEVM Testnet
   '80069':   'berachain',  // Berachain Testnet
   '1301':    'unichain',   // Unichain Sepolia
   '5003':    'megaeth',    // MegaETH Testnet
   '3636':    'botanix',    // Botanix alt
+  '48898':   'alpen',      // Alpen Testnet
 };
 
 // Normalize raw chain string from Garden API to a CHAIN_META key
@@ -3756,7 +3906,13 @@ async function confirmTradeSizeModal() {
 
 async function runAllTradeable() {
   const btn = document.getElementById('btnRunTradeable');
-  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Checking readiness…'; }
+  if (btn) { btn.disabled = true; }
+
+  if (!_evmBalancesReady && _evmBalancePromise) {
+    if (btn) btn.innerHTML = '<span class="spinner"></span> Loading balances…';
+    await Promise.race([_evmBalancePromise, new Promise(r => setTimeout(r, 15000))]);
+  }
+  if (btn) btn.innerHTML = '<span class="spinner"></span> Checking readiness…';
 
   try {
     const r = await fetch(`/api/route-readiness?mode=${encodeURIComponent(_selectedRunMode)}`);
@@ -3793,13 +3949,10 @@ const EVM_CHAINS = [
   { id: 'arbitrum',  name: 'Arbitrum Sepolia', chainId: '0x66eee',  mainChainId: '0xa4b1',  symbol: 'ETH',  icon: '🔵', rpc: 'https://sepolia-rollup.arbitrum.io/rpc',         explorer: 'https://sepolia.arbiscan.io' },
   { id: 'base',      name: 'Base Sepolia',     chainId: '0x14a34',  mainChainId: '0x2105',  symbol: 'ETH',  icon: '🔷', rpc: 'https://sepolia.base.org',                       explorer: 'https://sepolia.basescan.org' },
   { id: 'bnbchain',  name: 'BNB Testnet',      chainId: '0x61',     mainChainId: '0x38',    symbol: 'BNB',  icon: '🟡', rpc: 'https://data-seed-prebsc-1-s1.binance.org:8545', explorer: 'https://testnet.bscscan.com' },
-  { id: 'berachain', name: 'Berachain bArtio', chainId: '0x138d5',  mainChainId: '0x138d4', symbol: 'BERA', icon: '🐻', rpc: 'https://artio.rpc.berachain.com',                explorer: 'https://bartio.beratrail.io' },
-  { id: 'unichain',  name: 'Unichain Sepolia', chainId: '0x515',    mainChainId: '0x515',   symbol: 'ETH',  icon: '🦄', rpc: 'https://sepolia.unichain.org',                   explorer: 'https://uniscan.xyz' },
+  { id: 'monad',     name: 'Monad Testnet',    chainId: '0x279f',   mainChainId: '0x279f',  symbol: 'MON',  icon: '🟣', rpc: 'https://testnet-rpc.monad.xyz',                  explorer: 'https://explorer.testnet.monad.xyz' },
+  { id: 'citrea',    name: 'Citrea Testnet',   chainId: '0x13fb',   mainChainId: '0x13fb',  symbol: 'cBTC', icon: '🍊', rpc: 'https://rpc.testnet.citrea.xyz',                 explorer: 'https://explorer.testnet.citrea.xyz' },
+  { id: 'alpen',     name: 'Alpen Testnet II',  chainId: '0x1fd6',   mainChainId: '0x1fd6',  symbol: 'sBTC', icon: '🏔️', rpc: 'https://rpc.testnet.alpenlabs.io',                  explorer: 'https://explorer.testnet.alpenlabs.io' },
   { id: 'hyperevm',  name: 'HyperEVM Testnet', chainId: '0x3e6',    mainChainId: '0x3e7',   symbol: 'ETH',  icon: '⚡', rpc: 'https://rpc.hyperliquid-testnet.xyz/evm',        explorer: 'https://explorer.hyperliquid.xyz' },
-  { id: 'corn',      name: 'Corn Testnet',     chainId: '0x1406f',  mainChainId: '0x1406f', symbol: 'BTCN', icon: '🌽', rpc: 'https://testnet.corn-rpc.com',                   explorer: 'https://testnet.cornscan.io' },
-  { id: 'botanix',   name: 'Botanix Testnet',  chainId: '0xe35',    mainChainId: '0xe35',   symbol: 'BTC',  icon: '🌿', rpc: 'https://node.botanixlabs.dev',                   explorer: 'https://blockscout.botanixlabs.dev' },
-  { id: 'core',      name: 'Core Testnet',     chainId: '0x45b',    mainChainId: '0x45c',   symbol: 'CORE', icon: '⚙️', rpc: 'https://rpc.test.btcs.network',                  explorer: 'https://scan.test.btcs.network' },
-  { id: 'megaeth',   name: 'MegaETH Testnet',  chainId: '0x18c6',   mainChainId: '0x18c6',  symbol: 'ETH',  icon: '🚀', rpc: 'https://carrot.megaeth.com',                     explorer: 'https://megaexplorer.xyz' },
 ];
 
 // Add a chain to MetaMask if it doesn't know about it yet
@@ -3842,6 +3995,8 @@ let connectedWallets = { evm: false, btc: false, solana: false, privy: false, st
 let evmAddress = null;
 let privyFormVisible = false;
 let _envKeyAvailable = false; // set true on load if server has envkey configured
+let _evmBalancesReady = false; // true once fetchEvmBalances completes at least once
+let _evmBalancePromise = null; // resolves when current fetchEvmBalances finishes
 
 // Force switch active EVM signer back to .env key (override MetaMask)
 async function useEnvKeyEvm() {
@@ -3860,8 +4015,9 @@ async function useEnvKeyEvm() {
     document.getElementById('evm-btn').onclick = connectMetaMask;
     const envBtn = document.getElementById('evm-envkey-btn');
     if (envBtn) envBtn.style.display = 'none';
-    renderEvmChains(false, null);
+    renderEvmChains(true, d.address);
     updateWalletCount();
+    fetchEvmBalances(d.address);
   } catch(e) { alert('Could not switch to .env key: ' + e.message); }
 }
 
@@ -3984,19 +4140,40 @@ function toggleChainList() {
 
 function refreshChainBalanceDisplay() {
   const bals = window._evmBalances || {};
+  const tokBals = window._evmTokenBalances || {};
   EVM_CHAINS.forEach(c => {
     const el = document.getElementById(`chain-native-${c.id}`);
     if (!el) return;
     const key = Object.keys(bals).find(k => k.startsWith(c.id) || c.id.startsWith(k.split('_')[0]));
     const wei = key ? bals[key] : null;
+    const parts = [];
+    let anyBalance = false;
+
     if (wei === null || wei === undefined) {
-      el.textContent = '—'; el.style.color = 'var(--muted)';
+      parts.push(`— ${c.symbol}`);
     } else if (BigInt(wei) === 0n) {
-      el.textContent = `0 ${c.symbol}`; el.style.color = 'var(--muted)';
+      parts.push(`0 ${c.symbol}`);
     } else {
-      el.textContent = `${(Number(BigInt(wei))/1e18).toFixed(5)} ${c.symbol}`; el.style.color = 'var(--green)';
+      anyBalance = true;
+      parts.push(`${(Number(BigInt(wei))/1e18).toFixed(5)} ${c.symbol}`);
     }
-    // Refresh open asset list if visible
+
+    const chainTokens = key ? (tokBals[key] || {}) : {};
+    for (const [ticker, info] of Object.entries(chainTokens)) {
+      const val = parseFloat(info.formatted || '0');
+      if (val > 0) {
+        anyBalance = true;
+        parts.push(`${info.formatted} ${ticker}`);
+      }
+    }
+
+    el.innerHTML = parts.map((p, i) => {
+      const isFirst = i === 0;
+      const sep = isFirst ? '' : '<span style="color:var(--border);margin:0 4px">·</span>';
+      return `${sep}<span>${p}</span>`;
+    }).join('');
+    el.style.color = anyBalance ? 'var(--green)' : 'var(--muted)';
+
     if (document.getElementById(`chain-assets-${c.id}`)?.style.display !== 'none') renderChainAssetList(c.id);
   });
 }
@@ -4329,7 +4506,9 @@ async function disconnectEvm() {
       document.getElementById('evm-btn').textContent = 'Override with MetaMask';
       document.getElementById('evm-btn').className = 'btn btn-ghost';
       document.getElementById('evm-btn').onclick = connectMetaMask;
+      renderEvmChains(true, d.evm.address);
       updateWalletCount();
+      fetchEvmBalances(d.evm.address);
       return;
     }
   } catch(_) {}
@@ -4773,6 +4952,10 @@ function copyAddr(el) {
 async function fetchEvmBalances(address) {
   const statusEl = document.getElementById('evm-rpc-status');
   if (statusEl) { statusEl.textContent = '⏳ Checking balances…'; statusEl.style.color = 'var(--yellow)'; }
+
+  let _resolve;
+  _evmBalancePromise = new Promise(r => { _resolve = r; });
+
   try {
     const r = await fetch('/api/wallet/evm/balances', {
       method: 'POST', headers: {'Content-Type':'application/json'},
@@ -4786,19 +4969,22 @@ async function fetchEvmBalances(address) {
       statusEl.textContent = `✅ ${chains.length} chains checked · ${nonZero.length} with balance`;
       statusEl.style.color = 'var(--green)';
     }
-    // Expose balances globally for combinations
     window._evmBalances = d.balances || {};
-    window._evmTokenBalances = d.tokenBalances || {};  // { chainPrefix: { TICKER: {raw,formatted,tokenAddr} } }
+    window._evmTokenBalances = d.tokenBalances || {};
     window._supportedTokenContracts = d.supportedTokens || {};
-    // Track chains whose RPC failed so we can hide them from "send" assets & combos
     window._badRpcChains = (d.rpcErrors || []).map(e => (e.chain || '').toLowerCase());
-    refreshChainBalanceDisplay(); // update chain balance grid if open
+    refreshChainBalanceDisplay();
     if (d.rpcErrors?.length) {
       d.rpcErrors.forEach(e => addIssue('rpc', 'warning', `RPC Error: ${e.chain}`, e.message, { chain: e.chain }));
     }
+    _evmBalancesReady = true;
   } catch(err) {
     if (statusEl) { statusEl.textContent = `⚠️ Balance check failed: ${err.message}`; statusEl.style.color = 'var(--yellow)'; }
     addIssue('rpc', 'warning', 'EVM Balance RPC Failed', err.message, {});
+    _evmBalancesReady = true;
+  } finally {
+    _resolve();
+    _evmBalancePromise = null;
   }
 }
 
@@ -4898,7 +5084,7 @@ async function openRpcModal(chain) {
     hyperevm_testnet:  ['https://rpc.hyperliquid-testnet.xyz/evm'],
     monad_testnet:     ['https://testnet-rpc.monad.xyz'],
     citrea_testnet:    ['https://rpc.testnet.citrea.xyz'],
-    alpen_testnet:     ['https://rpc.testnet.alpen.xyz'],
+    alpen_testnet:     ['https://rpc.testnet.alpenlabs.io'],
   };
 
   const suggestions = (knownRpcs[chain] || []).filter(u => u !== currentUrl);

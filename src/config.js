@@ -69,12 +69,15 @@ const config = {
     botanix:   { id:"botanix",   name:"Botanix",   type:"evm",       asset:"BTC",  chainId: isMainnet?3637:3636,     rpc: r("RPC_BOTANIX_MAINNET","RPC_BOTANIX_TESTNET"),    explorer:"https://blockscout.botanixlabs.dev/tx/" },
     core:      { id:"core",      name:"Core",       type:"evm",       asset:"CORE", chainId: isMainnet?1116:1115,     rpc: r("RPC_CORE_MAINNET","RPC_CORE_TESTNET"),           explorer:"https://scan.coredao.org/tx/" },
     megaeth:   { id:"megaeth",   name:"MegaETH",   type:"evm",       asset:"ETH",  chainId: 6342,                    rpc: r("RPC_MEGAETH_MAINNET","RPC_MEGAETH_TESTNET"),     explorer:"https://megaexplorer.xyz/tx/" },
+    citrea:    { id:"citrea",    name:"Citrea",    type:"evm",       asset:"BTC",  chainId: 5115,                    rpc: r("RPC_CITREA_MAINNET","RPC_CITREA_TESTNET") || "https://rpc.testnet.citrea.xyz", explorer:"https://explorer.testnet.citrea.xyz/tx/" },
+    alpen:     { id:"alpen",     name:"Alpen",     type:"evm",       asset:"sBTC", chainId: 8150,                    rpc: r("RPC_ALPEN_MAINNET","RPC_ALPEN_TESTNET") || "https://rpc.testnet.alpenlabs.io",   explorer:"https://explorer.testnet.alpenlabs.io/tx/" },
+    monad:     { id:"monad",     name:"Monad",     type:"evm",       asset:"MON",  chainId: 10143,                   rpc: r("RPC_MONAD_MAINNET","RPC_MONAD_TESTNET") || "https://testnet-rpc.monad.xyz",     explorer:"https://explorer.testnet.monad.xyz/tx/" },
     solana:    { id:"solana",    name:"Solana",    type:"solana",    asset:"SOL",  rpc: r("RPC_SOLANA_MAINNET","RPC_SOLANA_TESTNET"),       explorer: isMainnet?"https://solscan.io/tx/":"https://solscan.io/tx/?cluster=testnet" },
     starknet:  { id:"starknet",  name:"Starknet",  type:"starknet",  asset:"ETH",  rpc: r("RPC_STARKNET_MAINNET","RPC_STARKNET_TESTNET"),   explorer: isMainnet?"https://starkscan.co/tx/":"https://sepolia.starkscan.co/tx/" },
     sui:       { id:"sui",       name:"Sui",        type:"sui",       asset:"SUI",  rpc: r("RPC_SUI_MAINNET","RPC_SUI_TESTNET"),             explorer: isMainnet?"https://suiexplorer.com/txblock/":"https://suiexplorer.com/txblock/?network=testnet" },
     tron:      { id:"tron",      name:"Tron",       type:"tron",      asset:"TRX",  rpc: r("RPC_TRON_MAINNET","RPC_TRON_TESTNET"),           explorer: isMainnet?"https://tronscan.org/#/transaction/":"https://nile.tronscan.org/#/transaction/" },
   },
-  evmChainIds: ["ethereum","arbitrum","base","bnbchain","berachain","unichain","hyperevm","corn","botanix","core","megaeth"],
+  evmChainIds: ["ethereum","arbitrum","base","bnbchain","hyperevm","citrea","alpen","monad"],
   port: parseInt(process.env.PORT || "3000"),
 };
 

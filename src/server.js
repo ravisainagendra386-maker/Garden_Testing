@@ -143,11 +143,20 @@ app.get("/api/funding-tree", async (req, res) => {
 let _amountOverrides = {};
 let _lastEvmTokenBalancesByAddress = {};
 let _lastSupportedTokensByAddress = {};
+let _evmBalanceScanInFlight = null; // resolves when the active POST /api/wallet/evm/balances finishes
 
 let _arbSummary = {
   totalProfitUsd: 0,
   trades: [],
 };
+
+// Last seed allowlist computed during route-readiness; reused at run time so display and execution use the same seed.
+let _lastSeedAllowlist = null;
+let _lastSeedAllowlistMode = null;
+let _lastSeedAllowlistTs = 0;
+const SEED_ALLOWLIST_REUSE_TTL = 90_000; // 90 s — stale after that, recompute
+let _lastReadinessPlan = null;
+let _lastReadinessPlanTs = 0;
 
 function pickSeedAllowlistByMode(routes, balances, gasMap, mode) {
   if (mode !== "allChains") return null;
@@ -206,9 +215,17 @@ app.post("/api/run", async (req, res) => {
       runner.abortAll();
     }
 
+    if (_evmBalanceScanInFlight) {
+      await Promise.race([_evmBalanceScanInFlight, new Promise(r => setTimeout(r, 15000))]);
+    }
     const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
     const { balanceMap, gasMap } = await gatherBalances(connectedTypes, supported);
-    const seedAllowlist = pickSeedAllowlistByMode(routes, balanceMap, gasMap, mode);
+    // Reuse the seed the user just saw in the run window (within TTL), otherwise recompute.
+    const seedAllowlistFresh = (_lastSeedAllowlist && _lastSeedAllowlistMode === mode &&
+      (Date.now() - _lastSeedAllowlistTs) < SEED_ALLOWLIST_REUSE_TTL)
+      ? _lastSeedAllowlist
+      : pickSeedAllowlistByMode(routes, balanceMap, gasMap, mode);
+    const seedAllowlist = seedAllowlistFresh;
     const seedAllowlistSize = seedAllowlist ? seedAllowlist.size : null;
     const { RouteOptimizerAgent } = require("./agents/routeOptimizerAgent");
     const agent = new RouteOptimizerAgent();
@@ -231,9 +248,7 @@ app.post("/api/run", async (req, res) => {
         consolidation = await resolveConsolidationTargetIfNoSeeds({ supported, gasMap });
       } catch (e) {
         return res.status(409).json({
-          started: false,
-          env: config.env,
-          strictMode: true,
+          started: false, env: config.env, strictMode: true,
           reason: `Consolidation target resolution failed: ${e.message}`,
         });
       }
@@ -241,13 +256,73 @@ app.post("/api/run", async (req, res) => {
         const pre = await verifyConsolidationPreflight(consolidation, gasMap);
         if (!pre.ok) {
           return res.status(409).json({
-            started: false,
-            env: config.env,
-            strictMode: true,
+            started: false, env: config.env, strictMode: true,
             reason: "Consolidation preflight failed: native gas or Garden liquidity check did not pass before run.",
-            consolidation,
-            preflight: pre,
+            consolidation, preflight: pre,
           });
+        }
+        const targetId = consolidation.targetAssetId;
+        const assetById = new Map(supported.map(a => [String(a.id), a]));
+        const targetMeta = assetById.get(String(targetId));
+        if (!targetMeta) {
+          return res.status(409).json({
+            started: false, env: config.env, strictMode: true,
+            reason: `Consolidation target asset ${targetId} not found in supported assets`,
+          });
+        }
+        const sources = [];
+        for (const a of (readiness.assets || [])) {
+          if (a.id === targetId || a.isChainFundedSource) continue;
+          const bal = balanceMap.get(a.id);
+          if (bal === null || bal === undefined) continue;
+          const balNum = Number(bal);
+          const minAmt = Math.max(1, parseInt(String(a.required || 50000), 10) || 50000);
+          if (balNum < minAmt) continue;
+          const srcMeta = assetById.get(String(a.id));
+          if (!srcMeta) continue;
+          sources.push({ id: a.id, amount: balNum, meta: srcMeta });
+        }
+        if (sources.length) {
+          const toChainType = getWalletTypeForAsset(targetMeta);
+          const consolidationRoutes = [];
+          for (const src of sources) {
+            const fromChainType = getWalletTypeForAsset(src.meta);
+            if (!fromChainType || !toChainType) continue;
+            const minAmt = Math.max(1, parseInt(String(src.meta.min_amount ?? 50000), 10) || 50000);
+            const maxAmt = src.meta.max_amount ? parseInt(String(src.meta.max_amount), 10) : null;
+            let useAmt = Math.max(minAmt, Math.floor(src.amount));
+            if (maxAmt && useAmt > maxAmt) useAmt = maxAmt;
+            consolidationRoutes.push({
+              fromAsset: src.id, toAsset: targetId,
+              fromChain: fromChainType, toChain: toChainType,
+              amount: useAmt, fromMeta: src.meta, toMeta: targetMeta,
+              label: `${src.meta.name || src.id} → ${targetMeta.name || targetId} [auto-consolidation]`,
+              executionMode: "allChains",
+            });
+          }
+          if (consolidationRoutes.length) {
+            res.json({
+              started: true, env: config.env, mode, autoConsolidating: true,
+              consolidationTarget: targetId, consolidationHops: consolidationRoutes.length,
+            });
+            _amountOverrides = {};
+            (async () => {
+              broadcast("suite_start", { env: config.env, mode: "auto-consolidation", ts: new Date().toISOString() });
+              let passed = 0;
+              for (const route of consolidationRoutes) {
+                broadcast("suite_info", { message: `Auto-consolidating: ${route.label}` });
+                try {
+                  const r = await runner.runRoute(route);
+                  if (r.status === "pass") { passed++; broadcast("suite_info", { message: `Consolidated: ${route.label}` }); }
+                  else broadcast("suite_info", { message: `Consolidation skipped/failed (${route.label}): ${r.error || r.status}` });
+                } catch (e) { broadcast("suite_info", { message: `Consolidation error (${route.label}): ${e.message}` }); }
+              }
+              broadcast("suite_info", { message: `Auto-consolidation done (${passed}/${consolidationRoutes.length} passed) — waiting 2s then starting allChains` });
+              await new Promise(r => setTimeout(r, 2000));
+              runner.runAll({}, "allChains").catch(err => broadcast("error", { message: `allChains after auto-consolidation error: ${err.message}` }));
+            })().catch(err => broadcast("error", { message: `auto-consolidation error: ${err.message}` }));
+            return;
+          }
         }
       }
     }
@@ -275,11 +350,9 @@ app.post("/api/run", async (req, res) => {
     }
 
     const overrides = Object.assign({}, _amountOverrides);
-    let preflight = { ok: true, skipped: true, reason: "allTests_preflight_skipped" };
-    if (mode !== "allTests") {
-      preflight = await runner.simulateExecutionPreflight(overrides, mode, { silent: true, maxFlows: 12 });
-    } else {
-    }
+    // allChains: skip preflight simulation entirely — it quotes all routes (200+ network calls).
+    // Seed sufficiency and per-hop gas checks run at execution time inside runChain.
+    let preflight = { ok: true, skipped: true, reason: "preflight_skipped" };
     if (!preflight.ok && mode !== "allTests") {
       _amountOverrides = {};
       const safePreflight = toJsonSafePayload(preflight);
@@ -306,10 +379,122 @@ app.post("/api/run", async (req, res) => {
           : null,
     });
     _amountOverrides = {};
-    runner.runAll(overrides, mode).catch(err => broadcast("error", { message: err.message }));
+    // Prefer the exact plan the readiness modal showed (saved during /api/route-readiness)
+    // so execution matches the displayed flow. Falls back to this handler's own optimizer run.
+    const readinessPlanFresh = (mode === "allChains" && _lastReadinessPlan &&
+      (Date.now() - _lastReadinessPlanTs) < SEED_ALLOWLIST_REUSE_TTL)
+      ? _lastReadinessPlan : null;
+    const serverPlan = readinessPlanFresh ||
+      ((mode === "allChains" && preview.plan && preview.plan.length > 0) ? preview.plan : null);
+    _lastReadinessPlan = null;
+    _lastReadinessPlanTs = 0;
+    runner.runAll(overrides, mode, seedAllowlist, serverPlan).catch(err => broadcast("error", { message: err.message }));
   } catch (err) {
     res.status(500).json({ started: false, error: err.message });
   }
+});
+
+// ── CONSOLIDATE then RUN allChains ───────────────────────────────────────────
+// Runs source→target swaps in sequence, then kicks off allChains from the now-funded target.
+app.post("/api/consolidate-and-run", async (req, res) => {
+  const { sources, targetId } = req.body || {};
+  if (!Array.isArray(sources) || !sources.length || !targetId) {
+    return res.status(400).json({ error: "sources[] and targetId required" });
+  }
+
+  const suiteStatus = runner.getSuiteRunStatus();
+  if (suiteStatus?.suiteRunning) {
+    runner.abortAll();
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  let allAssets = [];
+  try {
+    const g = await garden.getAssets();
+    allAssets = g.result || g.assets || (Array.isArray(g) ? g : []);
+  } catch (e) {
+    return res.status(500).json({ error: `getAssets failed: ${e.message}` });
+  }
+
+  const assetById = new Map(allAssets.map(a => [String(a.id), a]));
+  const targetMeta = assetById.get(String(targetId));
+  if (!targetMeta) return res.status(400).json({ error: `Target asset ${targetId} not found` });
+
+  function walletTypeOf(asset) {
+    const ch = (asset.chain || "").toLowerCase();
+    if (ch.startsWith("evm"))      return "evm";
+    if (ch.startsWith("solana"))   return "solana";
+    if (ch.startsWith("starknet")) return "starknet";
+    if (ch.startsWith("tron"))     return "tron";
+    if (ch.startsWith("sui"))      return "sui";
+    if (ch === "bitcoin" && /^bitcoin_(testnet|mainnet|signet)$/.test(String(asset.id || "").split(":")[0])) return "bitcoin";
+    return null;
+  }
+
+  const toChainType = walletTypeOf(targetMeta);
+  if (!toChainType) return res.status(400).json({ error: `Unsupported chain type for target ${targetId}` });
+
+  const consolidationRoutes = [];
+  for (const src of sources) {
+    const srcId  = String(src.id || src.assetId || "");
+    const amount = Number(src.amount || 0);
+    if (!srcId || amount <= 0 || srcId === String(targetId)) continue;
+    const fromMeta = assetById.get(srcId);
+    if (!fromMeta) continue;
+    const fromChainType = walletTypeOf(fromMeta);
+    if (!fromChainType) continue;
+    const minAmt = Math.max(1, parseInt(String(fromMeta.min_amount ?? 50000), 10) || 50000);
+    const maxAmt = fromMeta.max_amount ? parseInt(String(fromMeta.max_amount), 10) : null;
+    let useAmount = Math.max(minAmt, Math.floor(amount));
+    if (maxAmt && useAmount > maxAmt) useAmount = maxAmt;
+    consolidationRoutes.push({
+      fromAsset: srcId, toAsset: String(targetId),
+      fromChain: fromChainType, toChain: toChainType,
+      amount: useAmount, fromMeta, toMeta: targetMeta,
+      label: `${fromMeta.name || srcId} → ${targetMeta.name || targetId} [consolidation]`,
+      executionMode: "allChains",
+    });
+  }
+
+  if (!consolidationRoutes.length) {
+    return res.status(400).json({ error: "No valid consolidation routes from provided sources" });
+  }
+
+  res.json({ started: true, consolidationHops: consolidationRoutes.length, targetId });
+
+  (async () => {
+    broadcast("suite_start", { env: config.env, mode: "consolidation", ts: new Date().toISOString() });
+    let passed = 0;
+    for (const route of consolidationRoutes) {
+      broadcast("suite_info", { message: `Consolidating: ${route.label}` });
+      try {
+        const r = await runner.runRoute(route);
+        if (r.status === "pass") {
+          passed++;
+          broadcast("suite_info", { message: `✅ Consolidated: ${route.label}` });
+        } else {
+          broadcast("suite_info", { message: `⚠️ Consolidation swap skipped/failed (${route.label}): ${r.error || r.status}` });
+        }
+      } catch (e) {
+        broadcast("suite_info", { message: `⚠️ Consolidation swap error (${route.label}): ${e.message}` });
+      }
+    }
+
+    if (passed < consolidationRoutes.length) {
+      const failed = consolidationRoutes.length - passed;
+      broadcast("suite_end", {
+        env: config.env, total: consolidationRoutes.length, executed: consolidationRoutes.length,
+        passed, failed, aborted: 0, skipped: 0,
+        message: `Consolidation incomplete: ${passed}/${consolidationRoutes.length} swaps passed, ${failed} failed — allChains not started (full amount required)`,
+        ts: new Date().toISOString(),
+      });
+      return;
+    }
+
+    broadcast("suite_info", { message: `Consolidation complete (${passed}/${consolidationRoutes.length} passed) — waiting 2s for balances to settle, then starting allChains from ${targetId}` });
+    await new Promise(r => setTimeout(r, 2000));
+    runner.runAll({}, "allChains").catch(err => broadcast("error", { message: `allChains after consolidation error: ${err.message}` }));
+  })().catch(err => broadcast("error", { message: `consolidate-and-run error: ${err.message}` }));
 });
 
 app.post("/api/run/route", async (req, res) => {
@@ -336,7 +521,12 @@ app.get("/api/run/status", (req, res) => {
 app.post("/api/abort", (req, res) => {
   const { testId } = req.body;
   if (testId) runner.abortTest(testId);
-  else runner.abortAll();
+  else {
+    runner.abortAll();
+    _buildRoutesInFlight = null;
+    _lastReadinessPlan = null;
+    _lastReadinessPlanTs = 0;
+  }
   res.json({ ok: true });
 });
 
@@ -393,7 +583,7 @@ async function getAssets() {
   if (_assetsInFlight) return _assetsInFlight; // already fetching — share the in-flight promise
   _assetsInFlight = garden.getAssets()
     .then(r => { _cachedAssets = r; _cachedAssetsTs = Date.now(); return r; })
-    .catch(() => { _cachedAssets = []; return []; })
+    .catch(() => { return _cachedAssets || []; })
     .finally(() => { _assetsInFlight = null; });
   return _assetsInFlight;
 }
@@ -578,6 +768,13 @@ function isPairPlausible(from, to) {
   return from.id !== to.id; // all asset combinations allowed across all families
 }
 
+// ── HELPER: Check if a chain (by key or numeric ID) has a resolvable RPC ──
+function chainHasRpc(chainKeyOrId) {
+  if (!chainKeyOrId) return false;
+  const envkey = require("./wallet/envkey");
+  try { return !!envkey.getRpcForChain(chainKeyOrId); } catch (_) { return false; }
+}
+
 // ── HELPER: Build routes from assets + connected wallets ──────
 let _buildRoutesInFlight = null; // dedup: concurrent callers share one pending build
 async function buildRoutesForReadiness() {
@@ -593,10 +790,17 @@ async function _doBuildRoutesForReadiness() {
   const assets = ar.result || ar.assets || ar || [];
   if (!assets.length) return { routes: [], connectedTypes };
 
-  // CHANGE: Only include assets whose wallet type is connected
+  // Only include assets whose wallet type is connected AND chain has an RPC.
+  // Also checks numeric chain_id from asset metadata (Garden sends this in
+  // prebuilt txs; if we can't resolve it to an RPC, execution will fail).
   const supported = assets.filter(a => {
     const wt = getWalletTypeForAsset(a);
-    return wt && connectedTypes.has(wt);
+    if (!wt || !connectedTypes.has(wt)) return false;
+    const chainKey = String(a.id || '').split(':')[0].replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, '');
+    if (!chainHasRpc(chainKey)) return false;
+    const numericChainId = a.chain_id || a.chainId;
+    if (numericChainId && wt === 'evm' && !chainHasRpc(numericChainId)) return false;
+    return true;
   });
 
   const routes = [];
@@ -692,7 +896,7 @@ async function gatherBalances(connectedTypes, supported) {
       bnbchain:'https://data-seed-prebsc-1-s1.binance.org:8545',
       hyperevm:'https://rpc.hyperliquid-testnet.xyz/evm',
       monad:'https://testnet-rpc.monad.xyz',
-      citrea:'https://rpc.testnet.citrea.xyz', alpen:'https://rpc.testnet.alpen.xyz',
+      citrea:'https://rpc.testnet.citrea.xyz', alpen:'https://rpc.testnet.alpenlabs.io',
     };
 
     const evmChainKeys = new Set();
@@ -1112,6 +1316,15 @@ app.get("/api/combinations", async (req, res) => {
 // ── ROUTE READINESS — chain-reaction aware ───────────────────
 app.get("/api/route-readiness", async (req, res) => {
   try {
+    // Wait for any in-flight EVM balance scan so we don't read stale/empty data
+    if (_evmBalanceScanInFlight) {
+      console.log("[route-readiness] waiting for in-flight EVM balance scan…");
+      await Promise.race([
+        _evmBalanceScanInFlight,
+        new Promise(r => setTimeout(r, 15000)),
+      ]);
+    }
+
     const mode = req.query?.mode === "allChains" ? "allChains" : "allTests";
     const { routes, connectedTypes, supported } = await buildRoutesForReadiness();
 
@@ -1127,6 +1340,19 @@ app.get("/api/route-readiness", async (req, res) => {
     const seedAllowlist = pickSeedAllowlistByMode(routes, balanceMap, gasMap, mode);
     const seedAllowlistSize = seedAllowlist ? seedAllowlist.size : null;
 
+    // Fetch isolation groups from Garden policy API for diagnostics
+    let isolationGroups = null;
+    try {
+      const policyData = await garden.getGlobalPolicy();
+      if (policyData?.isolation_groups || policyData?.isolationGroups) {
+        isolationGroups = policyData.isolation_groups || policyData.isolationGroups;
+        if (Array.isArray(isolationGroups) && isolationGroups.length) {
+          console.log(`[policy] ${isolationGroups.length} isolation group(s) found:`,
+            isolationGroups.map(g => `[${(g.assets || g.chains || g).join(', ')}]`).join(' | '));
+        }
+      }
+    } catch (_) {}
+
     const { RouteOptimizerAgent } = require("./agents/routeOptimizerAgent");
     const agent = new RouteOptimizerAgent();
     const preview = agent.run(routes, {
@@ -1135,6 +1361,17 @@ app.get("/api/route-readiness", async (req, res) => {
       connectedWalletTypes: connectedTypes,
       seedAllowlist,
     }, mode);
+    // Lock in the raffled seed so /api/run uses the exact same asset the display just showed.
+    // Store as a single-element Set so candidateSeeds = [chosenSeed] → raffle is deterministic.
+    if (preview.chosenSeed && mode === "allChains") {
+      _lastSeedAllowlist = new Set([preview.chosenSeed]);
+      _lastSeedAllowlistMode = mode;
+      _lastSeedAllowlistTs = Date.now();
+    }
+    if (mode === "allChains" && Array.isArray(preview.plan) && preview.plan.length > 0) {
+      _lastReadinessPlan = preview.plan;
+      _lastReadinessPlanTs = Date.now();
+    }
     const payload = preview.readiness;
     const hasQualifiedChainStart = (payload.assets || []).some((a) => a.isChainStart && a.sufficient);
     const executablePlanCountGet = preview.executablePlanCount || 0;
@@ -1154,8 +1391,11 @@ app.get("/api/route-readiness", async (req, res) => {
         consolidation = { eligible: false, reason: "resolver_error", error: e.message };
       }
     }
-    const simulation = await runner.simulateExecutionPreflight(_amountOverrides, mode, { silent: true, maxFlows: 12 })
-      .catch((e) => ({ ok: false, failedFlow: { reason: "simulation_error", error: e.message } }));
+    // allChains: skip preflight simulation — quotes 200+ routes and hangs the readiness poll.
+    const simulation = mode === "allChains"
+      ? { ok: true, skipped: true, reason: "allChains_preflight_skipped" }
+      : await runner.simulateExecutionPreflight(_amountOverrides, mode, { silent: true, maxFlows: 12 })
+          .catch((e) => ({ ok: false, failedFlow: { reason: "simulation_error", error: e.message } }));
     const executablePlanRoutes = Array.isArray(preview.plan)
       ? preview.plan.map((r) => (r && typeof r === "object"
         ? { fromAsset: r.fromAsset, toAsset: r.toAsset, label: r.label || null }
@@ -1388,7 +1628,7 @@ const FREE_RPCS = {
   hyperevm_testnet:  "https://rpc.hyperliquid-testnet.xyz/evm",
   monad_testnet:     "https://testnet-rpc.monad.xyz",
   citrea_testnet:    "https://rpc.testnet.citrea.xyz",
-  alpen_testnet:     "https://rpc.testnet.alpen.xyz",
+  alpen_testnet:     "https://rpc.testnet.alpenlabs.io",
 };
 
 const ERC20_BALANCE_ABI = [
@@ -1401,6 +1641,10 @@ app.post("/api/wallet/evm/balances", async (req, res) => {
   const { address } = req.body;
   if (!address) return res.status(400).json({ error: "address required" });
 
+  let _resolveBalanceScan;
+  _evmBalanceScanInFlight = new Promise(r => { _resolveBalanceScan = r; });
+
+  try {
   const results = {};
   const tokenResults = {};
   const supportedTokens = {};
@@ -1475,6 +1719,10 @@ app.post("/api/wallet/evm/balances", async (req, res) => {
   _lastSupportedTokensByAddress[address.toLowerCase()] = supportedTokens;
   console.log(`[evm balances] ${Object.keys(results).length} chains OK, ${rpcErrors.length} errors, ${Object.values(tokenResults).reduce((s,t)=>s+Object.keys(t).length,0)} ERC20 balances`);
   res.json({ ok: true, address, balances: results, tokenBalances: tokenResults, supportedTokens, rpcErrors });
+  } finally {
+    _resolveBalanceScan();
+    _evmBalanceScanInFlight = null;
+  }
 });
 
 // ── RPC: update URL for a chain ──────────────────────────────

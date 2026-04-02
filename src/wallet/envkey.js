@@ -13,7 +13,7 @@ const _rpcs = {
   hyperevm_testnet:  "https://rpc.hyperliquid-testnet.xyz/evm",
   monad_testnet:     "https://testnet-rpc.monad.xyz",
   citrea_testnet:    "https://rpc.testnet.citrea.xyz",
-  alpen_testnet:     "https://rpc.testnet.alpen.xyz",
+  alpen_testnet:     "https://rpc.testnet.alpenlabs.io",
 };
 function setRpc(chain, url) { _rpcs[chain] = url; }
 
@@ -68,12 +68,19 @@ const FREE_RPCS_FALLBACK = {
   'monad_testnet':    'https://testnet-rpc.monad.xyz',
   'monad':            'https://testnet-rpc.monad.xyz',
   'citrea_testnet':   'https://rpc.testnet.citrea.xyz',
-  'alpen_testnet':    'https://rpc.testnet.alpen.xyz',
+  'citrea':           'https://rpc.testnet.citrea.xyz',
+  'alpen_testnet':    'https://rpc.testnet.alpenlabs.io',
+  'alpen':            'https://rpc.testnet.alpenlabs.io',
   // numeric chain IDs
-  84532:  'https://sepolia.base.org',
+  84532:    'https://sepolia.base.org',
   11155111: 'https://rpc.sepolia.org',
-  421614: 'https://sepolia-rollup.arbitrum.io/rpc',
-  97:     'https://data-seed-prebsc-1-s1.binance.org:8545',
+  421614:   'https://sepolia-rollup.arbitrum.io/rpc',
+  97:       'https://data-seed-prebsc-1-s1.binance.org:8545',
+  998:      'https://rpc.hyperliquid-testnet.xyz/evm',
+  10143:    'https://testnet-rpc.monad.xyz',
+  5115:     'https://rpc.testnet.citrea.xyz',
+  48898:    'https://rpc.testnet.alpenlabs.io',
+  8150:     'https://rpc.testnet.alpenlabs.io',  // Alpen testnet (Garden's internal chain_id)
 };
 
 function getRpcForChain(chainIdOrKey) {
@@ -138,23 +145,34 @@ function getRpcCandidates(chainIdOrKey) {
   });
 }
 
+// Track the last confirmed nonce per chainId to avoid "nonce already used" when
+// sequential TXs fire faster than the RPC can update its pending nonce counter.
+const _nonceByChain = new Map();
+
 async function sendEvmTransaction({ to, data, value = "0x0", chainId, gasLimit }) {
   const rpcCandidates = getRpcCandidates(chainId);
   if (!rpcCandidates.length) throw new Error(`No RPC found for chain: ${chainId}`);
-
-  const tx = {
-    to, data: data || "0x", value: value || "0x0",
-    gasLimit: gasLimit ? BigInt(gasLimit) : BigInt(500000),
-  };
 
   let lastErr = null;
   for (const rpc of rpcCandidates) {
     try {
       const provider = new ethers.JsonRpcProvider(rpc);
       const wallet = new ethers.Wallet(getEvmPrivateKey(), provider);
-      console.log(`[envkey/evm] sendTx chain=${chainId} rpc=${rpc} to=${to}`);
+      // Resolve nonce: use tracked nonce if higher than what the RPC reports
+      const onChainNonce = await provider.getTransactionCount(wallet.address, "pending");
+      const tracked = _nonceByChain.get(String(chainId)) ?? -1;
+      const nonce = Math.max(onChainNonce, tracked + 1);
+
+      const tx = {
+        to, data: data || "0x", value: value || "0x0",
+        gasLimit: gasLimit ? BigInt(gasLimit) : BigInt(500000),
+        nonce,
+      };
+
+      console.log(`[envkey/evm] sendTx chain=${chainId} rpc=${rpc} to=${to} nonce=${nonce}`);
       const sent = await wallet.sendTransaction(tx);
       console.log(`[envkey/evm] broadcast: ${sent.hash}`);
+      _nonceByChain.set(String(chainId), nonce);
       await sent.wait(1);
       return sent.hash;
     } catch (e) {

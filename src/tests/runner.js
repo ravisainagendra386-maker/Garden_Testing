@@ -11,7 +11,7 @@ const FREE_RPCS = {
   hyperevm:   'https://rpc.hyperliquid-testnet.xyz/evm',
   monad:      'https://testnet-rpc.monad.xyz',
   citrea:     'https://rpc.testnet.citrea.xyz',
-  alpen:      'https://rpc.testnet.alpen.xyz',
+  alpen:      'https://rpc.testnet.alpenlabs.io',
 };
 
 function resolveRpcUrl(chainIdOrAsset) {
@@ -27,6 +27,9 @@ function resolveRpcUrl(chainIdOrAsset) {
       '11155111':  FREE_RPCS.ethereum,
       '10143':     FREE_RPCS.monad,
       '998':       FREE_RPCS.hyperevm,
+      '5115':      FREE_RPCS.citrea,
+      '48898':     FREE_RPCS.alpen,
+      '8150':      FREE_RPCS.alpen,   // Alpen testnet (Garden uses 8150 as chain_id)
     };
     return CID_MAP[cid] || null;
   }
@@ -456,7 +459,7 @@ async function maybeNonEvmAllChainsGasPrefundViaGarden(ctx) {
   emit("suite_info", {
     message: `Gas prefund completed before main hop: ${label} (${fromChain})`,
   });
-  return { ok: true, didPrefund: true };
+  return { ok: true, didPrefund: true, amountConsumed: prefundAmt, nativeAssetId: nativeMeta.id, nativeMeta };
 }
 
 /**
@@ -561,8 +564,8 @@ async function maybeAllChainsGasPrefundViaGarden({
     };
   }
   step("Gas prefund", "pass", "Native gas topped up via Garden (same-chain swap)");
-  emit("suite_info", { message: `Gas prefund completed before main hop: ${label}` });
-  return { ok: true, didPrefund: true };
+  emit("suite_info", { message: `Gas prefund completed before main hop: ${label} (consumed ${prefundAmt} atomic)` });
+  return { ok: true, didPrefund: true, amountConsumed: prefundAmt, nativeAssetId: nativeMeta.id, nativeMeta };
   }
 
   if (
@@ -794,6 +797,7 @@ async function runRoute({
         toChain,
         fromMeta,
         safeAmount,
+        allowFallback: true,
       });
       quoteRes = resolved.quoteRes;
       quoteSwitchedDest = resolved.swappedDestination;
@@ -816,8 +820,8 @@ async function runRoute({
     }
 
     const bestQuote    = quotes[0];
-    const outputAmount = String(bestQuote.destination.amount);
-    const solverId     = bestQuote.solver_id;
+    let outputAmount   = String(bestQuote.destination.amount);
+    let solverId       = bestQuote.solver_id;
     const fromDisplay  = `${bestQuote.source.display} (${bestQuote.source.value} USD)`;
     const toDisplay    = `${bestQuote.destination.display} (${bestQuote.destination.value} USD)`;
     const swapNote = quoteSwitchedDest
@@ -1027,35 +1031,42 @@ async function runRoute({
       step("Balance Check", "pass", `Could not verify (${balErr.message}) — continuing`);
     }
 
-    // 5c. Create order
+    // 5c. Create order — re-fetch a fresh quote right before to minimize expiry window.
+    //     If it still expires, one retry with another fresh quote.
     step("Create Order", "running");
     checkAbort();
-    const orderBody = {
-      source: {
-        asset:  fromAsset,
-        owner:  fromAddress,
-        amount: String(execAmount),
-      },
-      destination: {
-        asset:  swapDestAsset,
-        owner:  toAddress,
-        amount: outputAmount,
-      },
-      solver_id: solverId,
-    };
-    console.log("[create order]", JSON.stringify(orderBody));
     let orderRes;
-    try {
-      orderRes = await garden.createOrder(orderBody);
-    } catch (orderErr) {
-      const msg = orderErr.message || "";
-      if (msg.includes("400") || msg.includes("liquidity") || msg.includes("insufficient")) {
-        step("Create Order", "skipped", `Skipped: ${msg.split("]").pop().trim()}`);
-        emit("test_end", { testId, label, status: "skipped", error: msg });
-        _activeTests.delete(testId);
-        return { testId, label, status: "skipped", error: msg };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      // Fresh quote immediately before order — keeps the window as small as possible
+      try {
+        const fresh = await garden.getQuote(fromAsset, swapDestAsset, execAmount);
+        const fq = fresh?.result?.[0];
+        if (fq) { outputAmount = String(fq.destination.amount); solverId = fq.solver_id; }
+      } catch (_) { /* use the last known quote values */ }
+
+      const orderBody = {
+        source:      { asset: fromAsset, owner: fromAddress, amount: String(execAmount) },
+        destination: { asset: swapDestAsset, owner: toAddress, amount: outputAmount },
+        solver_id:   solverId,
+      };
+      console.log("[create order]", JSON.stringify(orderBody));
+      try {
+        orderRes = await garden.createOrder(orderBody);
+        break;
+      } catch (orderErr) {
+        const msg = orderErr.message || "";
+        if (/quote.?expired/i.test(msg) && attempt === 0) {
+          step("Create Order", "running", "Quote expired — retrying with fresh quote");
+          continue;
+        }
+        if (msg.includes("400") || msg.includes("liquidity") || msg.includes("insufficient")) {
+          step("Create Order", "skipped", `Skipped: ${msg.split("]").pop().trim()}`);
+          emit("test_end", { testId, label, status: "skipped", error: msg });
+          _activeTests.delete(testId);
+          return { testId, label, status: "skipped", error: msg };
+        }
+        throw orderErr;
       }
-      throw orderErr;
     }
     console.log("[order response]", JSON.stringify(orderRes).slice(0, 400));
 
@@ -1088,6 +1099,11 @@ async function runRoute({
       11155111: 'https://rpc.sepolia.org',
       421614:   'https://sepolia-rollup.arbitrum.io/rpc',
       97:       'https://data-seed-prebsc-1-s1.binance.org:8545',
+      5115:     'https://rpc.testnet.citrea.xyz',
+      8150:     'https://rpc.testnet.alpenlabs.io',
+      48898:    'https://rpc.testnet.alpenlabs.io',
+      10143:    'https://testnet-rpc.monad.xyz',
+      998:      'https://rpc.hyperliquid-testnet.xyz/evm',
       'base_sepolia':     'https://sepolia.base.org',
       'base':             'https://sepolia.base.org',
       'ethereum_sepolia': 'https://rpc.sepolia.org',
@@ -1097,7 +1113,13 @@ async function runRoute({
       'bnbchain_testnet': 'https://data-seed-prebsc-1-s1.binance.org:8545',
       'bnbchain':         'https://data-seed-prebsc-1-s1.binance.org:8545',
       'hyperevm_testnet': 'https://rpc.hyperliquid-testnet.xyz/evm',
+      'hyperevm':         'https://rpc.hyperliquid-testnet.xyz/evm',
       'monad_testnet':    'https://testnet-rpc.monad.xyz',
+      'monad':            'https://testnet-rpc.monad.xyz',
+      'citrea_testnet':   'https://rpc.testnet.citrea.xyz',
+      'citrea':           'https://rpc.testnet.citrea.xyz',
+      'alpen_testnet':    'https://rpc.testnet.alpenlabs.io',
+      'alpen':            'https://rpc.testnet.alpenlabs.io',
     };
 
     function resolveRpcLocal(chainIdOrKey) {
@@ -1657,7 +1679,7 @@ async function runApiTests() {
 }
 
 // ── BUILD ROUTES — ALWAYS FRESH (no cache) ────────────────────
-async function buildRoutes(amountOverrides = {}, mode = "allTests") {
+async function buildRoutes(amountOverrides = {}, mode = "allTests", seedAllowlist = null) {
   const wallets = walletState.getStatus();
   const connectedTypes = new Set();
   if (wallets.evm)      connectedTypes.add("evm");
@@ -1777,14 +1799,14 @@ async function buildRoutes(amountOverrides = {}, mode = "allTests") {
   // Chain-reaction optimizer
   try {
     await ensureRouteAgentReady();
-    const planMode = mode === "allChains" ? "allTests" : mode;
     const result = _routeAgent.run(routes, {
       maxTotal: 160,
       perPairLimit: 3,
       balances: balanceMap,
       gasBalances: gasMap,
       connectedWalletTypes: connectedTypes,
-    }, planMode);
+      seedAllowlist: seedAllowlist instanceof Set && seedAllowlist.size ? seedAllowlist : undefined,
+    }, mode);
     emit("route_plan", {
       mode: result.mode,
       availableRunOptions: result.availableRunOptions || ["allTests", "allChains"],
@@ -1921,7 +1943,7 @@ async function simulateSingleHop({
  * Returns null if any quote fails (non-blocking — caller proceeds without the check).
  */
 async function computeChainRequiredSeed(chainRoutes) {
-  if (!chainRoutes || chainRoutes.length <= 1) return null;
+  if (!chainRoutes || chainRoutes.length === 0) return null;
 
   // Forward pass: quote each hop at its min_amount to measure spread
   const hopRatios = [];
@@ -2287,7 +2309,7 @@ function pickRandomizedSeedEntries(bySeed) {
 }
 
 // ── RUN ALL — PARALLEL CHAIN-REACTION EXECUTION ──────────────
-async function runAll(amountOverrides = {}, mode = "allTests") {
+async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = null, serverPlan = null) {
   const ts = new Date().toISOString();
   emit("suite_start", { env: config.env, mode, ts });
   _suiteRunActive = true;
@@ -2471,7 +2493,15 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
     return results;
   }
 
-  const routes = await buildRoutes(amountOverrides, mode);
+  // allChains: use server's pre-built plan if available (same seed/routes the display showed).
+  // Falls back to buildRoutes if serverPlan is null (e.g. consolidate-and-run, TTL expiry).
+  const allBuiltRoutes = (mode === "allChains" && serverPlan && serverPlan.length > 0)
+    ? serverPlan
+    : await buildRoutes(amountOverrides, mode, seedAllowlist);
+  // allChains: only chain routes — standalones are not part of the cycle
+  const routes = mode === "allChains"
+    ? allBuiltRoutes.filter(r => r._chainStart)
+    : allBuiltRoutes;
 
   emit("suite_routes", { count: routes.length, routes: routes.map(r => r.label) });
 
@@ -2503,14 +2533,34 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
   const seedEntries =
     mode === "allChains"
       ? (() => {
-          // allChains = one beam only: pick a single random seed and run its chain
-          const randomized = pickRandomizedSeedEntries(bySeed);
-          return randomized.slice(0, 1);
+          // allChains: single-seed model — one funded asset drives the full multi-hop beam path.
+          // All routes share _chainStart = that seed, so seedsToRun has exactly 1 entry.
+          // Sort by _chainIndex (always 0 with single seed, but kept for safety).
+          return [...bySeed.entries()].sort((a, b) => {
+            const ai = Math.min(...a[1].map(r => r._chainIndex ?? 999));
+            const bi = Math.min(...b[1].map(r => r._chainIndex ?? 999));
+            return ai - bi;
+          });
         })()
       : [...bySeed.entries()];
   const seedsToRun = new Map(seedEntries);
 
-  const simSummary = await simulateFlowsForRoutes(routes, mode, { allowLiquiditySkips: true });
+  if (mode === "allChains" && seedsToRun.size === 0) {
+    emit("suite_end", {
+      env: config.env, total: 0, executed: 0, passed: 0, failed: 0, aborted: 1, skipped: 0,
+      message: "allChains: no funded seed chains found — ensure at least one asset has balance ≥ min_amount",
+      ts: new Date().toISOString(),
+    });
+    _suiteEndEmitted = true;
+    return [];
+  }
+
+  // allChains skips preflight simulation — quoting 100+ routes sequentially hangs the runner.
+  // Per-hop gas checks (resolveToAssetWithGasSubstitution) and seed sufficiency
+  // (computeChainRequiredSeed) guard execution at runtime instead.
+  const simSummary = mode === "allChains"
+    ? { ok: true, totalFlows: 0, passedFlows: 0, failedFlows: 0, skippedFlows: [], skippedFlowIds: [] }
+    : await simulateFlowsForRoutes(routes, mode, { allowLiquiditySkips: true });
   if (!simSummary.ok) {
     emit("suite_end", {
       env: config.env,
@@ -2555,7 +2605,8 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
 
     // allChains pre-check: ensure seed balance covers min_amount requirements for all hops.
     // Quotes each hop at min_amount, works backward to compute the required seed amount.
-    if (mode === "allChains" && chainRoutes.length > 1) {
+    // Then APPLY the computed amount to the first hop so downstream hops receive enough.
+    if (mode === "allChains" && chainRoutes.length >= 1) {
       const reqStart = await computeChainRequiredSeed(chainRoutes).catch(() => null);
       if (reqStart) {
         const seedBal = getWalletAssetAtomicBalance(chainRoutes[0]);
@@ -2570,10 +2621,40 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
           });
           return;
         }
+        // Apply the fee-compounded amount to the first hop so each downstream
+        // hop receives at least its min_amount after 0.35% fees per hop.
+        // Use the larger of: quote-based backward pass OR formula-based estimate.
+        const seedAmount = clampGardenQuoteAmount(
+          Math.max(reqStart.requiredSeedAtomic, chainRoutes[0].amount || 0),
+          chainRoutes[0].fromMeta
+        );
+        const cappedSeedAmount = seedBalNum !== null
+          ? Math.min(seedAmount, seedBalNum)
+          : seedAmount;
+        chainRoutes[0].amount = cappedSeedAmount;
         emit("suite_info", {
-          message: `allChains seed check passed: balance ${seedBalNum} >= required ${reqStart.requiredSeedAtomic} for ${chainRoutes.length}-hop chain`,
+          message: `allChains seed check passed: balance ${seedBalNum} >= required ${reqStart.requiredSeedAtomic} for ${chainRoutes.length}-hop chain — first hop amount set to ${cappedSeedAmount}`,
           requiredSeedAtomic: reqStart.requiredSeedAtomic,
+          appliedSeedAmount: cappedSeedAmount,
           hopBreakdown: reqStart.hopBreakdown,
+        });
+      } else {
+        // Quote-based calculation unavailable — use formula (1/(1-0.0035))^N as fallback
+        const N = chainRoutes.length;
+        const feeMultiplier = Math.pow(1 / (1 - 0.0035), N);
+        const hop0Min = Math.max(1, parseInt(String(chainRoutes[0].fromMeta?.min_amount ?? 50000), 10) || 50000);
+        const formulaAmount = Math.ceil(hop0Min * feeMultiplier);
+        const seedBal = getWalletAssetAtomicBalance(chainRoutes[0]);
+        const seedBalNum = seedBal !== null ? Number(seedBal) : null;
+        const fallbackAmount = clampGardenQuoteAmount(
+          Math.max(formulaAmount, chainRoutes[0].amount || 0),
+          chainRoutes[0].fromMeta
+        );
+        chainRoutes[0].amount = seedBalNum !== null
+          ? Math.min(fallbackAmount, seedBalNum)
+          : fallbackAmount;
+        emit("suite_info", {
+          message: `allChains seed amount set via fee formula: ${chainRoutes[0].amount} (min ${hop0Min} × ${feeMultiplier.toFixed(4)} for ${N} hops)`,
         });
       }
     }
@@ -2581,63 +2662,114 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
     for (let i = 0; i < chainRoutes.length; i++) {
       if (_abortEpoch !== suiteEpoch) break;
 
-      // Pre-hop: if destination chain has no gas, substitute toAsset → native or block
+      // ── Pre-hop gas check ────────────────────────────────────────────
+      // Before executing, check if the destination chain has gas.
+      //   • Has gas        → pick random destination asset as normal
+      //   • No gas + Garden supports native gas token → substitute dest
+      //     to native token (delivers gas in one trade, no extra swap)
+      //   • No gas + no native support → skip this chain, emit fail,
+      //     re-route current source directly to the NEXT chain
       const destCheck = await resolveToAssetWithGasSubstitution(chainRoutes[i], supportedAssets, gasCache);
       if (!destCheck.ok) {
-        emit("suite_info", { message: `Chain blocked at hop ${i + 1} (${chainRoutes[i].label}): no Garden-supported native gas on destination chain` });
+        const skippedChain = String(chainRoutes[i].toAsset || '').split(':')[0];
+        const failLabel = chainRoutes[i].label || `${chainRoutes[i].fromAsset} → ${chainRoutes[i].toAsset}`;
+        const failError = `No gas on ${skippedChain} and Garden has no supported native gas token — chain skipped`;
+        const failTestId = `no_gas_skip_${i}_${Date.now()}`;
+
+        emit("test_start", { testId: failTestId, label: failLabel, fromAsset: chainRoutes[i].fromAsset, toAsset: chainRoutes[i].toAsset, fromChain: chainRoutes[i].fromChain, toChain: chainRoutes[i].toChain, amount: chainRoutes[i].amount });
+        emit("test_step",  { testId: failTestId, label: failLabel, step: { name: "Gas check", status: "fail", detail: failError, ts: new Date().toISOString() } });
+        emit("test_end",   { testId: failTestId, label: failLabel, status: "fail", error: failError });
+        results.push({ testId: failTestId, label: failLabel, status: "fail", error: failError, ts: new Date().toISOString() });
+
+        if (mode === "allChains" && i + 1 < chainRoutes.length) {
+          // Bypass skipped chain: re-route to next chain's destination.
+          // Keep current source, skip the intermediary chain that has no gas.
+          const nextHop = chainRoutes[i + 1];
+          const bypassLabel = `${chainRoutes[i].fromMeta?.name || chainRoutes[i].fromAsset} → ${nextHop.toMeta?.name || nextHop.toAsset}`;
+          Object.assign(nextHop, {
+            fromAsset: chainRoutes[i].fromAsset,
+            fromMeta:  chainRoutes[i].fromMeta,
+            fromChain: chainRoutes[i].fromChain,
+            amount:    chainRoutes[i].amount,
+            label:     bypassLabel,
+          });
+          emit("suite_info", { message: `Skipped ${skippedChain} (no gas) — re-routed: ${bypassLabel}` });
+          continue;
+        }
+        emit("suite_info", { message: `Chain stopped: ${failError}` });
         break;
       }
+
       if (destCheck.substituted) {
-        emit("suite_info", { message: `Substituted dest to native gas token: ${chainRoutes[i].label} → ${destCheck.route.toAsset}` });
+        emit("suite_info", { message: `Dest substituted to native gas token: ${chainRoutes[i].fromAsset} → ${destCheck.route.toAsset} (saves a trade)` });
       }
       const route = destCheck.route;
+
+      // ── Execute the hop ──────────────────────────────────────────────
       const result = await runRoute({ ...route, suiteEpoch });
       results.push(result);
 
+      // If the dest was substituted to native and the hop passed, mark gas as funded
+      if (result.status === "pass" && destCheck.substituted) {
+        const fundedChain = String(route.toAsset || '').split(':')[0].replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, '');
+        gasCache.set(fundedChain, MIN_NATIVE_WEI_FOR_GAS);
+      }
+
       if (result.status !== "pass") {
         if (mode === "allChains") {
-          // Try ALL other assets on the same fromChain→toChain direction, not just other seeds
-          const sameChainCandidates = routes.filter((r) =>
-            r.fromChain === route.fromChain &&
-            r.toChain === route.toChain &&
-            r.fromAsset !== route.fromAsset
-          );
+          // Dest fallback: try other assets on the same destination chain
+          const toChainPrefix = String(route.toAsset || '').split(':')[0].toLowerCase();
+          const triedDests = new Set([route.toAsset]);
+          const destCandidates = supportedAssets
+            .filter(a => {
+              const ck = String(a.id || '').split(':')[0].toLowerCase();
+              if (ck !== toChainPrefix) return false;
+              if (triedDests.has(a.id)) return false;
+              if (a.id === route.fromAsset) return false;
+              return true;
+            })
+            .sort((a, b) => String(a.id).localeCompare(String(b.id)));
           let replaced = false;
-          for (const cand of sameChainCandidates) {
+          for (const cand of destCandidates) {
             if (_abortEpoch !== suiteEpoch) break;
-            // Apply gas substitution to each fallback candidate too
-            const candCheck = await resolveToAssetWithGasSubstitution(cand, supportedAssets, gasCache);
-            if (!candCheck.ok) continue; // no native support on dest for this candidate either
-            const candRoute = candCheck.route;
-            const tryRes = await runRoute({ ...candRoute, suiteEpoch, executionMode: "allChains" });
+            triedDests.add(cand.id);
+            const candRoute = {
+              ...route,
+              toAsset: cand.id,
+              toMeta: cand,
+              label: `${route.fromMeta?.name || route.fromAsset} → ${cand.name || cand.id} [dest fallback]`,
+            };
+            const candCheck = await resolveToAssetWithGasSubstitution(candRoute, supportedAssets, gasCache);
+            if (!candCheck.ok) continue;
+            const tryRes = await runRoute({ ...candCheck.route, suiteEpoch, executionMode: "allChains" });
             results.push(tryRes);
             if (tryRes.status === "pass") {
               replaced = true;
               if (i + 1 < chainRoutes.length) {
                 patchNextChainHopFromReceive(chainRoutes[i + 1], tryRes);
-                // Mid-run check: received amount must meet next hop's min_amount
                 const nextMin = Math.max(1, parseInt(String(chainRoutes[i + 1].fromMeta?.min_amount ?? 50000), 10) || 50000);
                 if (Number(chainRoutes[i + 1].amount || 0) < nextMin) {
                   emit("suite_info", {
                     message: `Chain stopped before hop ${i + 2} (fallback): received ${chainRoutes[i + 1].amount} atomic < min ${nextMin} for ${chainRoutes[i + 1].label}`,
                   });
-                  replaced = false; // fall through to outer break
+                  replaced = false;
                   break;
                 }
               } else {
-                lastPassResult = tryRes; // fallback succeeded on the final hop
+                lastPassResult = tryRes;
               }
-              await maybePrefundNativeOnChainFromAsset({
-                fromChain: candRoute.toChain,
-                fromAsset: tryRes.actualDestAsset || candRoute.toAsset,
-                fromMeta: tryRes.actualDestMeta || candRoute.toMeta,
-                amount: Math.max(1, Math.floor(Number(tryRes.nextHopAmountAtomic || candRoute.amount || 50000) / 10)),
-                label: `${candRoute.label} [dest gas prefund]`,
-              });
               break;
             }
           }
           if (replaced) continue;
+
+          // All dest fallbacks failed — skip this hop, continue to next child
+          if (i + 1 < chainRoutes.length) {
+            emit("suite_info", {
+              message: `Hop ${i + 1} failed (${route.label}): ${result.error || result.status} — skipping to next child`,
+            });
+            continue;
+          }
         }
         emit("suite_info", {
           message:
@@ -2648,9 +2780,9 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
         break;
       }
 
+      // ── Patch next hop from received output ──────────────────────────
       if (i + 1 < chainRoutes.length) {
         patchNextChainHopFromReceive(chainRoutes[i + 1], result);
-        // Mid-run check: received amount must meet next hop's min_amount before firing it
         const nextMin = Math.max(1, parseInt(String(chainRoutes[i + 1].fromMeta?.min_amount ?? 50000), 10) || 50000);
         if (Number(chainRoutes[i + 1].amount || 0) < nextMin) {
           emit("suite_info", {
@@ -2660,67 +2792,75 @@ async function runAll(amountOverrides = {}, mode = "allTests") {
           });
           break;
         }
+        // Gas for the next hop's source chain is already handled:
+        // resolveToAssetWithGasSubstitution on the CURRENT hop substituted the
+        // dest to native if gas was needed, so the received token IS native gas.
+        // The NEXT iteration's pre-hop check handles the next dest chain.
       } else {
-        lastPassResult = result; // completed the final hop on the happy path
+        lastPassResult = result;
       }
-      await maybePrefundNativeOnChainFromAsset({
-        fromChain: route.toChain,
-        fromAsset: result.actualDestAsset || route.toAsset,
-        fromMeta: result.actualDestMeta || route.toMeta,
-        amount: Math.max(1, Math.floor(Number(result.nextHopAmountAtomic || route.amount || 50000) / 10)),
-        label: `${route.label} [dest gas prefund]`,
-      });
 
       if (!_globalAbort) await new Promise(r => setTimeout(r, 500));
     }
 
-    // Cycle close: route the final received asset back to the original seed asset.
-    // Uses actual received amount — only fires if amount meets the closing hop's min_amount.
-    if (mode === "allChains" && lastPassResult && _abortEpoch === suiteEpoch) {
-      const finalAsset = lastPassResult.actualDestAsset || chainRoutes[chainRoutes.length - 1].toAsset;
-      const finalMeta  = lastPassResult.actualDestMeta  || chainRoutes[chainRoutes.length - 1].toMeta;
-      const seedAsset  = chainRoutes[0].fromAsset;
-      if (finalAsset && seedAsset && finalAsset !== seedAsset) {
-        const closingRoute = routes.find(r => r.fromAsset === finalAsset && r.toAsset === seedAsset);
-        if (closingRoute) {
-          const receivedAmt = Number(lastPassResult.nextHopAmountAtomic || 0);
-          const cycleMin = Math.max(1, parseInt(String(finalMeta?.min_amount ?? 50000), 10) || 50000);
-          if (receivedAmt >= cycleMin) {
-            const cycleRoute = {
-              ...closingRoute,
-              amount: clampGardenQuoteAmount(receivedAmt, finalMeta),
-              suiteEpoch,
-              executionMode: "allChains",
-            };
-            const cycleGasCheck = await resolveToAssetWithGasSubstitution(cycleRoute, supportedAssets, gasCache);
-            if (cycleGasCheck.ok) {
-              emit("suite_info", {
-                message: `Cycle close: ${finalAsset} → ${seedAsset} (${receivedAmt} atomic from last hop)`,
-              });
-              const cycleResult = await runRoute(cycleGasCheck.route);
-              results.push(cycleResult);
-            } else {
-              emit("suite_info", { message: `Cycle close skipped: no gas on seed chain for ${closingRoute.label}` });
-            }
-          } else {
-            emit("suite_info", {
-              message: `Cycle close skipped: received ${receivedAmt} < min ${cycleMin} for ${finalAsset} → ${seedAsset}`,
-            });
-          }
-        } else {
-          emit("suite_info", { message: `Cycle close skipped: no route found ${finalAsset} → ${seedAsset}` });
-        }
-      }
-    }
+    // Per-chain cycle-close removed — in allChains mode the whole-cycle close
+    // (lastChain.output → firstChain.seed) is handled in the outer chainPromise loop.
+    return lastPassResult; // caller patches next chain's amount and handles cycle close
   }
 
-  // allChains mode: one beam only (seedsToRun has a single seed); hops run sequentially.
-  // allTests mode: keep seed chains parallel for throughput.
+  // allChains: all seed chains run sequentially in _chainIndex order; each chain's output
+  // is patched into the next chain's first hop as the seed amount.
+  // allTests: seed chains run in parallel for throughput.
   const chainPromise = (mode === "allChains")
     ? (async () => {
-        for (const [seed, chainRoutes] of [...seedsToRun.entries()]) {
+        let prevResult = null;
+        const allSeedEntries = [...seedsToRun.entries()];
+        const wholeCycleSeed = allSeedEntries[0]?.[1]?.[0]?.fromAsset || null; // e.g. BTC — first hop's fromAsset = cycle start
+        const gasCache = new Map();
+        const supportedAssets = await getAssetsForRunner().catch(() => []);
+
+        for (const [seed, chainRoutes] of allSeedEntries) {
           if (_abortEpoch !== suiteEpoch) break;
-          await runChain(chainRoutes, seed);
+          // Cross-chain fund handoff: patch this chain's seed amount from previous chain's output
+          if (prevResult && chainRoutes.length > 0) {
+            patchNextChainHopFromReceive(chainRoutes[0], prevResult);
+            const seedMin = Math.max(1, parseInt(String(chainRoutes[0].fromMeta?.min_amount ?? 50000), 10) || 50000);
+            if (Number(chainRoutes[0].amount || 0) < seedMin) {
+              emit("suite_info", { message: `allChains: stopping at chain ${seed} — received ${chainRoutes[0].amount} atomic < min ${seedMin}` });
+              prevResult = null;
+              break;
+            }
+          }
+          prevResult = await runChain(chainRoutes, seed);
+        }
+
+        // Whole-cycle close: last chain's output → first chain's seed (LBTC(eth) → WBTC(arb))
+        if (prevResult && wholeCycleSeed && _abortEpoch === suiteEpoch) {
+          const finalAsset = prevResult.actualDestAsset || null;
+          const finalMeta  = prevResult.actualDestMeta  || null;
+          if (finalAsset && finalAsset !== wholeCycleSeed) {
+            const closingRoute = routes.find(r => r.fromAsset === finalAsset && r.toAsset === wholeCycleSeed);
+            if (closingRoute) {
+              const receivedAmt = Number(prevResult.nextHopAmountAtomic || 0);
+              const cycleMin = Math.max(1, parseInt(String(finalMeta?.min_amount ?? 50000), 10) || 50000);
+              if (receivedAmt >= cycleMin) {
+                const cycleGasCheck = await resolveToAssetWithGasSubstitution(
+                  { ...closingRoute, amount: clampGardenQuoteAmount(receivedAmt, finalMeta), suiteEpoch, executionMode: "allChains" },
+                  supportedAssets, gasCache
+                );
+                if (cycleGasCheck.ok) {
+                  emit("suite_info", { message: `Cycle close: ${finalAsset} → ${wholeCycleSeed} (${receivedAmt} atomic)` });
+                  results.push(await runRoute(cycleGasCheck.route));
+                } else {
+                  emit("suite_info", { message: `Cycle close skipped: no gas on seed chain for ${closingRoute.label}` });
+                }
+              } else {
+                emit("suite_info", { message: `Cycle close skipped: received ${receivedAmt} < min ${cycleMin} for ${finalAsset} → ${wholeCycleSeed}` });
+              }
+            } else {
+              emit("suite_info", { message: `Cycle close skipped: no route found ${finalAsset} → ${wholeCycleSeed}` });
+            }
+          }
         }
       })()
     : Promise.all(

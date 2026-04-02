@@ -35,8 +35,8 @@ const EVM_FREE_RPCS = {
   'monad_testnet':    'https://testnet-rpc.monad.xyz',
   'citrea':           'https://rpc.testnet.citrea.xyz',
   'citrea_testnet':   'https://rpc.testnet.citrea.xyz',
-  'alpen':            'https://rpc.testnet.alpen.xyz',
-  'alpen_testnet':    'https://rpc.testnet.alpen.xyz',
+  'alpen':            'https://rpc.testnet.alpenlabs.io',
+  'alpen_testnet':    'https://rpc.testnet.alpenlabs.io',
 };
 
 function resolveRpc(chainKey) {

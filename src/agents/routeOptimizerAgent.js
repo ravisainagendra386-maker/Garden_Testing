@@ -16,19 +16,6 @@ function shuffleArray(arr) {
   return arr;
 }
 
-/**
- * allTests: for each bitcoin→* matrix cell, pick among all liquid catalog routes (uniform), not only max scoreHop
- * (BTC↔BTC-family pairs score highest, so iBTC on Base often won every time).
- * Default: on. Set ALLTESTS_RANDOM_BTC_DEST=false to restore deterministic “best score” picks.
- */
-function allTestsRandomBitcoinDestEnabled() {
-  const v = process.env.ALLTESTS_RANDOM_BTC_DEST;
-  if (v === undefined || String(v).trim() === "") return true;
-  const s = String(v).toLowerCase();
-  if (s === "0" || s === "false" || s === "no") return false;
-  return s === "1" || s === "true" || s === "yes";
-}
-
 class AgentMemoryFallback {
   constructor() {
     this.chainGas = new Map();
@@ -173,35 +160,95 @@ function formatUnitsAtomic(value, decimals = 8) {
   return `${whole.toString()}.${fracStr}`;
 }
 
-function scoreHop(fromId, toId, pairStats) {
-  const ff = assetFamilyFromIdOrName(fromId, "");
-  const tf = assetFamilyFromIdOrName(toId, "");
-  const fc = getChainKey(fromId);
-  const tc = getChainKey(toId);
-  let score = 0;
-
-  if (ff === "btc" && tf === "btc") score += 8;
-  else if (ff === "btc" || tf === "btc") score += 4;
-  if (ff === "eth" || tf === "eth") score += 2;
-  if (ff === "stable" || tf === "stable") score += 1;
-  if (fc !== tc) score += 5;
-  if (ff !== tf) score += 2;
-
-  const stat = pairStats?.get(`${fromId}::${toId}`);
-  if (stat) {
-    const total = Number(stat.successes || 0) + Number(stat.failures || 0);
-    if (total >= 3) {
-      const successRate = Number(stat.successRate ?? (stat.successes / total));
-      score += (successRate - 0.5) * 10;
-      if (Number(stat.avgEdgeBps || 0) > 0) score += Math.min(3, Number(stat.avgEdgeBps) / 10);
-    } else {
-      score -= 0.5;
+/**
+ * Detect isolation clusters from the adjacency graph.
+ * Two chains are in the same cluster if they share edges across 2+ distinct asset families.
+ * Chains connected ONLY via a single family (e.g. only WBTC) are in separate clusters.
+ * This naturally separates e.g. {Arb, Base, Eth} from {Corn, Botanix, Citrea}
+ * when the only bridge between them is BTC-family.
+ */
+function detectIsolationClusters(adj, allChainKeys) {
+  const pairFamilies = new Map();
+  for (const [fromAsset, edges] of adj.entries()) {
+    const fromChain = getChainRouteStepKey(fromAsset);
+    const fromFamily = assetFamilyFromIdOrName(fromAsset, "");
+    for (const edge of edges) {
+      const toChain = getChainRouteStepKey(edge.toAssetId);
+      if (fromChain === toChain) continue;
+      const key = [fromChain, toChain].sort().join("::");
+      if (!pairFamilies.has(key)) pairFamilies.set(key, new Set());
+      pairFamilies.get(key).add(fromFamily);
     }
-  } else {
-    score -= 0.3;
   }
 
-  return score;
+  // "Strong" adjacency: only edges with 2+ distinct asset families
+  const strongAdj = new Map();
+  for (const chain of allChainKeys) strongAdj.set(chain, new Set());
+  for (const [key, families] of pairFamilies) {
+    if (families.size < 2) continue;
+    const parts = key.split("::");
+    strongAdj.get(parts[0])?.add(parts[1]);
+    strongAdj.get(parts[1])?.add(parts[0]);
+  }
+
+  // BFS to find connected components
+  const visited = new Set();
+  const clusters = [];
+  for (const chain of allChainKeys) {
+    if (visited.has(chain)) continue;
+    const cluster = new Set();
+    const queue = [chain];
+    visited.add(chain);
+    while (queue.length) {
+      const cur = queue.shift();
+      cluster.add(cur);
+      for (const neighbor of (strongAdj.get(cur) || [])) {
+        if (!visited.has(neighbor)) {
+          visited.add(neighbor);
+          queue.push(neighbor);
+        }
+      }
+    }
+    clusters.push(cluster);
+  }
+
+  // Merge singleton clusters into the nearest cluster with ANY weak edge
+  const merged = clusters.filter(c => c.size > 1);
+  const singletons = clusters.filter(c => c.size === 1);
+  for (const s of singletons) {
+    const chain = [...s][0];
+    let bestCluster = null;
+    let bestFamilies = 0;
+    for (const [key, families] of pairFamilies) {
+      const parts = key.split("::");
+      const other = parts[0] === chain ? parts[1] : (parts[1] === chain ? parts[0] : null);
+      if (!other) continue;
+      for (const mc of merged) {
+        if (mc.has(other) && families.size > bestFamilies) {
+          bestFamilies = families.size;
+          bestCluster = mc;
+        }
+      }
+    }
+    if (bestCluster) bestCluster.add(chain);
+    else if (merged.length) merged[0].add(chain);
+    else merged.push(s);
+  }
+
+  return merged.length ? merged : [new Set(allChainKeys)];
+}
+
+/**
+ * Build a filtered adjacency map containing only edges within a given set of chains.
+ */
+function filterAdjToChains(adj, chainSet) {
+  const filtered = new Map();
+  for (const [fromAsset, edges] of adj.entries()) {
+    if (!chainSet.has(getChainRouteStepKey(fromAsset))) continue;
+    const kept = edges.filter(e => chainSet.has(getChainRouteStepKey(e.toAssetId)));
+    if (kept.length) filtered.set(fromAsset, kept);
+  }
+  return filtered;
 }
 
 function estimatePathGas(pathAssets, gasBalances, memory) {
@@ -240,14 +287,13 @@ function estimatePathGas(pathAssets, gasBalances, memory) {
 
 function beamSearchPath(seedId, adj, opts = {}) {
   const usedDestinations = opts.usedDestinations || new Set();
-  const pairStats = opts.pairStats || null;
   const gasBalances = opts.gasBalances || new Map();
   const memory = opts.memory || null;
   const beamWidth = Number(opts.beamWidth || BEAM_WIDTH);
   const maxDepth = Number(opts.maxDepth || MAX_DEPTH);
   const uniqueChainsOnly = opts.chainRoutesUniqueChains === true;
 
-  let beam = [{ assets: [seedId], score: 0 }];
+  let beam = [{ assets: [seedId] }];
   let best = null;
 
   for (let depth = 0; depth < maxDepth; depth++) {
@@ -266,36 +312,237 @@ function beamSearchPath(seedId, adj, opts = {}) {
           const nextCk = getChainRouteStepKey(edge.toAssetId);
           if (seenChainKeys.has(nextCk)) continue;
         }
-        const assets = [...partial.assets, edge.toAssetId];
-        const score = partial.score + scoreHop(current, edge.toAssetId, pairStats);
-        candidates.push({ assets, score });
+        candidates.push({ assets: [...partial.assets, edge.toAssetId] });
         expanded = true;
       }
 
       if (!expanded && partial.assets.length > 1) {
         const gas = estimatePathGas(partial.assets, gasBalances, memory);
-        if (gas.feasible && (!best || partial.score > best.score)) {
+        const feasibleForBeam = uniqueChainsOnly ? true : gas.feasible;
+        if (feasibleForBeam && (!best || partial.assets.length > best.assets.length)) {
           best = { ...partial, gasEstimate: gas };
         }
       }
     }
 
     if (!candidates.length) break;
-    shuffleArray(candidates);          // random hop selection at every depth
-    beam = candidates.slice(0, beamWidth);
+    if (uniqueChainsOnly) {
+      // Guarantee at least one random candidate per reachable chain survives the beam cut.
+      const byNextChain = new Map();
+      for (const c of candidates) {
+        const ck = getChainRouteStepKey(c.assets[c.assets.length - 1]);
+        if (!byNextChain.has(ck)) byNextChain.set(ck, []);
+        byNextChain.get(ck).push(c);
+      }
+      const guaranteed = [];
+      for (const [, group] of byNextChain) {
+        shuffleArray(group);
+        guaranteed.push(group[0]);
+        if (group.length > 1 && beamWidth > byNextChain.size * 2) {
+          guaranteed.push(group[1]);
+        }
+      }
+      const guaranteedSet = new Set(guaranteed);
+      const rest = candidates.filter(c => !guaranteedSet.has(c));
+      shuffleArray(rest);
+      beam = [...guaranteed, ...rest].slice(0, Math.max(beamWidth, guaranteed.length));
+    } else {
+      shuffleArray(candidates);
+      beam = candidates.slice(0, beamWidth);
+    }
   }
 
   if (!best) {
-    for (const p of beam.sort((a, b) => b.score - a.score)) {
+    // Pick the longest path from the beam (random tiebreak via shuffle)
+    shuffleArray(beam);
+    beam.sort((a, b) => b.assets.length - a.assets.length);
+    for (const p of beam) {
       if (p.assets.length < 2) continue;
       const gas = estimatePathGas(p.assets, gasBalances, memory);
-      if (!gas.feasible) continue;
+      if (!uniqueChainsOnly && !gas.feasible) continue;
       best = { ...p, gasEstimate: gas };
       break;
     }
   }
 
   return best;
+}
+
+/**
+ * Two-phase chain-first routing for allChains mode.
+ * Phase 1: Build a chain-level graph and find the longest chain order via DFS.
+ * Phase 2: For each hop, pick a RANDOM asset pair, check conditions (known-bad pair,
+ *          gas availability). If dest has no gas and Garden supports a native gas token
+ *          on that chain, substitute the dest asset to native so the swap delivers gas.
+ *          Child chains are unchanged.
+ *
+ * This avoids BEAM_WIDTH pruning entirely — with ~20 chain nodes, full DFS is fast.
+ */
+function chainFirstPath(seedId, adj, opts = {}) {
+  const usedDestinations = opts.usedDestinations || new Set();
+  const pairStats = opts.pairStats || null;
+  const gasBalances = opts.gasBalances || new Map();
+  const memory = opts.memory || null;
+  const supportedAssets = opts.supportedAssets || [];
+
+  const seedChain = getChainRouteStepKey(seedId);
+
+  // Phase 1: Build chain-level adjacency and track asset pairs per chain hop.
+  const chainAdj = new Map();
+  const chainPairs = new Map();
+
+  for (const [fromAsset, edges] of adj.entries()) {
+    const fromChain = getChainRouteStepKey(fromAsset);
+    for (const edge of edges) {
+      if (usedDestinations.has(edge.toAssetId)) continue;
+      const toChain = getChainRouteStepKey(edge.toAssetId);
+      if (fromChain === toChain) continue;
+
+      if (!chainAdj.has(fromChain)) chainAdj.set(fromChain, new Set());
+      chainAdj.get(fromChain).add(toChain);
+
+      const pairKey = `${fromChain}::${toChain}`;
+      if (!chainPairs.has(pairKey)) chainPairs.set(pairKey, []);
+      chainPairs.get(pairKey).push({
+        fromAsset,
+        toAsset: edge.toAssetId,
+        route: edge.route,
+      });
+    }
+  }
+
+  const allChains = [...new Set([...chainAdj.keys(), ...[...chainAdj.values()].flatMap(s => [...s])])];
+  console.log(`[chain-first] Phase 1: ${allChains.length} chains in graph, seed=${seedChain}`);
+
+  // DFS: find the longest path visiting the most unique chains
+  let bestChainPath = [seedChain];
+
+  function dfs(current, visited, path) {
+    if (path.length > bestChainPath.length) bestChainPath = [...path];
+    if (path.length >= allChains.length) return;
+
+    const neighbors = chainAdj.get(current);
+    if (!neighbors) return;
+
+    const unvisited = [...neighbors].filter(n => !visited.has(n));
+    shuffleArray(unvisited);
+
+    for (const next of unvisited) {
+      visited.add(next);
+      path.push(next);
+      dfs(next, visited, path);
+      path.pop();
+      visited.delete(next);
+      if (bestChainPath.length >= allChains.length) return;
+    }
+  }
+
+  dfs(seedChain, new Set([seedChain]), [seedChain]);
+  console.log(`[chain-first] Phase 1 result: ${bestChainPath.length}-chain path: ${bestChainPath.join(' → ')}`);
+
+  if (bestChainPath.length < 2) return null;
+
+  // Phase 2: For each hop, pick a random asset pair and check conditions.
+  const resultAssets = [];
+  let prevChosenToAsset = null;
+
+  for (let i = 0; i < bestChainPath.length - 1; i++) {
+    const fromChain = bestChainPath[i];
+    const toChain = bestChainPath[i + 1];
+    const pairKey = `${fromChain}::${toChain}`;
+    let candidates = chainPairs.get(pairKey) || [];
+
+    // Chain continuity: narrow to pairs starting from previous hop's output
+    if (prevChosenToAsset) {
+      const exact = candidates.filter(c => c.fromAsset === prevChosenToAsset);
+      if (exact.length) candidates = exact;
+    }
+
+    // Random selection: shuffle then iterate
+    shuffleArray(candidates);
+
+    // Gas check for destination chain
+    const destGas = gasBalances.get(toChain);
+    const destGasBig = toComparableBigInt(destGas);
+    const destHasGas = destGas === undefined || (destGasBig !== null && destGasBig >= MIN_GAS_WEI);
+
+    // If dest has no gas, find a Garden-supported native gas token on that chain
+    let nativeGasAssetId = null;
+    if (!destHasGas) {
+      const nativeAsset = findNativeGasAssetOnChain(toChain, supportedAssets, adj);
+      if (nativeAsset) {
+        nativeGasAssetId = nativeAsset;
+        console.log(`[chain-first]   ${toChain}: no gas — will substitute dest to native ${nativeGasAssetId}`);
+      }
+    }
+
+    let pick = null;
+    for (const c of candidates) {
+      // Check: skip pairs with 0% historical success (3+ attempts, all failed)
+      const stat = pairStats?.get(`${c.fromAsset}::${c.toAsset}`);
+      if (stat) {
+        const total = Number(stat.successes || 0) + Number(stat.failures || 0);
+        if (total >= 3 && Number(stat.successes || 0) === 0) continue;
+      }
+
+      // Gas substitution: if dest has no gas and native token is supported,
+      // check if there's a pair from this source to the native token instead
+      if (nativeGasAssetId && c.toAsset !== nativeGasAssetId) {
+        const nativeEdge = (adj.get(c.fromAsset) || []).find(e => e.toAssetId === nativeGasAssetId);
+        if (nativeEdge) {
+          pick = { fromAsset: c.fromAsset, toAsset: nativeGasAssetId, route: nativeEdge.route, _gasSubstituted: true };
+          console.log(`[chain-first]   ${fromChain} → ${toChain}: substituted ${c.toAsset} → ${nativeGasAssetId} (gas delivery)`);
+          break;
+        }
+      }
+
+      pick = c;
+      break;
+    }
+
+    // Fallback: if all failed checks, pick first candidate anyway
+    if (!pick && candidates.length) pick = candidates[0];
+
+    if (!pick) {
+      console.log(`[chain-first] Phase 2: no asset pair for ${fromChain} → ${toChain} — chain path broken`);
+      break;
+    }
+
+    resultAssets.push(pick.fromAsset);
+    prevChosenToAsset = pick.toAsset;
+
+    if (i === bestChainPath.length - 2) {
+      resultAssets.push(pick.toAsset);
+    }
+  }
+
+  if (resultAssets.length < 2) return null;
+
+  console.log(`[chain-first] Phase 2 result: ${resultAssets.length}-asset path across ${bestChainPath.length} chains`);
+  return { assets: resultAssets, score: 0, gasEstimate: estimatePathGas(resultAssets, gasBalances, memory) };
+}
+
+/**
+ * Find a Garden-supported native gas token on a given chain.
+ * Returns the asset ID if found, null otherwise.
+ */
+function findNativeGasAssetOnChain(chainKey, supportedAssets, adj) {
+  const nativeTickers = new Set(['eth', 'bnb', 'bera', 'mon', 'core', 'btc', 'cbtc', 'btcn', 'trx', 'sol']);
+  for (const a of supportedAssets) {
+    const ac = getChainRouteStepKey(a.id || '');
+    if (ac !== chainKey) continue;
+    const ticker = ((a.asset || a.ticker || a.id?.split(':')[1]) || '').toLowerCase();
+    const isNative = a.is_native || a.isNative ||
+      (a.token_address || a.tokenAddress || '') === 'native' ||
+      (a.token_address || a.tokenAddress || '') === '0x0000000000000000000000000000000000000000' ||
+      nativeTickers.has(ticker);
+    if (!isNative) continue;
+    // Verify this asset is actually in the adjacency graph (Garden supports swaps to it)
+    for (const [, edges] of adj.entries()) {
+      if (edges.some(e => e.toAssetId === a.id)) return a.id;
+    }
+  }
+  return null;
 }
 
 /** Ring walk on sorted chain list: from source at index i, visit (i+1)…(i+n−1) mod n — matches a₁→⋯→aₙ→a₁. */
@@ -361,10 +608,32 @@ function buildChainReactionFlow(routes, opts = {}) {
 
   if (!connected.length) return { chains: [], standalone: [], allRoutes: [], seedAssets: [] };
 
+  const allChainKeysFromAPI = [...new Set(
+    connected.flatMap(r => [getChainRouteStepKey(r.fromAsset), getChainRouteStepKey(r.toAsset)])
+  )];
+  const chainCount = allChainKeysFromAPI.length;
+  // Scale depth and width to the number of available chains so no chain is lost to fixed limits
+  const dynamicMaxDepth = Math.max(MAX_DEPTH, chainCount + 2);
+  const dynamicBeamWidth = Math.max(BEAM_WIDTH, chainCount);
+  console.log(`[DEBUG] All chains from API: ${allChainKeysFromAPI.sort()} (${chainCount} chains, ${connected.length} routes) — beam: width=${dynamicBeamWidth} depth=${dynamicMaxDepth}`);
+
   const adj = new Map();
   for (const r of connected) {
     if (!adj.has(r.fromAsset)) adj.set(r.fromAsset, []);
     adj.get(r.fromAsset).push({ toAssetId: r.toAsset, route: r });
+  }
+
+  // Build a deduplicated asset list from route metadata for native gas token lookups
+  const seenAssetIds = new Set();
+  const supportedAssets = [];
+  for (const r of connected) {
+    for (const meta of [r.fromMeta, r.toMeta]) {
+      if (!meta) continue;
+      const id = meta.id || meta.asset_id || r.fromAsset;
+      if (seenAssetIds.has(id)) continue;
+      seenAssetIds.add(id);
+      supportedAssets.push(meta);
+    }
   }
 
   const pairStats = memory?.getAllPairStats?.() || null;
@@ -400,72 +669,182 @@ function buildChainReactionFlow(routes, opts = {}) {
     : seedAssets;
 
   let seedsForBeam = candidateSeeds.length > 0 ? candidateSeeds : seedAssets;
-  if (opts.seedOrderMode === "allAssets" && seedsForBeam.length) {
-    seedsForBeam = orderSeedsCyclicAllAssets(seedsForBeam);
-  } else if (opts.seedOrderMode === "chains" && seedsForBeam.length) {
-    seedsForBeam = orderSeedsCyclicByChain(seedsForBeam);
+
+  // BFS: transitive chain reachability from a starting asset through a given adj graph
+  function transitiveChainReach(startAssetId, adjGraph) {
+    const visited = new Set();
+    const reachableChains = new Set();
+    const queue = [startAssetId];
+    visited.add(startAssetId);
+    reachableChains.add(getChainRouteStepKey(startAssetId));
+    while (queue.length) {
+      const cur = queue.shift();
+      for (const edge of (adjGraph.get(cur) || [])) {
+        reachableChains.add(getChainRouteStepKey(edge.toAssetId));
+        if (!visited.has(edge.toAssetId)) {
+          visited.add(edge.toAssetId);
+          queue.push(edge.toAssetId);
+        }
+      }
+    }
+    return reachableChains;
+  }
+
+  /**
+   * Pick the best seed for a cluster: max transitive reach within the cluster adj,
+   * fee-eligible, random raffle among ties.
+   */
+  function pickSeedForCluster(pool, clusterAdj) {
+    if (!pool.length) return null;
+    const scored = pool.map((s) => {
+      const reach = transitiveChainReach(s.assetId, clusterAdj);
+      const nHops = Math.max(0, reach.size - 1);
+      const required = nHops > 0
+        ? BigInt(Math.ceil(s.minAmt * Math.pow(1 / (1 - 0.0035), nHops)))
+        : BigInt(s.minAmt);
+      const bal = toComparableBigInt(s.balance);
+      const feeOk = bal !== null && bal >= required;
+      return { seed: s, reachCount: reach.size, nHops, feeOk };
+    });
+    const maxReach = Math.max(...scored.map((s) => s.reachCount));
+    const best = scored.filter((s) => s.reachCount === maxReach && s.feeOk);
+    const fallback = !best.length ? scored.filter((s) => s.reachCount === maxReach) : [];
+    const finalPool = best.length ? best : (fallback.length ? fallback : scored);
+    const pick = finalPool[Math.floor(Math.random() * finalPool.length)];
+    return pick ? pick.seed : null;
   }
 
   const chains = [];
   const usedDestinations = new Set();
-  for (const seed of seedsForBeam) {
-    const path = beamSearchPath(seed.assetId, adj, {
-      usedDestinations,
-      pairStats,
-      gasBalances,
-      memory,
-      chainRoutesUniqueChains: opts.chainRoutesUniqueChains === true,
-    });
-    if (!path || path.assets.length < 2) continue;
 
-    for (let i = 1; i < path.assets.length; i++) usedDestinations.add(path.assets[i]);
+  if (opts.singleSeed) {
+    // allChains: detect isolation clusters, run one cycle per cluster.
+    // Each cluster gets its own seed + own chainFirstPath, so assets stay varied
+    // within a cluster instead of being forced to WBTC at every isolation boundary.
+    const clusters = detectIsolationClusters(adj, allChainKeysFromAPI);
+    console.log(`[DEBUG] Detected ${clusters.length} isolation cluster(s):`,
+      clusters.map(c => `[${[...c].sort().join(', ')}]`).join(' | '));
 
-    const routesForPath = [];
-    for (let i = 0; i < path.assets.length - 1; i++) {
-      const from = path.assets[i];
-      const to = path.assets[i + 1];
-      const edge = (adj.get(from) || []).find((e) => e.toAssetId === to);
-      if (edge) routesForPath.push(edge.route);
-    }
-    if (!routesForPath.length) continue;
+    for (const cluster of clusters) {
+      const clusterAdj = filterAdjToChains(adj, cluster);
+      const clusterPool = (candidateSeeds.length ? candidateSeeds : seedAssets)
+        .filter(s => cluster.has(getChainRouteStepKey(s.assetId)));
 
-    const startAsset = seed.assetId;
-    const lastAsset = path.assets[path.assets.length - 1];
-    /**
-     * X = first hop after seed. Cycle close is only last→X (Q→X). Asset list becomes S1→…→Q→X
-     * (terminal asset is X again). No last→seed (Q→S1) fallback.
-     */
-    const firstHopDest = path.assets.length >= 2 ? path.assets[1] : null;
+      const seed = pickSeedForCluster(clusterPool, clusterAdj);
+      if (!seed) {
+        console.log(`[chain-first] Cluster [${[...cluster].sort().join(', ')}]: no funded seed — skipping`);
+        continue;
+      }
+      console.log(`[chain-first] Cluster [${[...cluster].sort().join(', ')}]: seed=${seed.assetId}`);
 
-    let closedOk = false;
-    let lastGasFail = null;
-    if (closeCycle && firstHopDest && firstHopDest !== lastAsset) {
-      const closingEdge = (adj.get(lastAsset) || []).find((e) => e.toAssetId === firstHopDest);
-      if (closingEdge) {
-        const closedAssets = [...path.assets, firstHopDest];
-        const gas = estimatePathGas(closedAssets, gasBalances, memory);
-        if (gas.feasible) {
-          path.assets = closedAssets;
-          routesForPath.push(closingEdge.route);
-          closedOk = true;
-        } else {
-          lastGasFail = { gas, closedAssetsLen: closedAssets.length };
+      let path = chainFirstPath(seed.assetId, clusterAdj, {
+        usedDestinations,
+        pairStats,
+        gasBalances,
+        memory,
+        supportedAssets,
+      });
+      if (!path || path.assets.length < 2) {
+        path = beamSearchPath(seed.assetId, clusterAdj, {
+          usedDestinations,
+          gasBalances,
+          memory,
+          chainRoutesUniqueChains: true,
+          maxDepth: Math.max(MAX_DEPTH, cluster.size + 2),
+          beamWidth: Math.max(BEAM_WIDTH, cluster.size),
+        });
+      }
+      if (!path || path.assets.length < 2) continue;
+
+      for (let i = 1; i < path.assets.length; i++) usedDestinations.add(path.assets[i]);
+
+      const routesForPath = [];
+      for (let i = 0; i < path.assets.length - 1; i++) {
+        const from = path.assets[i];
+        const to = path.assets[i + 1];
+        const edge = (clusterAdj.get(from) || []).find((e) => e.toAssetId === to);
+        if (edge) routesForPath.push(edge.route);
+      }
+      if (!routesForPath.length) continue;
+
+      // Close cycle: last asset → seed
+      const lastAsset = path.assets[path.assets.length - 1];
+      if (closeCycle && lastAsset !== seed.assetId) {
+        const closingEdge = (clusterAdj.get(lastAsset) || []).find((e) => e.toAssetId === seed.assetId);
+        if (closingEdge) {
+          const closedAssets = [...path.assets, seed.assetId];
+          const gas = estimatePathGas(closedAssets, gasBalances, memory);
+          if (gas.feasible) {
+            path.assets = closedAssets;
+            routesForPath.push(closingEdge.route);
+          }
         }
       }
+
+      chains.push({
+        startAsset: seed.assetId,
+        seedBalance: seed.balance,
+        assets: path.assets,
+        routes: routesForPath,
+        length: routesForPath.length,
+        pathScore: 0,
+        gasEstimate: estimatePathGas(path.assets, gasBalances, memory),
+      });
+    }
+  } else {
+    // allTests / other modes: use existing seed ordering + beam search
+    if (opts.seedOrderMode === "allAssets" && seedsForBeam.length) {
+      seedsForBeam = orderSeedsCyclicAllAssets(seedsForBeam);
+    } else if (opts.seedOrderMode === "chains" && seedsForBeam.length) {
+      seedsForBeam = orderSeedsCyclicByChain(seedsForBeam);
     }
 
-    if (closeCycle && !closedOk && lastGasFail) {
-    }
+    for (const seed of seedsForBeam) {
+      const path = beamSearchPath(seed.assetId, adj, {
+        usedDestinations,
+        gasBalances,
+        memory,
+        chainRoutesUniqueChains: opts.chainRoutesUniqueChains === true,
+        maxDepth: opts.beamDepth != null ? Number(opts.beamDepth) : dynamicMaxDepth,
+        beamWidth: dynamicBeamWidth,
+      });
+      if (!path || path.assets.length < 2) continue;
 
-    chains.push({
-      startAsset: seed.assetId,
-      seedBalance: seed.balance,
-      assets: path.assets,
-      routes: routesForPath,
-      length: routesForPath.length,
-      pathScore: path.score,
-      gasEstimate: estimatePathGas(path.assets, gasBalances, memory),
-    });
+      for (let i = 1; i < path.assets.length; i++) usedDestinations.add(path.assets[i]);
+
+      const routesForPath = [];
+      for (let i = 0; i < path.assets.length - 1; i++) {
+        const from = path.assets[i];
+        const to = path.assets[i + 1];
+        const edge = (adj.get(from) || []).find((e) => e.toAssetId === to);
+        if (edge) routesForPath.push(edge.route);
+      }
+      if (!routesForPath.length) continue;
+
+      const lastAsset = path.assets[path.assets.length - 1];
+      const closeTarget = path.assets.length >= 2 ? path.assets[1] : null;
+      if (closeCycle && closeTarget && closeTarget !== lastAsset) {
+        const closingEdge = (adj.get(lastAsset) || []).find((e) => e.toAssetId === closeTarget);
+        if (closingEdge) {
+          const closedAssets = [...path.assets, closeTarget];
+          const gas = estimatePathGas(closedAssets, gasBalances, memory);
+          if (gas.feasible) {
+            path.assets = closedAssets;
+            routesForPath.push(closingEdge.route);
+          }
+        }
+      }
+
+      chains.push({
+        startAsset: seed.assetId,
+        seedBalance: seed.balance,
+        assets: path.assets,
+        routes: routesForPath,
+        length: routesForPath.length,
+        pathScore: 0,
+        gasEstimate: estimatePathGas(path.assets, gasBalances, memory),
+      });
+    }
   }
 
   if (
@@ -480,12 +859,9 @@ function buildChainReactionFlow(routes, opts = {}) {
     for (const seed of seedsForBeam) {
       const neighbors = adj.get(seed.assetId) || [];
       if (!neighbors.length) continue;
-      const sorted = [...neighbors].sort(
-        (a, b) =>
-          scoreHop(seed.assetId, b.toAssetId, pairStats) -
-          scoreHop(seed.assetId, a.toAssetId, pairStats)
-      );
-      for (const edge of sorted) {
+      const shuffled = [...neighbors];
+      shuffleArray(shuffled);
+      for (const edge of shuffled) {
         if (usedDestinations.has(edge.toAssetId)) continue;
         const assets = [seed.assetId, edge.toAssetId];
         const gas = estimatePathGas(assets, gasBalances, memory);
@@ -497,11 +873,104 @@ function buildChainReactionFlow(routes, opts = {}) {
           assets,
           routes: [edge.route],
           length: 1,
-          pathScore: scoreHop(seed.assetId, edge.toAssetId, pairStats),
+          pathScore: 0,
           gasEstimate: gas,
         });
         break;
       }
+    }
+  }
+
+  let beamChainKeys = [...new Set(
+    chains.flatMap(c => c.routes.flatMap(r => [getChainRouteStepKey(r.fromAsset), getChainRouteStepKey(r.toAsset)]))
+  )];
+  let excludedChains = allChainKeysFromAPI.filter(ck => !beamChainKeys.includes(ck));
+  console.log("[DEBUG] Beam included chains:", beamChainKeys.sort(), `(${beamChainKeys.length}/${allChainKeysFromAPI.length})`);
+  if (excludedChains.length) console.log("[DEBUG] Beam EXCLUDED chains:", excludedChains.sort(), "— attempting island recovery");
+
+  // Safety net: recover any chains still not covered (e.g. cluster detection missed them).
+  // Uses chainFirstPath on the unreached-chain sub-graph with a local seed.
+  if (excludedChains.length && opts.singleSeed) {
+    const reachedChainSet = new Set(beamChainKeys);
+    const unreachedSet = new Set(excludedChains);
+
+    // Group unreached chains into their own mini-clusters
+    const unreachedAdj = filterAdjToChains(adj, unreachedSet);
+    const unreachedSeeds = seedAssets.filter(s => unreachedSet.has(getChainRouteStepKey(s.assetId)));
+
+    for (const islandSeed of unreachedSeeds) {
+      if (reachedChainSet.has(getChainRouteStepKey(islandSeed.assetId))) continue;
+
+      let islandPath = chainFirstPath(islandSeed.assetId, unreachedAdj, {
+        usedDestinations, pairStats, gasBalances, memory, supportedAssets,
+      });
+      if (!islandPath || islandPath.assets.length < 2) {
+        islandPath = beamSearchPath(islandSeed.assetId, unreachedAdj, {
+          usedDestinations, gasBalances, memory,
+          chainRoutesUniqueChains: true,
+          maxDepth: Math.max(MAX_DEPTH, unreachedSet.size + 2),
+          beamWidth: Math.max(BEAM_WIDTH, unreachedSet.size),
+        });
+      }
+      if (!islandPath || islandPath.assets.length < 2) continue;
+
+      for (let i = 1; i < islandPath.assets.length; i++) usedDestinations.add(islandPath.assets[i]);
+
+      const islandRoutes = [];
+      for (let i = 0; i < islandPath.assets.length - 1; i++) {
+        const from = islandPath.assets[i];
+        const to = islandPath.assets[i + 1];
+        const edge = (unreachedAdj.get(from) || adj.get(from) || []).find(e => e.toAssetId === to);
+        if (edge) islandRoutes.push(edge.route);
+      }
+      if (!islandRoutes.length) continue;
+
+      // Close cycle back to seed
+      const lastAsset = islandPath.assets[islandPath.assets.length - 1];
+      if (closeCycle && lastAsset !== islandSeed.assetId) {
+        const closingEdge = (unreachedAdj.get(lastAsset) || []).find(e => e.toAssetId === islandSeed.assetId);
+        if (closingEdge) {
+          const closedAssets = [...islandPath.assets, islandSeed.assetId];
+          const gas = estimatePathGas(closedAssets, gasBalances, memory);
+          if (gas.feasible) {
+            islandPath.assets = closedAssets;
+            islandRoutes.push(closingEdge.route);
+          }
+        }
+      }
+
+      chains.push({
+        startAsset: islandSeed.assetId,
+        seedBalance: islandSeed.balance,
+        assets: islandPath.assets,
+        routes: islandRoutes,
+        length: islandRoutes.length,
+        pathScore: 0,
+        gasEstimate: estimatePathGas(islandPath.assets, gasBalances, memory),
+        _islandRecovery: true,
+      });
+      console.log(`[DEBUG] Island recovery: found ${islandPath.assets.length}-node path from ${islandSeed.assetId} covering ${[...new Set(islandPath.assets.map(a => getChainRouteStepKey(a)))].join(', ')}`);
+
+      for (const a of islandPath.assets) reachedChainSet.add(getChainRouteStepKey(a));
+    }
+    beamChainKeys = [...reachedChainSet];
+    excludedChains = allChainKeysFromAPI.filter(ck => !reachedChainSet.has(ck));
+    if (excludedChains.length) {
+      for (const ck of excludedChains) {
+        const hasOutgoing = connected.some(r => getChainRouteStepKey(r.fromAsset) === ck);
+        const hasIncoming = connected.some(r => getChainRouteStepKey(r.toAsset) === ck);
+        const hasFundedSeed = seedAssets.some(s => getChainRouteStepKey(s.assetId) === ck);
+        const connectedTo = [...new Set(connected.filter(r => getChainRouteStepKey(r.fromAsset) === ck).map(r => getChainRouteStepKey(r.toAsset)))];
+        const connectedFrom = [...new Set(connected.filter(r => getChainRouteStepKey(r.toAsset) === ck).map(r => getChainRouteStepKey(r.fromAsset)))];
+        const reason = !hasOutgoing && !hasIncoming
+          ? 'Layer 1: no swap pairs from Garden API for this chain'
+          : !hasFundedSeed && !hasIncoming
+            ? 'Layer 2: has outgoing pairs but no funded seed and no incoming pairs from reachable chains'
+            : 'Layer 3: has pairs but forms disconnected island — no path from any funded seed reaches it';
+        console.log(`[DEBUG]   ${ck}: ${reason} (outgoing→[${connectedTo.join(',')}] incoming←[${connectedFrom.join(',')}] funded=${hasFundedSeed})`);
+      }
+    } else {
+      console.log("[DEBUG] Island recovery successful — all chains now covered");
     }
   }
 
@@ -513,9 +982,8 @@ function buildChainReactionFlow(routes, opts = {}) {
   const standalone = connected.filter((r) =>
     !usedEdges.has(`${r.fromAsset}::${r.toAsset}`) && !usedDestinations.has(r.toAsset)
   );
-  const scoredStandalone = standalone
-    .map((route) => ({ route, score: scoreHop(route.fromAsset, route.toAsset, pairStats) }))
-    .sort((a, b) => b.score - a.score);
+  const shuffledStandalone = [...standalone];
+  shuffleArray(shuffledStandalone);
 
   const allRoutes = [];
   chains.forEach((c, chainIndex) => {
@@ -530,9 +998,11 @@ function buildChainReactionFlow(routes, opts = {}) {
       });
     });
   });
-  scoredStandalone.forEach((s) => allRoutes.push(s.route));
+  if (!opts.excludeStandalone) {
+    shuffledStandalone.forEach((r) => allRoutes.push(r));
+  }
 
-  return { chains, standalone: scoredStandalone.map((s) => s.route), allRoutes, seedAssets };
+  return { chains, standalone: shuffledStandalone, allRoutes, seedAssets };
 }
 
 /** Same connected-route filter as getRouteReadiness — must match for a single flow build in run(). */
@@ -615,27 +1085,15 @@ function pickBestLiquidRouteAmong(
   balances,
   gasBalances,
   connectedRoutes,
-  pairStats,
-  pickOpts = {}
+  _pairStats,
+  _pickOpts = {}
 ) {
   if (!candidates?.length) return null;
   const ok = candidates.filter((r) =>
     isSourceLiquidForRoute(r.fromAsset, balances, gasBalances, connectedRoutes)
   );
   if (!ok.length) return null;
-  const fromChainKey = pickOpts.fromChainKey || "";
-  const bitcoinSource =
-    /^bitcoin/.test(String(fromChainKey)) &&
-    allTestsRandomBitcoinDestEnabled() &&
-    ok.length > 1;
-  if (bitcoinSource) {
-    return ok[Math.floor(Math.random() * ok.length)];
-  }
-  ok.sort(
-    (a, b) =>
-      scoreHop(b.fromAsset, b.toAsset, pairStats) - scoreHop(a.fromAsset, a.toAsset, pairStats)
-  );
-  return ok[0];
+  return ok[Math.floor(Math.random() * ok.length)];
 }
 
 /**
@@ -747,7 +1205,7 @@ function mergeRoutesDedupe(matrixPrefix, restRoutes) {
  * allChains: one source chain → at most N−1 hops (one per other chain). No N×(N−1) aggregate.
  * Picks the chain with the most catalog coverage; rows + representativeRoutes are for that fan-out only.
  */
-function computeChainPairMatrix(connectedRoutes, pairStats, sufficientByFromAsset) {
+function computeChainPairMatrix(connectedRoutes, _pairStats, sufficientByFromAsset) {
   const chainSet = new Set();
   for (const r of connectedRoutes) {
     chainSet.add(getChainRouteStepKey(r.fromAsset));
@@ -763,10 +1221,8 @@ function computeChainPairMatrix(connectedRoutes, pairStats, sufficientByFromAsse
     const tc = getChainRouteStepKey(r.toAsset);
     if (fc === tc) continue;
     const key = `${fc}::${tc}`;
-    const sc = scoreHop(r.fromAsset, r.toAsset, pairStats);
-    const prev = byPairBest.get(key);
-    if (!prev || sc > prev.score) {
-      byPairBest.set(key, { route: r, score: sc });
+    if (!byPairBest.has(key) || Math.random() < 0.5) {
+      byPairBest.set(key, { route: r });
     }
   }
 
@@ -868,32 +1324,6 @@ function computeChainPairMatrix(connectedRoutes, pairStats, sufficientByFromAsse
   };
 }
 
-/** Round-robin order by source chain prefix so allChains does not run every (bitcoin→*) hop before other sources. */
-function interleaveRepresentativeRoutesByFromChain(routes) {
-  if (!routes?.length) return [];
-  const byChain = new Map();
-  for (const r of routes) {
-    const k = getChainRouteStepKey(r.fromAsset);
-    if (!byChain.has(k)) byChain.set(k, []);
-    byChain.get(k).push(r);
-  }
-  const keys = [...byChain.keys()].sort();
-  const out = [];
-  let round = 0;
-  for (;;) {
-    let added = false;
-    for (const k of keys) {
-      const arr = byChain.get(k);
-      if (round < arr.length) {
-        out.push(arr[round]);
-        added = true;
-      }
-    }
-    if (!added) break;
-    round++;
-  }
-  return out;
-}
 
 function planFromAllRoutes(allRoutes, opts = {}) {
   const maxTotal = Number.isFinite(opts.maxTotal) ? opts.maxTotal : 120;
@@ -990,7 +1420,9 @@ function getRouteReadiness(routes, opts = {}) {
         memory,
         seedAllowlist: opts.seedAllowlist || null,
         chainRoutesUniqueChains: opts.mode === "allChains",
-        seedOrderMode: opts.mode === "allChains" ? "chains" : "allAssets",
+        seedOrderMode: "allAssets",
+        singleSeed: opts.mode === "allChains",
+        excludeStandalone: opts.mode === "allChains",
       }).chains;
 
   const chainStartAssets = new Set(chains.map((c) => c.startAsset));
@@ -1001,42 +1433,66 @@ function getRouteReadiness(routes, opts = {}) {
     }
   }
   // Sequential chain funding profile:
-  // tracks how much funding is still required at each hop when propagating
-  // from the chain start asset depth-by-depth.
+  // For allChains mode each hop is funded by the previous hop's output (in a
+  // different denomination), so the seed only needs to cover the FIRST hop.
+  // For other modes the cumulative sum approach is still used.
+  const isAllChains = opts.mode === "allChains";
   const chainFundingProfile = new Map();
   for (let chainIndex = 0; chainIndex < chains.length; chainIndex++) {
     const chain = chains[chainIndex];
     const routeAmounts = (chain.routes || []).map((r) => toComparableBigInt(r.amount || r.fromMeta?.min_amount || 50000) || 0n);
     const startBalanceRaw = balances.has(chain.startAsset) ? balances.get(chain.startAsset) : null;
     const startBalanceBig = startBalanceRaw === null ? null : (toComparableBigInt(startBalanceRaw) || 0n);
-    const prefixSpentByDepth = [0n];
-    for (let i = 0; i < routeAmounts.length; i++) {
-      prefixSpentByDepth.push(prefixSpentByDepth[i] + routeAmounts[i]);
-    }
-    const suffixNeedByDepth = new Array((chain.assets || []).length).fill(0n);
-    for (let depth = 0; depth < (chain.assets || []).length; depth++) {
-      let rem = 0n;
-      for (let j = depth; j < routeAmounts.length; j++) rem += routeAmounts[j];
-      suffixNeedByDepth[depth] = rem;
-    }
-    for (let depth = 0; depth < (chain.assets || []).length; depth++) {
-      const assetId = chain.assets[depth];
-      const remainingRequired = suffixNeedByDepth[depth] || 0n;
-      const spentBefore = prefixSpentByDepth[depth] || 0n;
-      const availableAtDepth = startBalanceBig === null
-        ? null
-        : (startBalanceBig > spentBefore ? (startBalanceBig - spentBefore) : 0n);
-      const needMore = availableAtDepth === null
-        ? remainingRequired
-        : (remainingRequired > availableAtDepth ? (remainingRequired - availableAtDepth) : 0n);
-      chainFundingProfile.set(assetId, {
-        chainIndex,
-        depth,
-        remainingRequired,
-        availableAtDepth,
-        needMore,
-        unknown: availableAtDepth === null,
-      });
+
+    if (isAllChains) {
+      for (let depth = 0; depth < (chain.assets || []).length; depth++) {
+        const assetId = chain.assets[depth];
+        const remainingRequired = depth === 0 ? (routeAmounts[0] || 0n) : 0n;
+        const availableAtDepth = depth === 0 ? startBalanceBig : null;
+        const needMore = (availableAtDepth === null && depth === 0)
+          ? remainingRequired
+          : (depth === 0 && availableAtDepth !== null
+            ? (remainingRequired > availableAtDepth ? (remainingRequired - availableAtDepth) : 0n)
+            : 0n);
+        chainFundingProfile.set(assetId, {
+          chainIndex,
+          depth,
+          remainingRequired,
+          availableAtDepth,
+          needMore,
+          unknown: depth === 0 && availableAtDepth === null,
+        });
+      }
+    } else {
+      const prefixSpentByDepth = [0n];
+      for (let i = 0; i < routeAmounts.length; i++) {
+        prefixSpentByDepth.push(prefixSpentByDepth[i] + routeAmounts[i]);
+      }
+      const suffixNeedByDepth = new Array((chain.assets || []).length).fill(0n);
+      for (let depth = 0; depth < (chain.assets || []).length; depth++) {
+        let rem = 0n;
+        for (let j = depth; j < routeAmounts.length; j++) rem += routeAmounts[j];
+        suffixNeedByDepth[depth] = rem;
+      }
+      for (let depth = 0; depth < (chain.assets || []).length; depth++) {
+        const assetId = chain.assets[depth];
+        const remainingRequired = suffixNeedByDepth[depth] || 0n;
+        const spentBefore = prefixSpentByDepth[depth] || 0n;
+        const availableAtDepth = startBalanceBig === null
+          ? null
+          : (startBalanceBig > spentBefore ? (startBalanceBig - spentBefore) : 0n);
+        const needMore = availableAtDepth === null
+          ? remainingRequired
+          : (remainingRequired > availableAtDepth ? (remainingRequired - availableAtDepth) : 0n);
+        chainFundingProfile.set(assetId, {
+          chainIndex,
+          depth,
+          remainingRequired,
+          availableAtDepth,
+          needMore,
+          unknown: availableAtDepth === null,
+        });
+      }
     }
   }
   const bySource = new Map();
@@ -1069,12 +1525,12 @@ function getRouteReadiness(routes, opts = {}) {
   let fundedSeedCount = 0;
 
   for (const [assetId, info] of bySource) {
+    const isChainFundedSource = chainFundedSourceAssets.has(assetId);
     const routeCount = info.isChainStart
       ? (chains[info.chainIndex]?.routes.length || info.routes.length)
-      : info.routes.length;
+      : (opts.mode === "allChains" && !isChainFundedSource ? 1 : info.routes.length);
     totalRoutes += routeCount;
     const balance = balances.has(assetId) ? balances.get(assetId) : null;
-    const isChainFundedSource = chainFundedSourceAssets.has(assetId);
     const flowFunding = chainFundingProfile.get(assetId) || null;
     const requiredPerRoute = info.isChainStart
       ? info.minAmount
@@ -1354,7 +1810,9 @@ class RouteOptimizerAgent {
       memory: this.memory,
       seedAllowlist,
       chainRoutesUniqueChains: mode === "allChains",
-      seedOrderMode: mode === "allChains" ? "chains" : "allAssets",
+      seedOrderMode: "allAssets",
+      singleSeed: mode === "allChains",
+      excludeStandalone: mode === "allChains",
       closeCycle,
     });
 
@@ -1389,11 +1847,12 @@ class RouteOptimizerAgent {
       Math.max(160, chainDim * chainDim + matrixPrefix.length + 100)
     );
 
-    let routesForPlan = flow.allRoutes;
+    let routesForPlan;
     if (mode === "allChains") {
-      const matrix = computeChainPairMatrix(connectedRoutes, pairStats, null);
-      const interleaved = interleaveRepresentativeRoutesByFromChain(matrix.representativeRoutes);
-      routesForPlan = mergeRoutesDedupe(matrixPrefix, [...interleaved, ...flow.allRoutes]);
+      // allChains: plan = single-seed beam path only (all routes have _chainStart).
+      // Matrix routes are for display stats (chainPairMatrix) only — they don't execute.
+      // This ensures the displayed plan matches what runner.js actually fires.
+      routesForPlan = flow.allRoutes;
     } else {
       routesForPlan = mergeRoutesDedupe(matrixPrefix, flow.allRoutes);
     }
@@ -1442,6 +1901,8 @@ class RouteOptimizerAgent {
       plan: linearExecutablePlan,
       readiness,
       chains: readiness.flowChains,
+      // The raffled seed asset — stored by server so /api/run uses the same seed the display showed.
+      chosenSeed: flow.chains[0]?.startAsset || null,
     };
 
     console.log(
