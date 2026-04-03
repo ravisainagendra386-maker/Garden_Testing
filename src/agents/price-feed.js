@@ -10,6 +10,7 @@ const TICKER_ALIASES = {
   pbtc: 'btc',
   bbtc: 'btc',
   dbtc: 'btc',
+  btcn: 'btc',
 };
 
 const COINGECKO_IDS = {
@@ -37,14 +38,16 @@ const COINGECKO_IDS = {
 };
 
 const FALLBACK_PRICES = {
-  btc: 95000, wbtc: 95000, cbtc: 95000, cbbtc: 95000,
-  sbtc: 95000, lbtc: 95000, hbtc: 95000, tbtc: 95000,
-  xbtc: 95000, rbtc: 95000,
-  ibtc: 95000, wcbtc: 95000, pbtc: 95000, bbtc: 95000, dbtc: 95000,
-  eth: 3200, weth: 3200,
+  btc: 67000, wbtc: 67000, cbtc: 67000, cbbtc: 67000,
+  sbtc: 67000, lbtc: 67000, hbtc: 67000, tbtc: 67000,
+  xbtc: 67000, rbtc: 67000,
+  ibtc: 67000, wcbtc: 67000, pbtc: 67000, bbtc: 67000, dbtc: 67000,
+  btcn: 67000,
+  eth: 2060, weth: 2060,
   usdc: 1, usdt: 1, dai: 1,
   bnb: 600, sol: 140, sui: 2,
   trx: 0.12, ltc: 80, strk: 0.5,
+  mon: 0.5, seed: 0.01,
 };
 
 // Decimals per ticker (for atomic → human conversion)
@@ -57,7 +60,7 @@ const TOKEN_DECIMALS = {
 
 let _cache = {};         // ticker → usd
 let _cacheTs = 0;
-const CACHE_TTL = 60000; // 1 min
+const CACHE_TTL = 86_400_000; // 24 hours
 
 async function fetchPrices() {
   const now = Date.now();
@@ -125,5 +128,111 @@ function getDecimals(ticker) {
 // Invalidate cache (force fresh fetch)
 function invalidate() { _cacheTs = 0; }
 
-module.exports = { fetchPrices, getPrice, atomicToUsd, usdToAtomic, getDecimals, invalidate };
+// Convert atomic → USD using explicit decimals (from Garden metadata) instead of hardcoded map
+function atomicToUsdExplicit(atomicAmount, ticker, decimals) {
+  const price = getPrice(ticker);
+  if (!price || decimals === undefined || decimals === null) return 0;
+  return (Number(atomicAmount) / Math.pow(10, Number(decimals))) * price;
+}
+
+// Convert USD → atomic using explicit decimals
+function usdToAtomicExplicit(usd, ticker, decimals) {
+  const price = getPrice(ticker);
+  if (!price || decimals === undefined || decimals === null) return 0;
+  return Math.ceil((usd / price) * Math.pow(10, Number(decimals)));
+}
+
+/**
+ * Compute the required seed amount (atomic) for an allChains cycle.
+ * Uses Garden metadata decimals (fromMeta.decimals, toMeta.decimals) directly
+ * instead of hardcoded TOKEN_DECIMALS.
+ *
+ * @param {Array} chainRoutes - Planned route objects with fromAsset, toAsset, fromMeta, toMeta
+ * @param {Object} [opts]
+ * @param {number} [opts.buffer=0.05]  - Price buffer (5% default) above market
+ * @param {number} [opts.feePerHop=0.0035] - Garden fee per hop (0.35%)
+ */
+function computePriceBasedSeedRequirement(chainRoutes, opts = {}) {
+  const buffer = opts.buffer ?? 0.05;
+  const feePerHop = opts.feePerHop ?? 0.0035;
+  const N = chainRoutes.length;
+  if (!N) return null;
+
+  // For each hop i, the seed value shrinks by (1-fee)^i before reaching that hop.
+  // So the seed must satisfy: seed_usd × (1-fee)^i >= hop_i_min_usd
+  // → seed_usd >= hop_i_min_usd / (1-fee)^i
+  // Required seed = max across all hops of (hop_min_usd / (1-fee)^i) × (1+buffer).
+  const hopBreakdown = [];
+  let maxRequiredUsd = 0;
+  let bottleneckHop = 0;
+
+  for (let i = 0; i < N; i++) {
+    const route = chainRoutes[i];
+    const fromTicker = extractTicker(route.fromAsset || '');
+    const toTicker = extractTicker(route.toAsset || '');
+    const fromDec = Number(route.fromMeta?.decimals ?? getDecimals(fromTicker));
+    const toDec = Number(route.toMeta?.decimals ?? getDecimals(toTicker));
+    const fromMin = Math.max(1, parseInt(String(route.fromMeta?.min_amount ?? 50000), 10) || 50000);
+    const toMin = Math.max(1, parseInt(String(route.toMeta?.min_amount ?? 50000), 10) || 50000);
+    const fromMinUsd = atomicToUsdExplicit(fromMin, fromTicker, fromDec);
+    const toMinUsd = atomicToUsdExplicit(toMin, toTicker, toDec);
+    const hopMinUsd = Math.max(fromMinUsd, toMinUsd);
+
+    // How much seed USD is needed so that after i hops of fees, this hop is still funded
+    const feeDecay = Math.pow(1 - feePerHop, i);
+    const seedNeededForHop = hopMinUsd / feeDecay;
+
+    if (seedNeededForHop > maxRequiredUsd) {
+      maxRequiredUsd = seedNeededForHop;
+      bottleneckHop = i;
+    }
+
+    hopBreakdown.push({
+      hop: i + 1,
+      fromAsset: route.fromAsset,
+      toAsset: route.toAsset,
+      fromTicker, toTicker,
+      fromDec, toDec,
+      fromMinAtomic: fromMin, toMinAtomic: toMin,
+      fromMinUsd: +fromMinUsd.toFixed(4),
+      toMinUsd: +toMinUsd.toFixed(4),
+      hopMinUsd: +hopMinUsd.toFixed(4),
+      feeDecay: +feeDecay.toFixed(6),
+      seedNeededUsd: +seedNeededForHop.toFixed(4),
+    });
+  }
+
+  const requiredUsd = maxRequiredUsd * (1 + buffer);
+
+  const seedTicker = extractTicker(chainRoutes[0].fromAsset || '');
+  const seedDec = Number(chainRoutes[0].fromMeta?.decimals ?? getDecimals(seedTicker));
+  const seedPrice = getPrice(seedTicker);
+  const requiredSeedAtomic = seedPrice > 0
+    ? usdToAtomicExplicit(requiredUsd, seedTicker, seedDec)
+    : 0;
+
+  return {
+    requiredSeedAtomic,
+    requiredSeedUsd: +requiredUsd.toFixed(4),
+    maxHopMinUsd: +(hopBreakdown[bottleneckHop]?.hopMinUsd ?? 0),
+    bottleneckFeeDecay: +(hopBreakdown[bottleneckHop]?.feeDecay ?? 1),
+    hops: N,
+    bottleneckHop,
+    seedTicker,
+    seedDec,
+    seedPriceUsd: seedPrice,
+    hopBreakdown,
+  };
+}
+
+function extractTicker(assetId) {
+  return (assetId || '').split(':').pop()?.toLowerCase() || '';
+}
+
+module.exports = {
+  fetchPrices, getPrice, atomicToUsd, usdToAtomic, getDecimals, invalidate,
+  atomicToUsdExplicit, usdToAtomicExplicit,
+  computePriceBasedSeedRequirement, extractTicker,
+  FALLBACK_PRICES, TOKEN_DECIMALS, TICKER_ALIASES, COINGECKO_IDS,
+};
 

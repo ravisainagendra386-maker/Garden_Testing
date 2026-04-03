@@ -162,6 +162,19 @@
   .empty-state { text-align: center; color: var(--muted); padding: 48px 0; font-size: 13px; }
   .spinner { width: 14px; height: 14px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: spin .7s linear infinite; display: inline-block; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  /* ── TOAST NOTIFICATIONS ── */
+  #toast-container { position: fixed; top: 20px; right: 20px; z-index: 100000; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+  .toast { pointer-events: auto; background: var(--bg2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 18px; font-size: 12px; color: var(--fg); box-shadow: 0 8px 24px rgba(0,0,0,.5); max-width: 380px; animation: toastIn .3s ease-out; line-height: 1.5; }
+  .toast.info { border-color: rgba(96,165,250,.5); }
+  .toast.warn { border-color: rgba(250,204,21,.5); }
+  .toast.error { border-color: rgba(248,113,113,.5); }
+  .toast .toast-title { font-weight: 700; margin-bottom: 4px; }
+  .toast.info .toast-title { color: var(--cyan); }
+  .toast.warn .toast-title { color: var(--yellow); }
+  .toast.error .toast-title { color: var(--red); }
+  .toast.fade-out { animation: toastOut .3s ease-in forwards; }
+  @keyframes toastIn { from { opacity: 0; transform: translateX(40px); } to { opacity: 1; transform: translateX(0); } }
+  @keyframes toastOut { from { opacity: 1; } to { opacity: 0; transform: translateX(40px); } }
   pre { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--muted); }
 
   /* ── COMBO CARDS ── */
@@ -808,8 +821,25 @@
     </div>
   </div>
 </div>
+<div id="toast-container"></div>
 
 <script>
+// ── TOAST HELPER ─────────────────────────────────────────────
+function showToast(title, message, type = 'info', durationMs = 6000) {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.innerHTML = `<div class="toast-title">${title}</div><div>${message}</div>`;
+  container.appendChild(el);
+  const timer = setTimeout(() => {
+    el.classList.add('fade-out');
+    setTimeout(() => el.remove(), 300);
+  }, durationMs);
+  el.onclick = () => { clearTimeout(timer); el.classList.add('fade-out'); setTimeout(() => el.remove(), 300); };
+  return el;
+}
+
 // ── AUTH ──────────────────────────────────────────────────────
 (function() {
   const token = sessionStorage.getItem('dash_token');
@@ -1069,6 +1099,7 @@ function handleTestEnd({ label, status, error, steps }) {
   }
   if (status === 'pass') {
     suiteStats.passed++;
+    invalidateCombos();
   } else if (status === 'fail' || status === 'aborted') {
     suiteStats.failed++;
     if (status === 'fail') {
@@ -1111,6 +1142,7 @@ function handleSuiteAborted(data) {
 }
 
 function handleSuiteEnd(d) {
+  invalidateCombos();
   _hydratedSuitePoll = false;
   stopRunStatusPoll();
   const executed = typeof d.executed === 'number'
@@ -1459,8 +1491,10 @@ function removeIssue(idx) {
 }
 function updateIssueBadge() {
   const badge = document.getElementById('issueCount');
-  badge.textContent = issues.length;
-  badge.style.display = issues.length > 0 ? 'inline' : 'none';
+  const filter = _currentIssueFilter || 'all';
+  const filtered = filter === 'all' ? issues : issues.filter(i => i.type === filter || i.severity === filter);
+  badge.textContent = filtered.length;
+  badge.style.display = filtered.length > 0 ? 'inline' : 'none';
 }
 
 // Track which issues are expanded
@@ -1656,7 +1690,7 @@ function renderIssues(filter = 'all') {
     </div>`;
   }).join('');
 }
-function filterIssues(f) { renderIssues(f); }
+function filterIssues(f) { renderIssues(f); updateIssueBadge(); }
 
 // ── STATS ──
 function updateStats() {
@@ -1674,26 +1708,73 @@ function updateStats() {
 }
 
 // ── ACTIONS ──
+async function _waitForBalances(btn) {
+  if (_evmBalancesReady) return;
+  if (btn) btn.innerHTML = '<span class="spinner"></span> Loading balances…';
+  const start = Date.now();
+  const slowTimer = setTimeout(() => {
+    showToast('Loading balances', 'Wallet balance scan is still running. This happens once after page load and usually takes 5–15 seconds.', 'info', 8000);
+  }, 6000);
+  try {
+    if (_evmBalancePromise) {
+      await Promise.race([_evmBalancePromise, new Promise(r => setTimeout(r, 20000))]);
+    } else if (evmAddress) {
+      const deadline = Date.now() + 20000;
+      while (!_evmBalancesReady && Date.now() < deadline) {
+        if (_evmBalancePromise) { await Promise.race([_evmBalancePromise, new Promise(r => setTimeout(r, 15000))]); break; }
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+  } finally { clearTimeout(slowTimer); }
+  if (!_evmBalancesReady && evmAddress) {
+    showToast('Balance timeout', 'Balance scan did not finish in time. Routes may be incomplete — retrying will usually fix this.', 'warn', 8000);
+  }
+}
+
+async function _fetchReadinessWithRetry(btn, maxAttempts = 3) {
+  const start = Date.now();
+  let slowToast = null;
+  const slowTimer = setTimeout(() => {
+    slowToast = showToast('Building routes', 'The server is fetching prices and computing route readiness. This can take a few seconds on first load.', 'info', 10000);
+  }, 5000);
+
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      if (btn) btn.innerHTML = `<span class="spinner"></span> Building routes${attempt > 1 ? ` (attempt ${attempt})` : ''}…`;
+      const r = await fetch(`/api/route-readiness?mode=${encodeURIComponent(_selectedRunMode)}`);
+      const readiness = await r.json();
+
+      if (readiness.error) return { readiness, ok: false };
+
+      const routeCount = readiness.totalRoutes || readiness.runnableRoutes || (readiness.rawPlannedRoutes || []).length || 0;
+      if (routeCount > 0) return { readiness, ok: true };
+
+      if (attempt < maxAttempts) {
+        if (btn) btn.innerHTML = `<span class="spinner"></span> No routes yet — retrying (${attempt}/${maxAttempts})…`;
+        if (attempt === 1) {
+          showToast('Waiting for routes', 'No routes found yet — the server may still be loading balances or building the route graph. Retrying automatically…', 'info', 5000);
+        }
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+      } else {
+        return { readiness, ok: true };
+      }
+    }
+  } finally { clearTimeout(slowTimer); if (slowToast) { slowToast.classList.add('fade-out'); setTimeout(() => slowToast.remove(), 300); } }
+}
+
 async function runAll() {
   const btn  = document.getElementById('btnRunAll');
   btn.disabled = true;
 
-  // Wait for balance scan to finish before querying readiness
-  if (!_evmBalancesReady && _evmBalancePromise) {
-    btn.innerHTML = '<span class="spinner"></span> Loading balances…';
-    await Promise.race([_evmBalancePromise, new Promise(r => setTimeout(r, 15000))]);
-  }
-
-  btn.innerHTML = '<span class="spinner"></span> Checking readiness…';
+  await _waitForBalances(btn);
 
   try {
-    const r = await fetch(`/api/route-readiness?mode=${encodeURIComponent(_selectedRunMode)}`);
-    const readiness = await r.json();
+    const { readiness, ok } = await _fetchReadinessWithRetry(btn);
     btn.disabled = false;
     btn.innerHTML = '▶ Run All Tests';
 
-    if (readiness.error) {
-      alert('Failed to check readiness: ' + readiness.error);
+    if (!ok) {
+      alert('Failed to check readiness: ' + (readiness?.error || 'unknown error'));
       _launchRunAll();
       return;
     }
@@ -1820,7 +1901,9 @@ function showReadinessModal(readiness) {
     requiredAmountSufficient, requiredAmountSummary, topThreeConditions,
     seedAllowlistSize, builtChains, canInitiate, rawPlannedRoutes, executablePlannedRoutes,
     executablePlanRoutes,
-    consolidation, hasQualifiedChainStart, executablePlanCount, simulation,
+    hasQualifiedChainStart, executablePlanCount, chosenSeed, simulation,
+    requiredSeedAtomic: _serverRequiredSeed, requiredSeedUsd: _serverRequiredUsd,
+    seedHopBreakdown: _serverHopBreakdown, seedCalcInfo: _serverSeedCalc,
   } = readiness;
   const isAllChains = _selectedRunMode === 'allChains';
 
@@ -1844,18 +1927,24 @@ function showReadinessModal(readiness) {
     return paths;
   };
   const mergedFlowPaths = mergeFlowChains(flowChains || []);
-  // Each hop costs 0.35% — seed needs min_amount * (1/(1-0.0035))^N to cover all N hops.
-  // Single-seed model: 1 flowChain with N hops; use flowChains[0].length (hop count), not flowChains.length (always 1).
   const _totalChainHops = Math.max(1, (flowChains || [])[0]?.length ?? (flowChains || []).length);
   const _chainFeeMultiplier = 1 / Math.pow(1 - 0.0035, _totalChainHops);
+
+  // Use server's quote-based required seed if available (accounts for cross-asset min_amounts).
+  // Falls back to simple fee-only formula when quotes weren't available.
+  const _effectiveRequired = (seedId) => {
+    if (_serverRequiredSeed && _serverRequiredSeed > 0) return _serverRequiredSeed;
+    const seedMeta = (assets || []).find(a => String(a.id) === String(seedId));
+    return Math.ceil(Number(seedMeta?.min_amount ?? 50000) * _chainFeeMultiplier);
+  };
+
   const anySeedSufficient = isAllChains && mergedFlowPaths.some(p => {
     const seedId = p.assets?.[0];
     if (!seedId) return false;
     const seedMeta = (assets || []).find(a => String(a.id) === String(seedId));
     if (!seedMeta) return false;
     const bal = typeof seedMeta.balance === 'bigint' ? Number(seedMeta.balance) : Number(seedMeta.balance ?? 0);
-    // Seed must arrive at each hop with at least min_amount after compounded 0.35% fees
-    return bal >= Math.ceil(Number(seedMeta.min_amount ?? 50000) * _chainFeeMultiplier);
+    return bal >= _effectiveRequired(seedId);
   });
 
   // Count categories
@@ -1957,9 +2046,7 @@ function showReadinessModal(readiness) {
     ? '✅ strict gate open (can initiate)'
     : '⛔ strict gate closed (no executable planned routes)';
 
-  const consolidationLine = consolidation?.eligible
-    ? `⚠️ consolidation suggested: ${String(consolidation?.target?.name || consolidation?.target?.id || '')}`.trim()
-    : (consolidation?.reason ? `ℹ️ consolidation: ${String(consolidation.reason)}` : '');
+  const consolidationLine = '';
 
   const effectiveCanRun = isAllChains ? (canRun && anySeedSufficient) : canRun;
   const runBtnStyle = effectiveCanRun
@@ -1968,38 +2055,28 @@ function showReadinessModal(readiness) {
   const runBtnText = 'RUN';
 
   // ── Consolidation UI: always shown in allChains mode ────────────────────────
-  // All assets with any balance (even below min) — candidates to consolidate from
+  // All assets with balance >= Garden min trade size, excluding the seed itself (its balance is added separately)
+  const _chosenSeedId = chosenSeed ? String(chosenSeed) : '';
   const consolidationSources = isAllChains
     ? (assets || []).filter(a => {
+        if (_chosenSeedId && String(a.id) === _chosenSeedId) return false;
         const bal = typeof a.balance === 'bigint' ? Number(a.balance) : Number(a.balance ?? 0);
         const min = Math.max(1, Number(a.min_amount ?? 0));
-        return bal > 0 && bal >= min; // must meet Garden's min trade size to be swappable
+        return bal > 0 && bal >= min;
       })
     : [];
-  // Target candidates: any asset that appears as a chain seed
+  // Target = the route's seed asset (sent by server as chosenSeed)
   const seedIds = new Set(mergedFlowPaths.map(p => p.assets?.[0]).filter(Boolean));
+  if (chosenSeed) seedIds.add(String(chosenSeed));
   const consolidationTargets = (assets || []).filter(a => seedIds.has(String(a.id)));
-  // Auto-pick best target: prefer already-sufficient seed, then most-referenced destination
-  const _normId = id => String(id).replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, '');
-  const bestConsolidationTargetId = (() => {
-    const funded = consolidationTargets.find(a => a.sufficient === true);
-    if (funded) return String(funded.id);
-    const destCounts = new Map();
-    for (const r of (executablePlanRoutes || [])) {
-      const n = _normId(r.toAsset); destCounts.set(n, (destCounts.get(n) || 0) + 1);
-    }
-    let best = null, bestScore = -1;
-    for (const t of consolidationTargets) {
-      const score = destCounts.get(_normId(String(t.id))) || 0;
-      if (score > bestScore) { bestScore = score; best = t; }
-    }
-    return best?.id ? String(best.id) : (consolidationTargets[0]?.id ? String(consolidationTargets[0].id) : '');
-  })();
+  const bestConsolidationTargetId = chosenSeed
+    ? String(chosenSeed)
+    : (consolidationTargets[0]?.id ? String(consolidationTargets[0].id) : '');
 
   const runBypassHtml = (isAllChains && consolidationSources.length)
     ? `<div id="consolidationPanel" data-fee-multiplier="${_chainFeeMultiplier.toFixed(8)}" data-total-hops="${_totalChainHops}" style="margin-top:10px;padding:12px;border:1px solid rgba(234,179,8,.25);border-radius:10px;background:rgba(234,179,8,.04)">
         <div style="font-size:11px;font-weight:700;color:var(--yellow);margin-bottom:8px">⚡ consolidate assets into one seed</div>
-        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;line-height:1.5">Swap partial balances into a single well-funded seed, then run allChains. All assets pre-selected. Gas is checked before each hop.</div>
+        <div style="font-size:10px;color:var(--muted);margin-bottom:10px;line-height:1.5">Select assets to swap into the route seed, then run allChains. Gas is checked before each hop.</div>
 
         <div style="font-size:10px;font-weight:600;margin-bottom:6px">source assets (select to include):</div>
         <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:10px" id="consolidationSourceList">
@@ -2010,7 +2087,7 @@ function showReadinessModal(readiness) {
             const chainStr = String(a.chainRaw || a.chain || '').replace(/_/g,'');
             const label = `${String(a.ticker||'').toUpperCase()} on ${chainStr}`;
             return `<label style="display:flex;align-items:center;gap:8px;cursor:pointer;padding:5px 8px;border-radius:6px;border:1px solid rgba(255,255,255,.08);background:rgba(255,255,255,.03)" data-asset-id="${a.id}">
-              <input type="checkbox" checked data-asset-id="${a.id}" data-balance="${a.balance ?? 0}" data-decimals="${dec}" onchange="_consolidationUpdate()" style="cursor:pointer">
+              <input type="checkbox" data-asset-id="${a.id}" data-balance="${a.balance ?? 0}" data-decimals="${dec}" onchange="_consolidationUpdate()" style="cursor:pointer">
               <span style="font-size:11px;flex:1">${label}</span>
               <span style="font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--muted)">${balStr} <span style="color:rgba(255,255,255,.3)">/ min ${minStr}</span></span>
             </label>`;
@@ -2060,11 +2137,7 @@ function showReadinessModal(readiness) {
           </div>
         </div>
         <div style="flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;padding:16px 24px">
-          ${consolidationLine ? `<div style="padding:8px 12px;border:1px solid rgba(234,179,8,.25);background:rgba(234,179,8,.06);border-radius:10px;margin-bottom:12px;font-size:11px;color:var(--yellow);line-height:1.5">${consolidationLine}</div>` : ''}
-          <div style="font-size:12px;font-weight:700;margin-bottom:10px">wallet balance:</div>
-          <div style="padding-bottom:10px">${walletValidHtml}</div>
-
-          <div style="margin-top:16px;border-top:1px solid rgba(255,255,255,.10);padding-top:12px">
+          <div style="padding-top:4px">
             ${(() => {
               // Build asset-id → decimals lookup from the assets list already in scope
               const assetDecMap = new Map((assets || []).map(a => [String(a.id || ''), Number(a.decimals ?? 8)]));
@@ -2091,8 +2164,19 @@ function showReadinessModal(readiness) {
                   </div>`;
                 };
 
-                // Only paths with funded seed
-                const fundedFlowPaths = mergedFlowPaths.filter(p => {
+                // Check funding using the original (pre-merge) flowChains which carry
+                // startAsset + seedBalance set by the server — the merge can reshuffle
+                // first-asset order, making a re-lookup against assetMetaMap unreliable.
+                const anyChainFunded = (flowChains || []).some(fc => {
+                  if (fc.seedBalance !== null && fc.seedBalance !== undefined && Number(fc.seedBalance) > 0) return true;
+                  const sId = fc.startAsset || (fc.assets && fc.assets[0]);
+                  if (!sId) return false;
+                  const sMeta = assetMetaMap.get(String(sId));
+                  const bal = typeof sMeta?.balance === 'bigint' ? Number(sMeta.balance) : Number(sMeta?.balance ?? 0);
+                  return bal > 0;
+                });
+
+                const fundedFlowPaths = anyChainFunded ? mergedFlowPaths : mergedFlowPaths.filter(p => {
                   const sId = p.assets?.[0];
                   if (!sId) return false;
                   const sMeta = assetMetaMap.get(String(sId));
@@ -2167,13 +2251,18 @@ function showReadinessModal(readiness) {
                 const lastId   = unified[unified.length - 1];
                 const seedMeta = assetMetaMap.get(String(seedId));
                 const seedBal  = seedMeta?.balance ?? null;
-                const seedMin  = seedMeta?.min_amount ?? null;
-                const needForChain = Math.ceil(Number(seedMin ?? 50000) * _chainFeeMultiplier);
+                const needForChain = _effectiveRequired(seedId);
                 const seedBalNum = typeof seedBal === 'bigint' ? Number(seedBal) : Number(seedBal ?? -1);
                 const balOk    = seedBal !== null && seedBalNum >= needForChain;
+                const usdTag = (_serverRequiredUsd && _serverRequiredUsd > 0)
+                  ? ` ≈ <span style="color:var(--yellow)">$${_serverRequiredUsd.toFixed(2)}</span>`
+                  : '';
+                const bottleneckTag = (_serverSeedCalc?.maxHopMinUsd)
+                  ? ` · hop ${(_serverSeedCalc.bottleneckHop ?? 0) + 1} needs $${_serverSeedCalc.maxHopMinUsd} min + 5% buf + compounded 0.35%/hop`
+                  : `min + ${_totalChainHops} × 0.35% fee`;
                 const balLine  = seedBal !== null
                   ? `${balOk ? '✅' : '❌'} <span style="font-family:'JetBrains Mono',monospace;color:${balOk ? 'var(--green)' : 'var(--red)'}">${fmtAmt(seedBal, seedId)}</span>`
-                    + ` / need <span style="font-family:'JetBrains Mono',monospace">${fmtAmt(needForChain, seedId)}</span><span style="font-size:9px;color:var(--muted)"> (min + ${_totalChainHops} × 0.35% fee)</span>`
+                    + ` / need <span style="font-family:'JetBrains Mono',monospace">${fmtAmt(needForChain, seedId)}</span>${usdTag}<span style="font-size:9px;color:var(--muted)"> (${bottleneckTag})</span>`
                   : `<span style="color:var(--muted)">balance unknown</span>`;
 
                 const flowParts = [];
@@ -2251,6 +2340,7 @@ function showReadinessModal(readiness) {
               }
             })()}
           </div>
+          ${runBypassHtml}
         </div>
         <div style="flex-shrink:0;padding:16px 24px;border-top:1px solid var(--border);display:flex;gap:10px;align-items:center;background:var(--bg2)">
           <button onclick="document.getElementById('readinessOverlay').remove()" class="btn btn-ghost" style="font-size:13px">Cancel</button>
@@ -2283,68 +2373,44 @@ function _consolidationUpdate() {
   const summaryEl = document.getElementById('consolidationSummary');
   const runBtn    = document.getElementById('consolidationRunBtn');
   const targetOpt = targetSel?.options[targetSel.selectedIndex];
-  const targetMin = targetOpt ? Number(targetOpt.dataset.min || 50000) : null;
-  const targetDec = targetOpt ? Number(targetOpt.dataset.decimals || 8) : 8;
+  const targetId  = targetSel?.value || '';
 
-  if (!checked.length || !targetSel?.value) {
-    if (summaryEl) summaryEl.textContent = '';
+  const hasSourcesSelected = checked.filter(c => c.dataset.assetId !== targetId).length > 0;
+
+  if (!hasSourcesSelected || !targetId) {
+    if (summaryEl) summaryEl.innerHTML = checked.length
+      ? '<div style="font-size:10px;color:var(--muted)">select at least one source asset different from the target</div>'
+      : '';
     if (runBtn) { runBtn.disabled = true; runBtn.style.background = 'var(--bg3)'; runBtn.style.color = 'var(--muted)'; runBtn.style.cursor = 'not-allowed'; }
     return;
   }
 
-  const SWAP_FEE = 0.0035;
-  const feeMultiplier = Number(panel.dataset.feeMultiplier || 1);
-  const totalHops     = Number(panel.dataset.totalHops || 1);
-  const targetDec2    = Number(targetOpt?.dataset.decimals || 8);
-  const targetId      = targetSel.value;
-  const targetExistingBal = Number(targetOpt?.dataset.balance || 0);
-
-  // Projected total = target's existing balance (no swap, no fee)
-  //                 + sum of each source × (1 - 0.35% swap fee)
-  // Sources matching the target ID are excluded from the fee (already in wallet).
-  let swappedSourceTotal = 0;
-  let rawSourceTotal = 0;
   const lines = checked.map(cb => {
     const id  = cb.dataset.assetId;
     const bal = Number(cb.dataset.balance || 0);
     const dec = Number(cb.dataset.decimals || 8);
     const label = id.split(':').pop()?.toUpperCase() || id;
-    const isTarget = (id === targetId);
-    rawSourceTotal += isTarget ? 0 : bal;
-    swappedSourceTotal += isTarget ? 0 : Math.floor(bal * (1 - SWAP_FEE));
     return `${label}: ${formatUnitsAtomicDisplay(bal, dec)}`;
   });
-  const projectedTotal = targetExistingBal + swappedSourceTotal;
-  const feeDeducted = rawSourceTotal - swappedSourceTotal;
-
-  const needAtomic  = targetMin !== null ? Math.ceil(targetMin * feeMultiplier) : null;
-  const meetsMin    = needAtomic !== null && projectedTotal >= needAtomic;
-  const shortfall   = needAtomic !== null ? Math.max(0, needAtomic - projectedTotal) : 0;
 
   if (summaryEl) {
+    const targetDec = Number(targetOpt?.dataset.decimals || 8);
+    const targetExistingBal = Number(targetOpt?.dataset.balance || 0);
     const targetBalLine = targetExistingBal > 0
-      ? `<div style="color:var(--muted);margin-top:3px">seed existing balance: ${formatUnitsAtomicDisplay(targetExistingBal, targetDec2)}</div>`
-      : '';
-    const feeLine = feeDeducted > 0
-      ? `<div style="color:var(--muted);margin-top:1px">swap fees (${checked.filter(c=>c.dataset.assetId!==targetId).length} × 0.35%): −${formatUnitsAtomicDisplay(feeDeducted, targetDec2)}</div>`
+      ? `<div style="color:var(--muted);margin-top:3px">seed existing balance: ${formatUnitsAtomicDisplay(targetExistingBal, targetDec)}</div>`
       : '';
     summaryEl.innerHTML =
       `<div style="line-height:1.7">${lines.join(' · ')}</div>` +
-      `<div style="color:var(--cyan);margin-top:3px">→ will swap into ${targetOpt?.text || ''}</div>` +
-      targetBalLine + feeLine +
-      (needAtomic !== null
-        ? meetsMin
-          ? `<div style="color:var(--green);margin-top:2px;font-size:10px">✅ projected ${formatUnitsAtomicDisplay(projectedTotal, targetDec2)} ≥ need ${formatUnitsAtomicDisplay(needAtomic, targetDec2)} (min × (1/(1−0.35%))^${totalHops})</div>`
-          : `<div style="color:var(--red);margin-top:2px;font-size:10px">❌ projected ${formatUnitsAtomicDisplay(projectedTotal, targetDec2)} — short by ${formatUnitsAtomicDisplay(shortfall, targetDec2)} (need ${formatUnitsAtomicDisplay(needAtomic, targetDec2)})</div>`
-        : '') +
-      `<div style="color:var(--muted);margin-top:2px;font-size:9px">gas is checked at execution time · all swaps must pass before allChains starts</div>`;
+      `<div style="color:var(--cyan);margin-top:3px">→ swap ${checked.filter(c=>c.dataset.assetId!==targetId).length} asset(s) into ${targetOpt?.text || ''}</div>` +
+      targetBalLine +
+      `<div style="color:var(--muted);margin-top:4px;font-size:9px">swap rates determined by Garden at execution time · gas checked per hop</div>`;
   }
 
   if (runBtn) {
-    runBtn.disabled = !meetsMin;
-    runBtn.style.background = meetsMin ? 'var(--cyan)' : 'var(--bg3)';
-    runBtn.style.color      = meetsMin ? '#021015'     : 'var(--muted)';
-    runBtn.style.cursor     = meetsMin ? 'pointer'     : 'not-allowed';
+    runBtn.disabled = false;
+    runBtn.style.background = 'var(--cyan)';
+    runBtn.style.color = '#021015';
+    runBtn.style.cursor = 'pointer';
   }
 }
 
@@ -3289,6 +3355,7 @@ async function loadChains() {
 
 // ── NAVIGATION ──
 function showPanel(id) {
+  if (_comboChunkRafId && id !== 'combinations') { cancelAnimationFrame(_comboChunkRafId); _comboChunkRafId = null; }
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   document.getElementById(`panel-${id}`).classList.add('active');
@@ -3307,7 +3374,10 @@ function filterRoutes(f) {
 // ── TRADE COMBINATIONS ────────────────────────────────────────
 
 let allCombos     = [];
+let _combosStale  = true;  // true = next loadCombinations must re-fetch from server
 let currentFilter = "all";
+
+function invalidateCombos() { _combosStale = true; }
 let _arbScanResults = [];
 
 async function refreshArbSummary() {
@@ -3341,12 +3411,19 @@ async function refreshArbSummary() {
   }
 }
 
-async function loadCombinations() {
+async function loadCombinations(force = false) {
   const grid    = document.getElementById("combosGrid");
   const loading = document.getElementById("combosLoading");
   const empty   = document.getElementById("combosEmpty");
   const subtitle = document.getElementById("comboSubtitle");
   const stats   = document.getElementById("comboStats");
+
+  // Use cached data if available and not stale
+  if (!force && !_combosStale && allCombos.length > 0) {
+    loading.style.display = "none";
+    renderCombos(currentFilter);
+    return;
+  }
 
   grid.style.display    = "none";
   empty.style.display   = "none";
@@ -3356,7 +3433,23 @@ async function loadCombinations() {
   try {
     const r = await fetch("/api/combinations");
     const d = await r.json();
-    allCombos = d.combinations || [];
+    allCombos = (d.combinations || []).map(c => {
+      const dec = Number(c.from?.decimals ?? 8);
+      const sug = (c.suggestedAmount !== null && c.suggestedAmount !== undefined) ? Number(c.suggestedAmount) : c.minAmount;
+      c._dec        = dec;
+      c._fmtMin     = formatUnitsAtomicDisplay(c.minAmount, dec);
+      c._fmtMax     = formatUnitsAtomicDisplay(c.maxAmount, dec);
+      c._fmtBal     = (c.walletBalance != null) ? formatUnitsAtomicDisplay(c.walletBalance, dec) : null;
+      c._suggested   = sug;
+      c._fmtSug     = formatUnitsAtomicDisplay(sug, dec);
+      c._fromTicker = assetLabel(c.from);
+      c._toTicker   = assetLabel(c.to);
+      c._fromChain  = chainLabel(c.from);
+      c._toChain    = chainLabel(c.to);
+      c._safeId     = c.id.replace(/[^a-z0-9]/gi, '_');
+      return c;
+    });
+    _combosStale = false;
     routeMetrics.discovered = allCombos.length;
     updateStats();
 
@@ -3364,10 +3457,8 @@ async function loadCombinations() {
     const partial = allCombos.filter(c => c.comboStatus === 'partial').length;
 
     subtitle.textContent = `${allCombos.length} active asset pairs found`;
-    // Normal stats line (no extra hint message)
     stats.textContent    = `${ready} ready · ${partial} partial`;
 
-    // Update badge
     const badge = document.getElementById("comboBadge");
     if (ready > 0) { badge.textContent = ready + " ready"; badge.style.display = "inline"; }
     else badge.style.display = "none";
@@ -3382,7 +3473,7 @@ async function loadCombinations() {
         <div style="font-weight:600;margin-bottom:6px">Could not load combinations</div>
         <div style="font-size:12px;color:var(--muted);margin-bottom:14px">${err.message}</div>
         <div style="font-size:12px;color:var(--muted)">Make sure the server is running and wallets are connected</div>
-        <button class="btn btn-ghost" onclick="loadCombinations()" style="margin-top:12px;font-size:12px">Try Again</button>
+        <button class="btn btn-ghost" onclick="loadCombinations(true)" style="margin-top:12px;font-size:12px">Try Again</button>
       </div>`;
   }
 }
@@ -3409,7 +3500,7 @@ async function validatePairs() {
       status.style.color = 'var(--green)';
       btn.disabled = false;
       btn.innerHTML = '🔍 Validate Pairs';
-      await loadCombinations();
+      await loadCombinations(true);
     } else if (d.inProgress) {
       status.textContent = '⏳ Validation already running…';
       status.style.color = 'var(--yellow)';
@@ -3443,8 +3534,7 @@ async function handleValidateDone({ total, valid, error }) {
     if (status) { status.textContent = `❌ Validation failed: ${error}`; status.style.color = 'var(--red)'; }
   } else {
     if (status) { status.textContent = `✅ ${valid} valid pairs out of ${total}`; status.style.color = 'var(--green)'; }
-    // Reload combinations to apply the new filter
-    await loadCombinations();
+    await loadCombinations(true);
   }
   if (btn) { btn.disabled = false; btn.innerHTML = '🔄 Refresh'; }
 }
@@ -3461,11 +3551,81 @@ function chainLabel(a) {
   return prefix.replace(/_/g, " ").replace(/\b\w/g, l => l.toUpperCase());
 }
 
+const _COMBO_CHUNK_SIZE = 50;
+let _comboChunkRafId = null;
+
+function _comboCardHtml(c) {
+  const safeId = c._safeId;
+  const fromTicker = c._fromTicker;
+  const toTicker   = c._toTicker;
+  const fromDec    = c._dec;
+
+  let statusClass, badgeClass, badgeText;
+  if (c.comboStatus === "ready") {
+    statusClass = "can-trade"; badgeClass = "ready"; badgeText = "✅ Ready to Trade";
+  } else if (c.comboStatus === "partial" && c.canAfford === false) {
+    statusClass = "partial"; badgeClass = "partial"; badgeText = "❌ Low Balance";
+  } else if (c.comboStatus === "partial") {
+    statusClass = "partial"; badgeClass = "partial"; badgeText = "⚠️ Partial";
+  } else {
+    statusClass = "no-wallet"; badgeClass = "no"; badgeText = "❌ Not Connected";
+  }
+
+  const fromDot  = c.fromWalletConnected ? `<span style="color:var(--green)">●</span>` : `<span style="color:var(--muted)">○</span>`;
+  const toDot    = c.toWalletConnected   ? `<span style="color:var(--green)">●</span>` : `<span style="color:var(--muted)">○</span>`;
+  const fromIcon = c.from.icon ? `<img src="${c.from.icon}" style="width:18px;height:18px;border-radius:50%;margin-right:5px;vertical-align:middle" onerror="this.style.display='none'">` : '';
+  const toIcon   = c.to.icon   ? `<img src="${c.to.icon}"   style="width:18px;height:18px;border-radius:50%;margin-right:5px;vertical-align:middle" onerror="this.style.display='none'">` : '';
+
+  let balanceLine = "";
+  if (c._fmtBal !== null) {
+    const balColor = c.canAfford === false ? "var(--red)" : "var(--green)";
+    balanceLine = `· <span style="color:${balColor}">Balance: ${c._fmtBal}</span>`;
+  }
+
+  return `
+  <div class="combo-card ${statusClass}" id="combo-${safeId}">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
+      <div style="display:flex;align-items:center;gap:6px">
+        <div style="text-align:center">
+          <div class="combo-asset">${fromIcon}${fromDot} ${fromTicker}</div>
+          <div class="combo-chain">${c._fromChain}</div>
+        </div>
+        <span class="combo-arrow">→</span>
+        <div style="text-align:center">
+          <div class="combo-asset">${toIcon}${toDot} ${toTicker}</div>
+          <div class="combo-chain">${c._toChain}</div>
+        </div>
+      </div>
+      <span class="combo-badge ${badgeClass}">${badgeText}</span>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:8px">
+      Min: ${c._fmtMin} – Max: ${c._fmtMax} ${balanceLine}
+    </div>
+    ${c.canTrade ? `
+    <div class="combo-amount-row">
+      <input class="combo-amount-input" id="amt-${safeId}"
+        type="number" value="${c._suggested}" min="${c.minAmount}" max="${c.maxAmount}" step="1"
+        title="Atomic smallest units; ≈ ${c._fmtSug} ${fromTicker} @ ${fromDec} decimals">
+      <span style="font-size:11px;color:var(--muted);flex:1;line-height:1.35">≈ <span style="font-family:'JetBrains Mono',monospace;color:var(--fg)">${c._fmtSug}</span> ${fromTicker} · <span style="opacity:.85">input = atomic</span></span>
+      <button class="btn btn-green"
+        onclick="confirmTrade('${safeId}','${c.from.assetId}','${c.to.assetId}','${c.from.walletType}','${c.to.walletType}','${fromTicker}','${toTicker}',${fromDec})"
+        style="font-size:11px;padding:5px 12px">▶ Run</button>
+    </div>` : `
+    <div style="font-size:11px;color:var(--muted)">
+      ${!c.fromWalletConnected ? `Connect ${c.from.walletType} wallet to send` :
+        !c.toWalletConnected ? `Connect ${c.to.walletType} wallet to receive` :
+        `Route not tradeable (RPC/solver limits)`}
+      <a onclick="showPanel('wallets')" style="color:var(--accent);cursor:pointer;margin-left:4px">→ Connect</a>
+    </div>`}
+  </div>`;
+}
+
 function renderCombos(filter) {
+  if (_comboChunkRafId) { cancelAnimationFrame(_comboChunkRafId); _comboChunkRafId = null; }
+
   const grid  = document.getElementById("combosGrid");
   const empty = document.getElementById("combosEmpty");
 
-  // Remove combinations whose source chain has a broken RPC
   const badRpcs = window._badRpcChains || [];
   const healthy = allCombos.filter(c => {
     const chainKey = (c.from.chain || "").toLowerCase();
@@ -3486,84 +3646,37 @@ function renderCombos(filter) {
   grid.style.display  = "grid";
   empty.style.display = "none";
 
-  try {
-    grid.innerHTML = filtered.map(c => {
-    const safeId = c.id.replace(/[^a-z0-9]/gi, '_');
+  const firstBatch = filtered.slice(0, _COMBO_CHUNK_SIZE).map(_comboCardHtml).join("");
 
-    // Status: distinguish "ready with confirmed balance" vs "ready but EVM balance unknown"
-    let statusClass, badgeClass, badgeText;
-    if (c.comboStatus === "ready") {
-      statusClass = "can-trade"; badgeClass = "ready"; badgeText = "✅ Ready to Trade";
-    } else if (c.comboStatus === "partial" && c.canAfford === false) {
-      statusClass = "partial"; badgeClass = "partial"; badgeText = "❌ Low Balance";
-    } else if (c.comboStatus === "partial") {
-      statusClass = "partial"; badgeClass = "partial"; badgeText = "⚠️ Partial";
-    } else {
-      statusClass = "no-wallet"; badgeClass = "no"; badgeText = "❌ Not Connected";
-    }
-
-    const fromTicker = assetLabel(c.from);
-    const toTicker   = assetLabel(c.to);
-    const fromChain  = chainLabel(c.from);
-    const toChain    = chainLabel(c.to);
-    const fromDec = Number(c.from?.decimals ?? 8);
-    const fromDot    = c.fromWalletConnected ? `<span style="color:var(--green)">●</span>` : `<span style="color:var(--muted)">○</span>`;
-    const toDot      = c.toWalletConnected   ? `<span style="color:var(--green)">●</span>` : `<span style="color:var(--muted)">○</span>`;
-    const fromIcon   = c.from.icon ? `<img src="${c.from.icon}" style="width:18px;height:18px;border-radius:50%;margin-right:5px;vertical-align:middle" onerror="this.style.display='none'">` : '';
-    const toIcon     = c.to.icon   ? `<img src="${c.to.icon}"   style="width:18px;height:18px;border-radius:50%;margin-right:5px;vertical-align:middle" onerror="this.style.display='none'">` : '';
-
-    // Balance info line (keep minimal, no instructions)
-    let balanceLine = "";
-    const balanceLow = c.canAfford === false;
-    if (c.walletBalance !== null && c.walletBalance !== undefined) {
-      const balColor = balanceLow ? "var(--red)" : "var(--green)";
-      balanceLine = `· <span style="color:${balColor}">Balance: ${formatUnitsAtomicDisplay(c.walletBalance, fromDec)}</span>`;
-    }
-
-    // Default input respects server suggestedAmount (atomic); fallback to minAmount.
-    const suggested = (c.suggestedAmount !== null && c.suggestedAmount !== undefined) ? Number(c.suggestedAmount) : c.minAmount;
-    const suggestedHuman = formatUnitsAtomicDisplay(suggested, fromDec);
-
-    return `
-    <div class="combo-card ${statusClass}" id="combo-${safeId}">
-      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px">
-        <div style="display:flex;align-items:center;gap:6px">
-          <div style="text-align:center">
-            <div class="combo-asset">${fromIcon}${fromDot} ${fromTicker}</div>
-            <div class="combo-chain">${fromChain}</div>
-          </div>
-          <span class="combo-arrow">→</span>
-          <div style="text-align:center">
-            <div class="combo-asset">${toIcon}${toDot} ${toTicker}</div>
-            <div class="combo-chain">${toChain}</div>
-          </div>
-        </div>
-        <span class="combo-badge ${badgeClass}">${badgeText}</span>
-      </div>
-      <div style="font-size:11px;color:var(--muted);margin-bottom:8px">
-        Min: ${formatUnitsAtomicDisplay(c.minAmount, fromDec)} – Max: ${formatUnitsAtomicDisplay(c.maxAmount, fromDec)} ${balanceLine}
-      </div>
-      ${c.canTrade ? `
-      <div class="combo-amount-row">
-        <input class="combo-amount-input" id="amt-${safeId}"
-          type="number" value="${suggested}" min="${c.minAmount}" max="${c.maxAmount}" step="1"
-          title="Atomic smallest units; ≈ ${suggestedHuman} ${fromTicker} @ ${fromDec} decimals">
-        <span style="font-size:11px;color:var(--muted);flex:1;line-height:1.35">≈ <span style="font-family:'JetBrains Mono',monospace;color:var(--fg)">${suggestedHuman}</span> ${fromTicker} · <span style="opacity:.85">input = atomic</span></span>
-        <button class="btn btn-green"
-          onclick="confirmTrade('${safeId}','${c.from.assetId}','${c.to.assetId}','${c.from.walletType}','${c.to.walletType}','${fromTicker}','${toTicker}',${fromDec})"
-          style="font-size:11px;padding:5px 12px">▶ Run</button>
-      </div>` : `
-      <div style="font-size:11px;color:var(--muted)">
-        ${!c.fromWalletConnected ? `Connect ${c.from.walletType} wallet to send` :
-          !c.toWalletConnected ? `Connect ${c.to.walletType} wallet to receive` :
-          `Route not tradeable (RPC/solver limits)`}
-        <a onclick="showPanel('wallets')" style="color:var(--accent);cursor:pointer;margin-left:4px">→ Connect</a>
-      </div>`}
-    </div>`;
-  }).join("");
-  } catch (err) {
-    throw err;
+  if (filtered.length <= _COMBO_CHUNK_SIZE) {
+    grid.innerHTML = firstBatch;
+    return;
   }
+
+  grid.innerHTML = firstBatch
+    + '<div id="comboChunkLoader" style="grid-column:1/-1;text-align:center;color:var(--muted);font-size:12px;padding:16px 0">'
+    + `<span class="spinner" style="margin-right:6px"></span>Loading ${filtered.length - _COMBO_CHUNK_SIZE} more…</div>`;
+
+  let offset = _COMBO_CHUNK_SIZE;
+  function renderNextChunk() {
+    if (offset >= filtered.length) {
+      document.getElementById('comboChunkLoader')?.remove();
+      _comboChunkRafId = null;
+      return;
+    }
+    const chunk = filtered.slice(offset, offset + _COMBO_CHUNK_SIZE);
+    const loader = document.getElementById('comboChunkLoader');
+    if (loader) loader.insertAdjacentHTML('beforebegin', chunk.map(_comboCardHtml).join(""));
+    offset += _COMBO_CHUNK_SIZE;
+    if (offset >= filtered.length) {
+      loader?.remove();
+      _comboChunkRafId = null;
+    } else {
+      if (loader) loader.innerHTML = `<span class="spinner" style="margin-right:6px"></span>Loading ${filtered.length - offset} more…`;
+      _comboChunkRafId = requestAnimationFrame(renderNextChunk);
+    }
+  }
+  _comboChunkRafId = requestAnimationFrame(renderNextChunk);
 }
 
 async function scanArbitrage() {
@@ -3908,20 +4021,14 @@ async function runAllTradeable() {
   const btn = document.getElementById('btnRunTradeable');
   if (btn) { btn.disabled = true; }
 
-  if (!_evmBalancesReady && _evmBalancePromise) {
-    if (btn) btn.innerHTML = '<span class="spinner"></span> Loading balances…';
-    await Promise.race([_evmBalancePromise, new Promise(r => setTimeout(r, 15000))]);
-  }
-  if (btn) btn.innerHTML = '<span class="spinner"></span> Checking readiness…';
+  await _waitForBalances(btn);
 
   try {
-    const r = await fetch(`/api/route-readiness?mode=${encodeURIComponent(_selectedRunMode)}`);
-    const readiness = await r.json();
+    const { readiness, ok } = await _fetchReadinessWithRetry(btn);
     if (btn) { btn.disabled = false; btn.innerHTML = '▶ Run All Tradeable'; }
 
-    if (readiness.error) {
-      alert('Failed to check readiness: ' + readiness.error);
-      // Fallback: skip readiness gate
+    if (!ok) {
+      alert('Failed to check readiness: ' + (readiness?.error || 'unknown error'));
       const tradeable = allCombos.filter(c => c.canTrade);
       if (!tradeable.length) { alert("No tradeable combinations. Connect wallets first."); return; }
       showTradeSizeModal(tradeable);
@@ -4414,6 +4521,7 @@ async function _doConnectEvm(provider) {
   if (!accounts?.length) throw new Error('No accounts returned');
   evmAddress = accounts[0];
   connectedWallets.evm = true;
+  invalidateCombos();
   window._evmProvider = provider;
   const info = providerInfo(provider);
   window._evmWalletName = info.name;
@@ -4490,6 +4598,7 @@ async function switchEvmWallet() {
 }
 
 async function disconnectEvm() {
+  invalidateCombos();
   connectedWallets.evm = false; evmAddress = null;
   setTimeout(updateEnvKeyNotice, 500); // re-check — envkey may re-activate
   await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'evm' }) });
@@ -4547,6 +4656,7 @@ async function saveBtcWallet() {
     const r = await fetch('/api/wallet/btc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ address, wif }) });
     const d = await r.json();
     connectedWallets.btc = true;
+    invalidateCombos();
     const pendingLabel = d.pendingSats && d.pendingSats !== 0
       ? ` <span style="color:var(--yellow);font-size:11px">(${d.pendingSats > 0 ? '+' : ''}${(d.pendingSats/1e8).toFixed(8)} pending in mempool)</span>`
       : '';
@@ -4600,6 +4710,7 @@ async function connectPhantom() {
 }
 
 async function disconnectSolana() {
+  invalidateCombos();
   if (window.solana) await window.solana.disconnect().catch(() => {});
   connectedWallets.solana = false;
   await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'solana' }) });
@@ -4733,6 +4844,7 @@ async function connectTron() {
 
 // Generic disconnect helper
 async function disconnectWallet(type, addrId, btnId, reconnectFn, reconnectLabel) {
+  invalidateCombos();
   await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type }) });
   connectedWallets[type] = false;
 
@@ -4978,6 +5090,7 @@ async function fetchEvmBalances(address) {
       d.rpcErrors.forEach(e => addIssue('rpc', 'warning', `RPC Error: ${e.chain}`, e.message, { chain: e.chain }));
     }
     _evmBalancesReady = true;
+    invalidateCombos();
   } catch(err) {
     if (statusEl) { statusEl.textContent = `⚠️ Balance check failed: ${err.message}`; statusEl.style.color = 'var(--yellow)'; }
     addIssue('rpc', 'warning', 'EVM Balance RPC Failed', err.message, {});
@@ -5161,6 +5274,7 @@ async function saveRpc(chain) {
       // Remove the old RPC issue for this chain from issues list
       issues = issues.filter(i => !(i.type === 'rpc' && i.meta?.chain === chain));
       renderIssues();
+      updateIssueBadge();
       // Re-fetch balances with the updated RPC
       if (evmAddress) await fetchEvmBalances(evmAddress);
     } else { result.textContent = `❌ ${d.error}`; result.style.color = 'var(--red)'; }

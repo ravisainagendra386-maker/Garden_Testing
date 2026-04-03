@@ -12,6 +12,7 @@ const walletState = require("./wallet/state");
 const envkey      = require("./wallet/envkey");
 const crypto         = require("crypto");
 const arbitrageAgent = require("./agents/arbitrageAgent");
+const priceFeed      = require("./agents/price-feed");
 
 // ── AUTH ──────────────────────────────────────────────────────
 const _sessions = new Set();
@@ -236,96 +237,6 @@ app.post("/api/run", async (req, res) => {
       seedAllowlist,
     }, mode);
     const readiness = preview.readiness;
-
-    const hasQualifiedChainStart = (readiness.assets || []).some((a) => a.isChainStart && a.sufficient);
-    const executablePlanCount = preview.executablePlanCount || 0;
-    // Only when no beam seed qualifies AND there is no other executable plan (e.g. standalone) do we
-    // require random native gas + Garden liquidity preflight (does not block funded standalone paths).
-    if (mode === "allChains" && !hasQualifiedChainStart && executablePlanCount === 0) {
-      const { resolveConsolidationTargetIfNoSeeds, verifyConsolidationPreflight } = require("./utils/consolidationTarget");
-      let consolidation = null;
-      try {
-        consolidation = await resolveConsolidationTargetIfNoSeeds({ supported, gasMap });
-      } catch (e) {
-        return res.status(409).json({
-          started: false, env: config.env, strictMode: true,
-          reason: `Consolidation target resolution failed: ${e.message}`,
-        });
-      }
-      if (consolidation.eligible) {
-        const pre = await verifyConsolidationPreflight(consolidation, gasMap);
-        if (!pre.ok) {
-          return res.status(409).json({
-            started: false, env: config.env, strictMode: true,
-            reason: "Consolidation preflight failed: native gas or Garden liquidity check did not pass before run.",
-            consolidation, preflight: pre,
-          });
-        }
-        const targetId = consolidation.targetAssetId;
-        const assetById = new Map(supported.map(a => [String(a.id), a]));
-        const targetMeta = assetById.get(String(targetId));
-        if (!targetMeta) {
-          return res.status(409).json({
-            started: false, env: config.env, strictMode: true,
-            reason: `Consolidation target asset ${targetId} not found in supported assets`,
-          });
-        }
-        const sources = [];
-        for (const a of (readiness.assets || [])) {
-          if (a.id === targetId || a.isChainFundedSource) continue;
-          const bal = balanceMap.get(a.id);
-          if (bal === null || bal === undefined) continue;
-          const balNum = Number(bal);
-          const minAmt = Math.max(1, parseInt(String(a.required || 50000), 10) || 50000);
-          if (balNum < minAmt) continue;
-          const srcMeta = assetById.get(String(a.id));
-          if (!srcMeta) continue;
-          sources.push({ id: a.id, amount: balNum, meta: srcMeta });
-        }
-        if (sources.length) {
-          const toChainType = getWalletTypeForAsset(targetMeta);
-          const consolidationRoutes = [];
-          for (const src of sources) {
-            const fromChainType = getWalletTypeForAsset(src.meta);
-            if (!fromChainType || !toChainType) continue;
-            const minAmt = Math.max(1, parseInt(String(src.meta.min_amount ?? 50000), 10) || 50000);
-            const maxAmt = src.meta.max_amount ? parseInt(String(src.meta.max_amount), 10) : null;
-            let useAmt = Math.max(minAmt, Math.floor(src.amount));
-            if (maxAmt && useAmt > maxAmt) useAmt = maxAmt;
-            consolidationRoutes.push({
-              fromAsset: src.id, toAsset: targetId,
-              fromChain: fromChainType, toChain: toChainType,
-              amount: useAmt, fromMeta: src.meta, toMeta: targetMeta,
-              label: `${src.meta.name || src.id} → ${targetMeta.name || targetId} [auto-consolidation]`,
-              executionMode: "allChains",
-            });
-          }
-          if (consolidationRoutes.length) {
-            res.json({
-              started: true, env: config.env, mode, autoConsolidating: true,
-              consolidationTarget: targetId, consolidationHops: consolidationRoutes.length,
-            });
-            _amountOverrides = {};
-            (async () => {
-              broadcast("suite_start", { env: config.env, mode: "auto-consolidation", ts: new Date().toISOString() });
-              let passed = 0;
-              for (const route of consolidationRoutes) {
-                broadcast("suite_info", { message: `Auto-consolidating: ${route.label}` });
-                try {
-                  const r = await runner.runRoute(route);
-                  if (r.status === "pass") { passed++; broadcast("suite_info", { message: `Consolidated: ${route.label}` }); }
-                  else broadcast("suite_info", { message: `Consolidation skipped/failed (${route.label}): ${r.error || r.status}` });
-                } catch (e) { broadcast("suite_info", { message: `Consolidation error (${route.label}): ${e.message}` }); }
-              }
-              broadcast("suite_info", { message: `Auto-consolidation done (${passed}/${consolidationRoutes.length} passed) — waiting 2s then starting allChains` });
-              await new Promise(r => setTimeout(r, 2000));
-              runner.runAll({}, "allChains").catch(err => broadcast("error", { message: `allChains after auto-consolidation error: ${err.message}` }));
-            })().catch(err => broadcast("error", { message: `auto-consolidation error: ${err.message}` }));
-            return;
-          }
-        }
-      }
-    }
 
     // Strict run gate:
     // - allChains still requires an executable beam plan (runner executes beam-style routes).
@@ -1160,6 +1071,22 @@ async function buildCombinationsResponse() {
     return minAmount;
   }
 
+  function toBigIntOrNull(v) {
+    if (v === null || v === undefined) return null;
+    if (typeof v === "bigint") return v;
+    if (typeof v === "number") {
+      if (!Number.isFinite(v)) return null;
+      return BigInt(Math.floor(v));
+    }
+    try {
+      const s = String(v).trim();
+      if (!s) return null;
+      return BigInt(s.includes(".") ? s.split(".")[0] : s);
+    } catch (_) { return null; }
+  }
+
+  // Phase 1: Build all combo entries synchronously (no network calls).
+  const pending = [];
   for (const from of supported) {
     for (const to of supported) {
       if (from.id === to.id) continue;
@@ -1196,7 +1123,6 @@ async function buildCombinationsResponse() {
             walletBalance = String(match.raw);
             canAfford = gteAtomic(walletBalance, minAmount);
           } else if (chainSupported.some(st => String(st?.tokenAddr || '').toLowerCase() === tokenAddr)) {
-            // Known supported ERC20 on this chain but wallet balance is zero.
             walletBalance = "0";
             canAfford = false;
           }
@@ -1209,82 +1135,64 @@ async function buildCombinationsResponse() {
         }
       }
 
-      function toBigIntOrNull(v) {
-        if (v === null || v === undefined) return null;
-        if (typeof v === "bigint") return v;
-        if (typeof v === "number") {
-          if (!Number.isFinite(v)) return null;
-          // If a float sneaks in, we only keep the integer part for atomic comparisons.
-          return BigInt(Math.floor(v));
-        }
-        try {
-          // String may be a big integer.
-          const s = String(v).trim();
-          if (!s) return null;
-          return BigInt(s.includes(".") ? s.split(".")[0] : s);
-        } catch (_) {
-          return null;
-        }
-      }
-
-      function clampInt(n, lo, hi) {
-        return Math.max(lo, Math.min(n, hi));
-      }
-
-      // Default input/suggested amount rules:
-      // - If balance < minAmount or unknown: suggested=minAmount
-      // - If receiving asset has a minimum constraint, compute required send amount to
-      //   reach (to.min_amount + 0.4%) using Garden quote pricing (chain-aware).
-      //   If quote is unavailable, fall back to "max balance" behavior.
-      // Always enforce sender min/max bounds.
-      // Always clamp to maxAmount when known.
       const balanceKnown = walletBalance !== null;
       let comboStatus = "no";
-      // "Send" wallet must be connected to be considered tradeable/partial.
-      // If only destination wallet is connected, keep it in "no" (Not Connected).
       if (!fromConnected) comboStatus = "no";
       else if (toConnected && canAfford === true) comboStatus = "ready";
       else comboStatus = "partial";
       const canTrade = comboStatus === "ready";
-      // Enable quote-based defaulting whenever we have a sender balance that can afford the sender min.
-      // This keeps defaults accurate even when destination wallet isn't connected (partial),
-      // while still avoiding quote spam for "no" combos / unknown balance.
+
       const minBigForQuote = toBigIntOrNull(minAmount);
-      const quoteMinRequired = (minBigForQuote !== null) ? (minBigForQuote + ((minBigForQuote + 199n) / 200n)) : null; // min + ceil(min*0.5%)
+      const quoteMinRequired = (minBigForQuote !== null) ? (minBigForQuote + ((minBigForQuote + 199n) / 200n)) : null;
       const canAffordPlus05 =
         quoteMinRequired !== null ? gteAtomic(walletBalance, quoteMinRequired.toString()) : (canAfford === true);
-
       const quoteEnabled = fromConnected && balanceKnown === true && canAffordPlus05 === true;
       if (quoteEnabled) quoteEnabledCount++;
 
-      const suggestedFinal = await computeSuggestedAmount({
-        from,
-        to,
-        minAmount,
-        maxAmount,
-        minToAmount,
-        walletBalance,
-        canAfford,
-        quoteEnabled,
-      });
-
-      combinations.push({
-        id: `${from.id}->${to.id}`,
-        from: { assetId: from.id, name: from.name, chain: from.chain, icon: from.icon, walletType: fromType, decimals: from.decimals },
-        to:   { assetId: to.id,   name: to.name,   chain: to.chain,   icon: to.icon,   walletType: toType,   decimals: to.decimals },
-        minAmount, maxAmount, toMinAmount: minToAmount, suggestedAmount: suggestedFinal,
-        fromWalletConnected: fromConnected,
-        toWalletConnected:   toConnected,
-        canTrade,
-        canAfford,
-        balanceKnown,
-        walletBalance,
-        comboStatus,
+      pending.push({
+        from, to, fromType, toType, fromConnected, toConnected,
+        minAmount, maxAmount, minToAmount, walletBalance, canAfford,
+        canTrade, balanceKnown, comboStatus, quoteEnabled,
       });
     }
   }
 
-  // CHANGE: No valid-pairs cache filtering — always show all connected combos
+  // Phase 2: Fetch quotes in parallel — all calls are independent.
+  const results = new Array(pending.length);
+  let cursor = 0;
+  async function worker() {
+    while (cursor < pending.length) {
+      const i = cursor++;
+      const c = pending[i];
+      results[i] = await computeSuggestedAmount({
+        from: c.from, to: c.to,
+        minAmount: c.minAmount, maxAmount: c.maxAmount, minToAmount: c.minToAmount,
+        walletBalance: c.walletBalance, canAfford: c.canAfford, quoteEnabled: c.quoteEnabled,
+      });
+    }
+  }
+  const PARALLEL = 10;
+  await Promise.all(Array.from({ length: PARALLEL }, () => worker()));
+
+  for (let i = 0; i < pending.length; i++) {
+    const c = pending[i];
+    combinations.push({
+      id: `${c.from.id}->${c.to.id}`,
+      from: { assetId: c.from.id, name: c.from.name, chain: c.from.chain, icon: c.from.icon, walletType: c.fromType, decimals: c.from.decimals },
+      to:   { assetId: c.to.id,   name: c.to.name,   chain: c.to.chain,   icon: c.to.icon,   walletType: c.toType,   decimals: c.to.decimals },
+      minAmount: c.minAmount, maxAmount: c.maxAmount, toMinAmount: c.minToAmount, suggestedAmount: results[i],
+      fromWalletConnected: c.fromConnected,
+      toWalletConnected:   c.toConnected,
+      canTrade: c.canTrade,
+      canAfford: c.canAfford,
+      balanceKnown: c.balanceKnown,
+      walletBalance: c.walletBalance,
+      comboStatus: c.comboStatus,
+    });
+  }
+
+  console.log(`[combinations] ${combinations.length} pairs built in ${Date.now() - startedAt}ms (quotes: ${quoteStats.calls} calls, ${quoteStats.hits} hits, ${quoteStats.errors} errors, ${quoteEnabledCount} eligible)`);
+
   combinations.sort((a, b) => {
     if (a.canTrade && !b.canTrade) return -1;
     if (!a.canTrade && b.canTrade) return 1;
@@ -1376,21 +1284,6 @@ app.get("/api/route-readiness", async (req, res) => {
     const hasQualifiedChainStart = (payload.assets || []).some((a) => a.isChainStart && a.sufficient);
     const executablePlanCountGet = preview.executablePlanCount || 0;
     const builtChains = (payload.flowChains || []).length;
-    // Banner: offer a native consolidation hint when no beam chains were built (no Garden flow from seeds),
-    // even if standalone/matrix hops still look executable — POST /api/run keeps stricter gating.
-    const shouldResolveConsolidation =
-      mode === "allChains" &&
-      !hasQualifiedChainStart &&
-      (executablePlanCountGet === 0 || builtChains === 0);
-    let consolidation = null;
-    if (shouldResolveConsolidation) {
-      const { resolveConsolidationTargetIfNoSeeds } = require("./utils/consolidationTarget");
-      try {
-        consolidation = await resolveConsolidationTargetIfNoSeeds({ supported, gasMap });
-      } catch (e) {
-        consolidation = { eligible: false, reason: "resolver_error", error: e.message };
-      }
-    }
     // allChains: skip preflight simulation — quotes 200+ routes and hangs the readiness poll.
     const simulation = mode === "allChains"
       ? { ok: true, skipped: true, reason: "allChains_preflight_skipped" }
@@ -1401,6 +1294,36 @@ app.get("/api/route-readiness", async (req, res) => {
         ? { fromAsset: r.fromAsset, toAsset: r.toAsset, label: r.label || null }
         : null)).filter(Boolean)
       : [];
+
+    // allChains: compute required seed via price-based calculation.
+    // Uses CoinGecko prices (cached 24h) + 5% buffer + fee formula.
+    let requiredSeedAtomic = null;
+    let requiredSeedUsd = null;
+    let seedHopBreakdown = null;
+    let seedCalcInfo = null;
+    if (mode === "allChains" && Array.isArray(preview.plan) && preview.plan.length > 0) {
+      try {
+        await priceFeed.fetchPrices();
+        const seedReq = priceFeed.computePriceBasedSeedRequirement(preview.plan);
+        if (seedReq && seedReq.requiredSeedAtomic > 0) {
+          requiredSeedAtomic = seedReq.requiredSeedAtomic;
+          requiredSeedUsd = seedReq.requiredSeedUsd;
+          seedHopBreakdown = seedReq.hopBreakdown;
+          seedCalcInfo = {
+            maxHopMinUsd: seedReq.maxHopMinUsd,
+            bottleneckFeeDecay: seedReq.bottleneckFeeDecay,
+            hops: seedReq.hops,
+            bottleneckHop: seedReq.bottleneckHop,
+            seedTicker: seedReq.seedTicker,
+            seedPriceUsd: seedReq.seedPriceUsd,
+          };
+          console.log(`[readiness] price-based seed: ${requiredSeedAtomic} atomic ≈ $${requiredSeedUsd} (bottleneck hop ${seedReq.bottleneckHop + 1}: $${seedReq.maxHopMinUsd} min after ${seedReq.bottleneckFeeDecay} decay, ${seedReq.hops} hops)`);
+        }
+      } catch (e) {
+        console.warn("[readiness] price-based seed calc failed:", e.message);
+      }
+    }
+
     res.json({
       ...payload,
       mode,
@@ -1414,8 +1337,12 @@ app.get("/api/route-readiness", async (req, res) => {
       canInitiate: (preview.executablePlanCount || 0) > 0,
       hasQualifiedChainStart,
       executablePlanCount: executablePlanCountGet,
-      consolidation,
+      chosenSeed: preview.chosenSeed || null,
       simulation,
+      requiredSeedAtomic,
+      requiredSeedUsd,
+      seedHopBreakdown,
+      seedCalcInfo,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });

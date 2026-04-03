@@ -2604,28 +2604,29 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
     let lastPassResult = null; // set when the final hop completes — used for cycle closing
 
     // allChains pre-check: ensure seed balance covers min_amount requirements for all hops.
-    // Quotes each hop at min_amount, works backward to compute the required seed amount.
-    // Then APPLY the computed amount to the first hop so downstream hops receive enough.
+    // Uses CoinGecko prices (24h cache) + 5% buffer to compute the required seed amount
+    // accounting for the most expensive hop's min_amount across the entire chain.
     if (mode === "allChains" && chainRoutes.length >= 1) {
-      const reqStart = await computeChainRequiredSeed(chainRoutes).catch(() => null);
-      if (reqStart) {
-        const seedBal = getWalletAssetAtomicBalance(chainRoutes[0]);
-        const seedBalNum = seedBal !== null ? Number(seedBal) : null;
-        if (seedBalNum !== null && seedBalNum < reqStart.requiredSeedAtomic) {
+      const priceFeed = require('../agents/price-feed');
+      await priceFeed.fetchPrices().catch(() => {});
+      const seedReq = priceFeed.computePriceBasedSeedRequirement(chainRoutes);
+      const seedBal = getWalletAssetAtomicBalance(chainRoutes[0]);
+      const seedBalNum = seedBal !== null ? Number(seedBal) : null;
+
+      if (seedReq && seedReq.requiredSeedAtomic > 0) {
+        if (seedBalNum !== null && seedBalNum < seedReq.requiredSeedAtomic) {
           emit("suite_info", {
-            message: `allChains aborted: seed balance ${seedBalNum} < required ${reqStart.requiredSeedAtomic} atomic (${chainRoutes[0].fromAsset}) — ${chainRoutes.length}-hop chain needs more funding`,
-            requiredSeedAtomic: reqStart.requiredSeedAtomic,
+            message: `allChains aborted: seed balance ${seedBalNum} < required ${seedReq.requiredSeedAtomic} atomic ≈ $${seedReq.requiredSeedUsd} (${chainRoutes[0].fromAsset}) — bottleneck: hop ${seedReq.bottleneckHop + 1} needs $${seedReq.maxHopMinUsd} min`,
+            requiredSeedAtomic: seedReq.requiredSeedAtomic,
+            requiredSeedUsd: seedReq.requiredSeedUsd,
             seedBalance: seedBalNum,
-            shortfall: reqStart.requiredSeedAtomic - seedBalNum,
-            hopBreakdown: reqStart.hopBreakdown,
+            shortfall: seedReq.requiredSeedAtomic - seedBalNum,
+            hopBreakdown: seedReq.hopBreakdown,
           });
           return;
         }
-        // Apply the fee-compounded amount to the first hop so each downstream
-        // hop receives at least its min_amount after 0.35% fees per hop.
-        // Use the larger of: quote-based backward pass OR formula-based estimate.
         const seedAmount = clampGardenQuoteAmount(
-          Math.max(reqStart.requiredSeedAtomic, chainRoutes[0].amount || 0),
+          Math.max(seedReq.requiredSeedAtomic, chainRoutes[0].amount || 0),
           chainRoutes[0].fromMeta
         );
         const cappedSeedAmount = seedBalNum !== null
@@ -2633,19 +2634,16 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
           : seedAmount;
         chainRoutes[0].amount = cappedSeedAmount;
         emit("suite_info", {
-          message: `allChains seed check passed: balance ${seedBalNum} >= required ${reqStart.requiredSeedAtomic} for ${chainRoutes.length}-hop chain — first hop amount set to ${cappedSeedAmount}`,
-          requiredSeedAtomic: reqStart.requiredSeedAtomic,
+          message: `allChains seed: ${cappedSeedAmount} atomic ≈ $${seedReq.requiredSeedUsd} for ${chainRoutes.length} hops (bottleneck: hop ${seedReq.bottleneckHop + 1} needs $${seedReq.maxHopMinUsd} min + 5% buf + compounded 0.35%/hop)`,
+          requiredSeedAtomic: seedReq.requiredSeedAtomic,
           appliedSeedAmount: cappedSeedAmount,
-          hopBreakdown: reqStart.hopBreakdown,
         });
       } else {
-        // Quote-based calculation unavailable — use formula (1/(1-0.0035))^N as fallback
+        // Price feed unavailable — use seed's own min_amount × fee formula as fallback
         const N = chainRoutes.length;
         const feeMultiplier = Math.pow(1 / (1 - 0.0035), N);
         const hop0Min = Math.max(1, parseInt(String(chainRoutes[0].fromMeta?.min_amount ?? 50000), 10) || 50000);
         const formulaAmount = Math.ceil(hop0Min * feeMultiplier);
-        const seedBal = getWalletAssetAtomicBalance(chainRoutes[0]);
-        const seedBalNum = seedBal !== null ? Number(seedBal) : null;
         const fallbackAmount = clampGardenQuoteAmount(
           Math.max(formulaAmount, chainRoutes[0].amount || 0),
           chainRoutes[0].fromMeta
@@ -2654,7 +2652,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
           ? Math.min(fallbackAmount, seedBalNum)
           : fallbackAmount;
         emit("suite_info", {
-          message: `allChains seed amount set via fee formula: ${chainRoutes[0].amount} (min ${hop0Min} × ${feeMultiplier.toFixed(4)} for ${N} hops)`,
+          message: `allChains seed (fallback formula): ${chainRoutes[0].amount} (min ${hop0Min} × ${feeMultiplier.toFixed(4)} for ${N} hops)`,
         });
       }
     }
@@ -3286,4 +3284,5 @@ module.exports = {
   abortTest,
   abortAll,
   getSuiteRunStatus,
+  computeChainRequiredSeed,
 };
