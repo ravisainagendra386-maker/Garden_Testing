@@ -691,8 +691,10 @@ function buildChainReactionFlow(routes, opts = {}) {
   }
 
   /**
-   * Pick the best seed for a cluster: max transitive reach within the cluster adj,
-   * fee-eligible, random raffle among ties.
+   * Pick the seed for a cluster: only assets whose balance covers the
+   * fee-compounded requirement for the full chain are eligible.
+   * Among eligible seeds, one is chosen randomly (raffle).
+   * Returns null when no asset can fund the chain (→ consolidation needed).
    */
   function pickSeedForCluster(pool, clusterAdj) {
     if (!pool.length) return null;
@@ -704,14 +706,18 @@ function buildChainReactionFlow(routes, opts = {}) {
         : BigInt(s.minAmt);
       const bal = toComparableBigInt(s.balance);
       const feeOk = bal !== null && bal >= required;
-      return { seed: s, reachCount: reach.size, nHops, feeOk };
+      return { seed: s, reachCount: reach.size, nHops, feeOk, required };
     });
-    const maxReach = Math.max(...scored.map((s) => s.reachCount));
-    const best = scored.filter((s) => s.reachCount === maxReach && s.feeOk);
-    const fallback = !best.length ? scored.filter((s) => s.reachCount === maxReach) : [];
-    const finalPool = best.length ? best : (fallback.length ? fallback : scored);
-    const pick = finalPool[Math.floor(Math.random() * finalPool.length)];
-    return pick ? pick.seed : null;
+
+    const funded = scored.filter((s) => s.feeOk);
+    if (!funded.length) {
+      console.log(`[pickSeedForCluster] no funded seed (pool=${pool.length}, all underfunded)`);
+      return null;
+    }
+
+    const pick = funded[Math.floor(Math.random() * funded.length)];
+    console.log(`[pickSeedForCluster] chose=${pick.seed.assetId} reach=${pick.reachCount} (raffle from ${funded.length} funded out of ${pool.length})`);
+    return pick.seed;
   }
 
   const chains = [];
@@ -721,13 +727,28 @@ function buildChainReactionFlow(routes, opts = {}) {
     // allChains: detect isolation clusters, run one cycle per cluster.
     // Each cluster gets its own seed + own chainFirstPath, so assets stay varied
     // within a cluster instead of being forced to WBTC at every isolation boundary.
+
+    // Build the full asset pool (no balance pre-filter) — pickSeedForCluster
+    // does the real feeOk gate, so every asset with a known balance is a candidate.
+    const allAssetPool = [];
+    const allAssetSeen = new Set();
+    for (const r of connected) {
+      const assetId = r.fromAsset;
+      if (allAssetSeen.has(assetId)) continue;
+      allAssetSeen.add(assetId);
+      const bal = balances.get(assetId);
+      if (bal === null || bal === undefined) continue;
+      const minAmt = Number(r.amount || r.fromMeta?.min_amount || 50000);
+      allAssetPool.push({ assetId, balance: bal, minAmt, outDegree: adj.get(assetId)?.length || 0 });
+    }
+
     const clusters = detectIsolationClusters(adj, allChainKeysFromAPI);
     console.log(`[DEBUG] Detected ${clusters.length} isolation cluster(s):`,
       clusters.map(c => `[${[...c].sort().join(', ')}]`).join(' | '));
 
     for (const cluster of clusters) {
       const clusterAdj = filterAdjToChains(adj, cluster);
-      const clusterPool = (candidateSeeds.length ? candidateSeeds : seedAssets)
+      const clusterPool = allAssetPool
         .filter(s => cluster.has(getChainRouteStepKey(s.assetId)));
 
       const seed = pickSeedForCluster(clusterPool, clusterAdj);
@@ -1062,7 +1083,7 @@ function buildLiquidSourceAssetsByChain(connectedRoutes, balances, gasBalances) 
   return out;
 }
 
-/** One random funded source asset per chain prefix (Garden network), for allChains seeds. */
+/** Best-funded source asset per chain prefix (Garden network), for allChains seeds. */
 function pickOneRandomAssetPerChainPrefix(connectedRoutes, balances, gasBalances) {
   const by = new Map();
   for (const r of connectedRoutes) {
@@ -1072,7 +1093,10 @@ function pickOneRandomAssetPerChainPrefix(connectedRoutes, balances, gasBalances
   }
   const picked = new Map();
   for (const [ck, assetsSet] of by) {
-    const liquid = [...assetsSet].filter((a) => isSourceLiquidForRoute(a, balances, gasBalances, connectedRoutes));
+    const liquid = [...assetsSet].filter((a) => {
+      if (!isSourceLiquidForRoute(a, balances, gasBalances, connectedRoutes)) return false;
+      return true;
+    });
     if (!liquid.length) continue;
     const chosen = liquid[Math.floor(Math.random() * liquid.length)];
     picked.set(ck, chosen);
@@ -1771,7 +1795,7 @@ class RouteOptimizerAgent {
       if (!available.length) continue;
       const chosen = available[Math.floor(Math.random() * available.length)];
       picked.add(chosen);
-      console.log(`[RouteOptimizerAgent] chain=${ck} pickedSeed=${chosen}`);
+      console.log(`[RouteOptimizerAgent] chain=${ck} pickedSeed=${chosen} (random from ${available.length} liquid)`);
     }
     return picked;
   }

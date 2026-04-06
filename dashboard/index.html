@@ -2073,7 +2073,7 @@ function showReadinessModal(readiness) {
     ? String(chosenSeed)
     : (consolidationTargets[0]?.id ? String(consolidationTargets[0].id) : '');
 
-  const runBypassHtml = (isAllChains && consolidationSources.length)
+  const runBypassHtml = (isAllChains && !effectiveCanRun && consolidationSources.length)
     ? `<div id="consolidationPanel" data-fee-multiplier="${_chainFeeMultiplier.toFixed(8)}" data-total-hops="${_totalChainHops}" style="margin-top:10px;padding:12px;border:1px solid rgba(234,179,8,.25);border-radius:10px;background:rgba(234,179,8,.04)">
         <div style="font-size:11px;font-weight:700;color:var(--yellow);margin-bottom:8px">⚡ consolidate assets into one seed</div>
         <div style="font-size:10px;color:var(--muted);margin-bottom:10px;line-height:1.5">Select assets to swap into the route seed, then run allChains. Gas is checked before each hop.</div>
@@ -4100,23 +4100,41 @@ async function ensureChain(chainIdHex) {
 
 let connectedWallets = { evm: false, btc: false, solana: false, privy: false, starknet: false, sui: false, tron: false };
 let evmAddress = null;
+let _evmSource = null; // 'metamask' | 'envkey' | null — tracks active EVM source client-side
+let _evmAccountsChangedHandler = null; // stored so we can removeListener on switch
 let privyFormVisible = false;
 let _envKeyAvailable = false; // set true on load if server has envkey configured
 let _evmBalancesReady = false; // true once fetchEvmBalances completes at least once
 let _evmBalancePromise = null; // resolves when current fetchEvmBalances finishes
 
+// Detach MetaMask accountsChanged listener so it can't overwrite .env state
+function _detachEvmProviderListeners() {
+  if (window._evmProvider && _evmAccountsChangedHandler) {
+    try { window._evmProvider.removeListener('accountsChanged', _evmAccountsChangedHandler); } catch(_) {}
+  }
+  _evmAccountsChangedHandler = null;
+  window._evmProvider = null;
+  window._evmWalletName = null;
+}
+
 // Force switch active EVM signer back to .env key (override MetaMask)
 async function useEnvKeyEvm() {
   if (!confirm('Switch to .env private key for EVM signing?\n\nMetaMask will no longer be used until you reconnect it.')) return;
   try {
+    _detachEvmProviderListeners();
     const r = await fetch('/api/wallet/use-envkey', { method: 'POST',
       headers: {'Content-Type':'application/json'}, body: JSON.stringify({ type: 'evm' }) });
     const d = await r.json();
     if (!d.ok) throw new Error(d.error || 'Failed');
     evmAddress = d.address;
+    _evmSource = 'envkey';
     connectedWallets.evm = true;
-    document.getElementById('evm-addr').textContent = shortenAddr(d.address) + ' 🔐 .env key';
-    document.getElementById('evm-addr').style.color = 'var(--yellow)';
+    const addrEl = document.getElementById('evm-addr');
+    addrEl.textContent = shortenAddr(d.address) + ' 🔐 .env key';
+    addrEl.dataset.full = d.address;
+    addrEl.style.color = 'var(--yellow)';
+    document.getElementById('evm-wallet-icon').textContent = '🔐';
+    document.getElementById('evm-wallet-name').textContent = '(.env key)';
     document.getElementById('evm-btn').textContent = 'Override with MetaMask';
     document.getElementById('evm-btn').className = 'btn btn-ghost';
     document.getElementById('evm-btn').onclick = connectMetaMask;
@@ -4517,9 +4535,11 @@ async function connectEvmWallet() {
 
 // Internal EVM connect action called from modal
 async function _doConnectEvm(provider) {
+  _detachEvmProviderListeners();
   const accounts = await provider.request({ method: 'eth_requestAccounts' });
   if (!accounts?.length) throw new Error('No accounts returned');
   evmAddress = accounts[0];
+  _evmSource = 'metamask';
   connectedWallets.evm = true;
   invalidateCombos();
   window._evmProvider = provider;
@@ -4546,7 +4566,8 @@ async function _doConnectEvm(provider) {
   updateWalletCount();
   fetchEvmBalances(evmAddress);
 
-  provider.on('accountsChanged', (accs) => {
+  _evmAccountsChangedHandler = (accs) => {
+    if (_evmSource !== 'metamask') return;
     if (!accs.length) disconnectEvm();
     else {
       evmAddress = accs[0];
@@ -4556,7 +4577,8 @@ async function _doConnectEvm(provider) {
       renderEvmChains(true, evmAddress);
       fetch('/api/wallet/evm', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ address: evmAddress }) });
     }
-  });
+  };
+  provider.on('accountsChanged', _evmAccountsChangedHandler);
 }
 
 // Keep connectMetaMask as alias
@@ -4566,8 +4588,7 @@ const connectMetaMask = connectEvmWallet;
 async function switchEvmWallet() {
   const providers = getEvmProviders();
   if (providers.length === 0) { alert('No EVM wallets detected.'); return; }
-  // Disconnect current first silently
-  window._evmProvider = null;
+  _detachEvmProviderListeners();
   const provider = providers.length > 1 ? await pickEvmWallet() : providers[0];
   if (!provider) return;
   try {
@@ -4598,8 +4619,9 @@ async function switchEvmWallet() {
 }
 
 async function disconnectEvm() {
+  _detachEvmProviderListeners();
   invalidateCombos();
-  connectedWallets.evm = false; evmAddress = null;
+  connectedWallets.evm = false; evmAddress = null; _evmSource = null;
   setTimeout(updateEnvKeyNotice, 500); // re-check — envkey may re-activate
   await fetch('/api/wallet/disconnect', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'evm' }) });
 
@@ -4609,6 +4631,7 @@ async function disconnectEvm() {
     const d = await r.json();
     if (d.evm && d.evm.source === 'envkey') {
       evmAddress = d.evm.address;
+      _evmSource = 'envkey';
       connectedWallets.evm = true;
       document.getElementById('evm-addr').textContent = shortenAddr(d.evm.address) + ' 🔐 .env key';
       document.getElementById('evm-addr').style.color = 'var(--yellow)';
@@ -4909,7 +4932,7 @@ async function loadWalletStates() {
 
     // EVM
     if (d.evm) {
-      connectedWallets.evm = true; evmAddress = d.evm.address;
+      connectedWallets.evm = true; evmAddress = d.evm.address; _evmSource = d.evm.source || null;
       const _evmEl = document.getElementById('evm-addr');
       const _evmDisplay = d.evm.addressDisplay || d.evm.address;
       _evmEl.textContent = shortenAddr(_evmDisplay) + srcBadge(d.evm.source, 'metamask');
