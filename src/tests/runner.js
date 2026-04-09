@@ -14,6 +14,11 @@ const FREE_RPCS = {
   alpen:      'https://rpc.testnet.alpenlabs.io',
 };
 
+// Fallback RPCs for chains whose primary public RPC is unreliable
+const FREE_RPC_FALLBACKS = {
+  ethereum: ['https://rpc2.sepolia.org', 'https://ethereum-sepolia-rpc.publicnode.com'],
+};
+
 function resolveRpcUrl(chainIdOrAsset) {
   const { chains } = require('../config');
   if (typeof chainIdOrAsset === 'number' || (typeof chainIdOrAsset === 'string' && /^\d+$/.test(chainIdOrAsset))) {
@@ -36,6 +41,16 @@ function resolveRpcUrl(chainIdOrAsset) {
   const raw = String(chainIdOrAsset).split(':')[0];
   const stripped = raw.replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, '');
   return chains[stripped]?.rpc || FREE_RPCS[stripped] || chains[raw]?.rpc || null;
+}
+
+// Returns array of RPC URLs: primary + fallbacks. Used when primary fails.
+function resolveRpcUrlList(chainIdOrAsset) {
+  const primary = resolveRpcUrl(chainIdOrAsset);
+  if (!primary) return [];
+  const raw = String(chainIdOrAsset).split(':')[0];
+  const stripped = raw.replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, '');
+  const fallbacks = FREE_RPC_FALLBACKS[stripped] || [];
+  return [primary, ...fallbacks.filter(u => u !== primary)];
 }
 
 const config  = require("../config");
@@ -297,15 +312,15 @@ async function resolveToAssetWithGasSubstitution(route, supportedAssets, gasCach
   // Only EVM destinations need the native-gas check for now
   if (route.toChain !== 'evm') return { route, ok: true };
 
-  // Look up gas balance (cached → live RPC fallback with 3s timeout)
+  // Look up gas balance (cached → live RPC fallback with 3s timeout per RPC)
   let gasWei = gasCache?.get(destChainKey);
   if (gasWei === undefined) {
     const evmAddress = walletState.getAddressByType('evm');
     if (evmAddress) {
-      try {
-        const { ethers } = require('ethers');
-        const rpcUrl = resolveRpcUrl(destChainRaw);
-        if (rpcUrl) {
+      const { ethers } = require('ethers');
+      const rpcUrls = resolveRpcUrlList(destChainRaw);
+      for (const rpcUrl of rpcUrls) {
+        try {
           const provider = new ethers.JsonRpcProvider(rpcUrl);
           const bal = await Promise.race([
             provider.getBalance(evmAddress),
@@ -313,8 +328,9 @@ async function resolveToAssetWithGasSubstitution(route, supportedAssets, gasCach
           ]);
           gasWei = BigInt(bal.toString());
           if (gasCache) gasCache.set(destChainKey, gasWei);
-        }
-      } catch (_) { gasWei = undefined; }
+          break;
+        } catch (_) { /* try next RPC */ }
+      }
     }
   }
 
@@ -654,7 +670,11 @@ async function getQuoteWithDestinationFallback({
       if (getWalletTypeForAsset(a) !== toChain) return false;
       return true;
     });
-    candidates.sort((x, y) => String(x.id).localeCompare(String(y.id)));
+    // Shuffle candidates randomly — no alphabetical or deterministic bias
+    for (let i = candidates.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+    }
 
     for (const a of candidates) {
       tried.add(String(a.id));
@@ -1368,8 +1388,10 @@ async function runRoute({
 
       // Notify Garden can take a long time depending on chain/indexer latency.
       // We use a "soft timeout": retry frequently for 20 minutes, then back off
-      // to every 10 minutes until the order reaches a terminal state.
+      // to every 10 minutes. Hard timeout at 30 minutes to prevent indefinite hang
+      // when the RPC is down and confirmation wait already failed.
       const NOTIFY_SOFT_TIMEOUT = 20 * 60 * 1000;
+      const NOTIFY_HARD_TIMEOUT = 30 * 60 * 1000;
       const NOTIFY_POST_SOFT_INTERVAL = 10 * 60 * 1000;
       function getNotifyInterval(elapsedMs) {
         if (elapsedMs < 2 * 60 * 1000)  return 10000;
@@ -1384,6 +1406,10 @@ async function runRoute({
 
       while (!notifyDone) {
         checkAbort();
+        const elapsed = Date.now() - notifyStart;
+        if (elapsed > NOTIFY_HARD_TIMEOUT) {
+          throw new Error(`Notify Garden timed out after ${Math.round(elapsed / 60000)}m — RPC may be unreachable (tx: ${initTxHash})`);
+        }
         notifyAttempts++;
         try {
           await garden.patchOrder(orderId, "initiate", initTxHash);
@@ -1412,12 +1438,10 @@ async function runRoute({
           } catch(checkErr) {
             if (checkErr.message.includes("terminal status")) throw checkErr;
           }
-          const interval = getNotifyInterval(Date.now() - notifyStart);
+          const interval = getNotifyInterval(elapsed);
           await new Promise(r => setTimeout(r, interval));
         }
       }
-
-      // No hard timeout here: if patching fails, we keep polling/backing off until terminal.
     }
 
     // ── Check current state ──
@@ -2704,7 +2728,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
       const route = destCheck.route;
 
       // ── Execute the hop ──────────────────────────────────────────────
-      const result = await runRoute({ ...route, suiteEpoch });
+      const result = await runRoute({ ...route, suiteEpoch, executionMode: mode });
       results.push(result);
 
       // If the dest was substituted to native and the hop passed, mark gas as funded
@@ -2725,8 +2749,12 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
               if (triedDests.has(a.id)) return false;
               if (a.id === route.fromAsset) return false;
               return true;
-            })
-            .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+            });
+          // Shuffle randomly — no alphabetical bias
+          for (let j = destCandidates.length - 1; j > 0; j--) {
+            const k = Math.floor(Math.random() * (j + 1));
+            [destCandidates[j], destCandidates[k]] = [destCandidates[k], destCandidates[j]];
+          }
           let replaced = false;
           for (const cand of destCandidates) {
             if (_abortEpoch !== suiteEpoch) break;
@@ -2761,7 +2789,42 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
           }
           if (replaced) continue;
 
-          // All dest fallbacks failed — skip this hop, continue to next child
+          // All dest fallbacks failed — try bypassing this destination chain
+          // Route current source directly to the NEXT destination chain (destination chain fallback)
+          if (i + 1 < chainRoutes.length) {
+            const nextHop = chainRoutes[i + 1];
+            const nextChainPrefix = String(nextHop.toAsset || '').split(':')[0].toLowerCase();
+            const bypassLabel = `${route.fromMeta?.name || route.fromAsset} → ${nextHop.toMeta?.name || nextHop.toAsset} [chain skip: ${toChainPrefix}]`;
+            const bypassRoute = {
+              ...route,
+              toAsset: nextHop.toAsset,
+              toMeta: nextHop.toMeta,
+              toChain: nextHop.toChain,
+              label: bypassLabel,
+            };
+            const bypassCheck = await resolveToAssetWithGasSubstitution(bypassRoute, supportedAssets, gasCache);
+            if (bypassCheck.ok) {
+              const bypassRes = await runRoute({ ...bypassCheck.route, suiteEpoch, executionMode: "allChains" });
+              results.push(bypassRes);
+              if (bypassRes.status === "pass") {
+                emit("suite_info", {
+                  message: `Skipped ${toChainPrefix} (insufficient liquidity) — bypassed to ${nextChainPrefix}: ${bypassLabel}`,
+                });
+                // Patch the hop after the next one (if it exists) with the bypass result
+                if (i + 2 < chainRoutes.length) {
+                  patchNextChainHopFromReceive(chainRoutes[i + 2], bypassRes);
+                } else if (i + 1 < chainRoutes.length) {
+                  lastPassResult = bypassRes;
+                }
+                // Update loop to skip the next hop since we just executed its destination
+                i = i + 1; // Will become i+2 after for loop increment
+                replaced = true;
+              }
+            }
+          }
+          if (replaced) continue;
+
+          // All dest fallbacks AND destination chain bypass failed — skip this hop, continue to next child
           if (i + 1 < chainRoutes.length) {
             emit("suite_info", {
               message: `Hop ${i + 1} failed (${route.label}): ${result.error || result.status} — skipping to next child`,
@@ -3079,19 +3142,21 @@ async function buildFundingTreePlan(amountOverrides = {}, opts = {}) {
     }
     await Promise.all([...destChainRaws].map(async (chainRaw) => {
       const chainKey = chainRaw.replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, '');
-      try {
-        const rpcUrl = resolveRpcUrl(chainRaw);
-        if (!rpcUrl) return;
-        const provider = new ethers.JsonRpcProvider(rpcUrl);
-        const bal = await Promise.race([
-          provider.getBalance(evmAddr),
-          new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000)),
-        ]);
-        if (BigInt(bal.toString()) >= MIN_NATIVE_WEI_FOR_GAS) return;
-        const nativeMeta = findNativeFeeAssetOnChain(assets, chainRaw);
-        if (!nativeMeta?.id) return;
-        chainGasNeeds.set(chainKey, { chainRaw, nativeMeta });
-      } catch (_) {}
+      const rpcUrls = resolveRpcUrlList(chainRaw);
+      for (const rpcUrl of rpcUrls) {
+        try {
+          const provider = new ethers.JsonRpcProvider(rpcUrl);
+          const bal = await Promise.race([
+            provider.getBalance(evmAddr),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 3000)),
+          ]);
+          if (BigInt(bal.toString()) >= MIN_NATIVE_WEI_FOR_GAS) return;
+          const nativeMeta = findNativeFeeAssetOnChain(assets, chainRaw);
+          if (!nativeMeta?.id) return;
+          chainGasNeeds.set(chainKey, { chainRaw, nativeMeta });
+          return;
+        } catch (_) { /* try next RPC */ }
+      }
     }));
   }
 

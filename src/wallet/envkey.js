@@ -122,7 +122,7 @@ function getRpcCandidates(chainIdOrKey) {
       candidates.push(
         "https://ethereum-sepolia-rpc.publicnode.com",
         "https://sepolia.gateway.tenderly.co",
-        "https://rpc2.sepolia.org"
+        "https://1rpc.io/sepolia"
       );
     } else if (num === 84532) {
       candidates.push("https://sepolia.base.org");
@@ -133,7 +133,7 @@ function getRpcCandidates(chainIdOrKey) {
     candidates.push(
       "https://ethereum-sepolia-rpc.publicnode.com",
       "https://sepolia.gateway.tenderly.co",
-      "https://rpc2.sepolia.org"
+      "https://1rpc.io/sepolia"
     );
   }
 
@@ -153,10 +153,20 @@ async function sendEvmTransaction({ to, data, value = "0x0", chainId, gasLimit }
   const rpcCandidates = getRpcCandidates(chainId);
   if (!rpcCandidates.length) throw new Error(`No RPC found for chain: ${chainId}`);
 
+  const RPC_TIMEOUT_MS = 30_000; // 30s max per RPC attempt
+  const RETRY_DELAY_MS = 2_000;  // 2s pause between retries
+
   let lastErr = null;
-  for (const rpc of rpcCandidates) {
+  for (let i = 0; i < rpcCandidates.length; i++) {
+    const rpc = rpcCandidates[i];
     try {
-      const provider = new ethers.JsonRpcProvider(rpc);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
+
+      const provider = new ethers.JsonRpcProvider(rpc, undefined, {
+        staticNetwork: true,
+        batchMaxCount: 1,
+      });
       const wallet = new ethers.Wallet(getEvmPrivateKey(), provider);
       // Resolve nonce: use tracked nonce if higher than what the RPC reports
       const onChainNonce = await provider.getTransactionCount(wallet.address, "pending");
@@ -174,10 +184,17 @@ async function sendEvmTransaction({ to, data, value = "0x0", chainId, gasLimit }
       console.log(`[envkey/evm] broadcast: ${sent.hash}`);
       _nonceByChain.set(String(chainId), nonce);
       await sent.wait(1);
+      clearTimeout(timer);
       return sent.hash;
     } catch (e) {
       lastErr = e;
-      console.warn(`[envkey/evm] RPC failed chain=${chainId} rpc=${rpc}: ${e.message}`);
+      const isTimeout = e.name === 'AbortError' || /abort|timeout/i.test(e.message);
+      const isServerError = /5\d{2}|SERVER_ERROR/i.test(e.message);
+      console.warn(`[envkey/evm] RPC failed chain=${chainId} rpc=${rpc}${isTimeout ? ' (timeout)' : isServerError ? ' (server error)' : ''}: ${e.message}`);
+      // Pause before trying next RPC to avoid rapid-fire requests
+      if (i < rpcCandidates.length - 1) {
+        await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
+      }
     }
   }
   throw lastErr || new Error(`All RPC candidates failed for chain ${chainId}`);
