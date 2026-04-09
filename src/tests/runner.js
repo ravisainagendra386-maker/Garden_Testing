@@ -127,12 +127,14 @@ function patchNextChainHopFromReceive(nextRoute, prevPassResult) {
   const amount = clampGardenQuoteAmount(nextHopAmountAtomic, actualDestMeta);
   const fromName = actualDestMeta.name || actualDestAsset;
   const toName = nextRoute.toMeta?.name || nextRoute.toAsset;
+  const toChainName = config.chains[nextRoute.toChain]?.name || nextRoute.toChain;
+  const fromChainName = config.chains[fromChain]?.name || fromChain;
   Object.assign(nextRoute, {
     fromAsset: actualDestAsset,
     fromMeta: actualDestMeta,
     fromChain,
     amount,
-    label: `${fromName} → ${toName}`,
+    label: `${fromName} [${fromChainName}] → ${toName} [${toChainName}]`,
   });
 }
 
@@ -1813,7 +1815,7 @@ async function buildRoutes(amountOverrides = {}, mode = "allTests", seedAllowlis
         amount:    chosenAmount,
         fromMeta:  from,
         toMeta:    to,
-        label:     `${from.name} → ${to.name}`,
+        label:     `${from.name} [${fromChain}] → ${to.name} [${toChain}]`,
         executionMode: mode,
       });
     }
@@ -2418,7 +2420,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
       const gasRoute = {
         fromAsset: fromMeta.id, toAsset: nativeMeta.id,
         fromChain, toChain: 'evm', amount, fromMeta, toMeta: nativeMeta,
-        label: `${fromMeta.name || fromMeta.id} → ${nativeMeta.name || nativeMeta.id} [gas fill: ${destChainKey}]`,
+        label: `${fromMeta.name || fromMeta.id} [${fromChain}] → ${nativeMeta.name || nativeMeta.id} [evm] [gas fill: ${destChainKey}]`,
         executionMode: 'allTests', suiteEpoch,
       };
       emit("suite_info", { message: `Pre-filling gas on ${destChainKey}: ${gasRoute.label}` });
@@ -2509,7 +2511,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
             fromAsset: altFromMeta.id, toAsset: childMeta.id,
             fromChain: altFromChain, toChain, amount,
             fromMeta: altFromMeta, toMeta: childMeta,
-            label: `${altFromMeta.name || altFromMeta.id} → ${childMeta.name || childMeta.id} [fallback parent]`,
+            label: `${altFromMeta.name || altFromMeta.id} [${altFromChain}] → ${childMeta.name || childMeta.id} [${toChain}] [fallback parent]`,
             executionMode: 'allTests', suiteEpoch,
           };
           emit("suite_info", { message: `Fallback parent for ${childMeta.id}: trying ${altFromMeta.id}` });
