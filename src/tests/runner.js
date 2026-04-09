@@ -2738,7 +2738,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
           // Bypass skipped chain: re-route to next chain's destination.
           // Keep current source, skip the intermediary chain that has no gas.
           const nextHop = chainRoutes[i + 1];
-          const bypassLabel = `${chainRoutes[i].fromMeta?.name || chainRoutes[i].fromAsset} → ${nextHop.toMeta?.name || nextHop.toAsset}`;
+          const bypassLabel = `${chainRoutes[i].fromMeta?.name || chainRoutes[i].fromAsset} [${chainRoutes[i].fromChain}] → ${nextHop.toMeta?.name || nextHop.toAsset} [${nextHop.toChain}]`;
           Object.assign(nextHop, {
             fromAsset: chainRoutes[i].fromAsset,
             fromMeta:  chainRoutes[i].fromMeta,
@@ -2794,7 +2794,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
               ...route,
               toAsset: cand.id,
               toMeta: cand,
-              label: `${route.fromMeta?.name || route.fromAsset} → ${cand.name || cand.id} [dest fallback]`,
+              label: `${route.fromMeta?.name || route.fromAsset} [${route.fromChain}] → ${cand.name || cand.id} [${route.toChain}] [dest fallback]`,
             };
             const candCheck = await resolveToAssetWithGasSubstitution(candRoute, supportedAssets, gasCache);
             if (!candCheck.ok) continue;
@@ -2825,7 +2825,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
           if (i + 1 < chainRoutes.length) {
             const nextHop = chainRoutes[i + 1];
             const nextChainPrefix = String(nextHop.toAsset || '').split(':')[0].toLowerCase();
-            const bypassLabel = `${route.fromMeta?.name || route.fromAsset} → ${nextHop.toMeta?.name || nextHop.toAsset} [chain skip: ${toChainPrefix}]`;
+            const bypassLabel = `${route.fromMeta?.name || route.fromAsset} [${route.fromChain}] → ${nextHop.toMeta?.name || nextHop.toAsset} [${nextHop.toChain}] [chain skip: ${toChainPrefix}]`;
             const bypassRoute = {
               ...route,
               toAsset: nextHop.toAsset,
@@ -3104,7 +3104,7 @@ async function buildFundingTreePlan(amountOverrides = {}, opts = {}) {
         amount,
         fromMeta,
         toMeta,
-        label: `${fromMeta.name || fromMeta.id} → ${toMeta.name || toMeta.id}`,
+        label: `${fromMeta.name || fromMeta.id} [${fromChain}] → ${toMeta.name || toMeta.id} [${toChain}]`,
         _fundingTree: {
           parentIndex: e.parent,
           childIndex: e.child,
@@ -3140,7 +3140,7 @@ async function buildFundingTreePlan(amountOverrides = {}, opts = {}) {
         amount,
         fromMeta,
         toMeta,
-        label: `${fromMeta.name || fromMeta.id} → ${toMeta.name || toMeta.id} [return to root]`,
+        label: `${fromMeta.name || fromMeta.id} [${fromChain}] → ${toMeta.name || toMeta.id} [${toChain}] [return to root]`,
         _fundingTree: {
           kind: "return_to_root",
           leafIndex: r.leafIndex,

@@ -366,7 +366,7 @@ app.post("/api/consolidate-and-run", async (req, res) => {
       fromAsset: srcId, toAsset: String(targetId),
       fromChain: fromChainType, toChain: toChainType,
       amount: useAmount, fromMeta, toMeta: targetMeta,
-      label: `${fromMeta.name || srcId} → ${targetMeta.name || targetId} [consolidation]`,
+      label: `${fromMeta.name || srcId} [${fromChainType}] → ${targetMeta.name || targetId} [${toChainType}] [consolidation]`,
       executionMode: "allChains",
     });
   }
@@ -419,7 +419,7 @@ app.post("/api/run/route", async (req, res) => {
   const to   = config.chains[toChain];
   if (!from || !to) return res.status(400).json({ error: "Unknown chain" });
   res.json({ started: true });
-  runner.runRoute({ fromChain, toChain, fromAsset: from.asset, toAsset: to.asset, amount: 50000, label: `${from.name} → ${to.name}` })
+  runner.runRoute({ fromChain, toChain, fromAsset: from.asset, toAsset: to.asset, amount: 50000, label: `${from.name} [${fromChain}] → ${to.name} [${toChain}]` })
     .catch(err => broadcast("error", { message: err.message }));
 });
 
@@ -731,7 +731,7 @@ async function _doBuildRoutesForReadiness() {
         amount:    parseInt(from.min_amount || 50000),
         fromMeta:  from,
         toMeta:    to,
-        label:     `${from.name} → ${to.name}`,
+        label:     `${from.name} [${getWalletTypeForAsset(from)}] → ${to.name} [${getWalletTypeForAsset(to)}]`,
       });
     }
   }
@@ -1463,7 +1463,7 @@ app.post("/api/arbitrage/execute", async (req, res) => {
       fromAsset: fromAssetId,
       toAsset:   toAssetId,
       amount:    verification.amount,
-      label:     `Arb: ${fromAssetId} → ${toAssetId}`,
+      label:     `Arb: ${fromAssetId} [${fromWalletType}] → ${toAssetId} [${toWalletType}]`,
     }).then(result => {
       if (result && result.status === "pass") {
         recordArbTrade({
@@ -1520,7 +1520,7 @@ app.post("/api/run/combination", async (req, res) => {
     amount,
     fromMeta,
     toMeta,
-    label: `${fromAssetId} → ${toAssetId}`,
+    label: `${fromAssetId} [${fromWalletType || "evm"}] → ${toAssetId} [${toWalletType || "evm"}]`,
   }).catch(err => broadcast("error", { message: err.message }));
 });
 
