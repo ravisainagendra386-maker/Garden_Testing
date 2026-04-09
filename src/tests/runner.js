@@ -2840,6 +2840,15 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
             };
             const bypassCheck = await resolveToAssetWithGasSubstitution(bypassRoute, supportedAssets, gasCache);
             if (bypassCheck.ok) {
+              // Track that this asset failed on the current chain before bypassing
+              results.push({
+                testId: `${route.fromAsset}_on_${toChainPrefix}`,
+                label: `${route.fromMeta?.name || route.fromAsset} on ${toChainPrefix} (skipped - insufficient liquidity)`,
+                status: "fail",
+                error: "insufficient_liquidity",
+                ts: new Date().toISOString(),
+              });
+
               const bypassRes = await runRoute({ ...bypassCheck.route, suiteEpoch, executionMode: "allChains" });
               results.push(bypassRes);
               if (bypassRes.status === "pass") {
