@@ -2637,6 +2637,8 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
   }
 
   // Skip standalone routes that preflight marked as skippable liquidity failures.
+  // Track skipped routes to count them as failed in the final results.
+  const skippedRoutes = [];
   if (Array.isArray(simSummary.skippedFlows) && simSummary.skippedFlows.length) {
     const skipKeys = new Set(
       simSummary.skippedFlows
@@ -2646,7 +2648,10 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
     if (skipKeys.size) {
       for (let i = standalone.length - 1; i >= 0; i--) {
         const r = standalone[i];
-        if (skipKeys.has(`${r.fromAsset}::${r.toAsset}`)) standalone.splice(i, 1);
+        if (skipKeys.has(`${r.fromAsset}::${r.toAsset}`)) {
+          skippedRoutes.unshift(r);
+          standalone.splice(i, 1);
+        }
       }
     }
   }
@@ -2988,6 +2993,17 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
     await chainPromise;
   } else {
     await Promise.all([chainPromise, runStandalonePool()]);
+  }
+
+  // Count skipped routes as failed routes
+  for (const route of skippedRoutes) {
+    results.push({
+      testId: `${route.fromAsset}_${route.toAsset}`,
+      label: route.label,
+      status: "fail",
+      error: "insufficient_liquidity",
+      ts: new Date().toISOString(),
+    });
   }
 
   const passed = results.filter(r => r.status === "pass").length;
