@@ -2274,45 +2274,67 @@ async function simulateExecutionPreflight(amountOverrides = {}, mode = "allTests
         bySeed.get(r._chainStart).push(r);
       }
     }
-    // Pick the same single random seed that runAll would pick
+    // Check all seeds and pick one with sufficient balance; only consolidate if none are sufficient
     const seedEntries = pickRandomizedSeedEntries(bySeed);
-    const pickedSeed = seedEntries[0];
-    if (pickedSeed) {
-      const [seedId, chainRoutes] = pickedSeed;
+    let pickedSeed = null;
+    let insufficientSeeds = [];
+
+    for (const [seedId, chainRoutes] of seedEntries) {
       const req = await computeChainRequiredSeed(chainRoutes).catch(() => null);
       const seedBal = getWalletAssetAtomicBalance(chainRoutes[0]);
       const seedBalNum = seedBal !== null ? Number(seedBal) : null;
       const sufficient = req && seedBalNum !== null ? seedBalNum >= req.requiredSeedAtomic : null;
+
+      if (sufficient) {
+        // Found a seed with enough balance — use this one
+        pickedSeed = [seedId, chainRoutes];
+        emit("allchains_preflight", {
+          seedAsset: seedId,
+          hopCount: chainRoutes.length,
+          requiredSeedAtomic: req?.requiredSeedAtomic ?? null,
+          seedBalanceAtomic: seedBalNum,
+          sufficient: true,
+          shortfall: 0,
+          hopBreakdown: req?.hopBreakdown ?? null,
+        });
+        break;
+      } else {
+        // Insufficient balance — save for potential consolidation fallback
+        insufficientSeeds.push({ seedId, chainRoutes, req, seedBalNum });
+      }
+    }
+
+    // If no seed had sufficient balance, offer consolidation for the first insufficient seed
+    if (!pickedSeed && insufficientSeeds.length > 0) {
+      const { seedId, chainRoutes, req, seedBalNum } = insufficientSeeds[0];
       emit("allchains_preflight", {
         seedAsset: seedId,
         hopCount: chainRoutes.length,
         requiredSeedAtomic: req?.requiredSeedAtomic ?? null,
         seedBalanceAtomic: seedBalNum,
-        sufficient,
-        shortfall: req && seedBalNum !== null && !sufficient
+        sufficient: false,
+        shortfall: req && seedBalNum !== null && req.requiredSeedAtomic > seedBalNum
           ? req.requiredSeedAtomic - seedBalNum
           : 0,
         hopBreakdown: req?.hopBreakdown ?? null,
       });
-      if (req && seedBalNum !== null && !sufficient) {
-        return {
-          mode,
-          ok: false,
-          totalFlows: chainRoutes.length,
-          passedFlows: 0,
-          failedFlows: 1,
-          skippedFlows: [],
-          skippedFlowIds: [],
-          requiredStartByFlow: [],
-          failedFlow: {
-            flowId: `seed:${seedId}`,
-            reason: "insufficient_seed_balance",
-            error: `Need ${req.requiredSeedAtomic} atomic but have ${seedBalNum} (shortfall ${req.requiredSeedAtomic - seedBalNum})`,
-          },
-          chainRequirement: req,
-          seedBalanceAtomic: seedBalNum,
-        };
-      }
+      return {
+        mode,
+        ok: false,
+        totalFlows: chainRoutes.length,
+        passedFlows: 0,
+        failedFlows: 1,
+        skippedFlows: [],
+        skippedFlowIds: [],
+        requiredStartByFlow: [],
+        failedFlow: {
+          flowId: `seed:${seedId}`,
+          reason: "insufficient_seed_balance",
+          error: `Need ${req.requiredSeedAtomic} atomic but have ${seedBalNum} (shortfall ${req.requiredSeedAtomic - seedBalNum})`,
+        },
+        chainRequirement: req,
+        seedBalanceAtomic: seedBalNum,
+      };
     }
   }
 
