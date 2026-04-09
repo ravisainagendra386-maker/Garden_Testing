@@ -2765,7 +2765,6 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
 
       // ── Execute the hop ──────────────────────────────────────────────
       const result = await runRoute({ ...route, suiteEpoch, executionMode: mode });
-      results.push(result);
 
       // If the dest was substituted to native and the hop passed, mark gas as funded
       if (result.status === "pass" && destCheck.substituted) {
@@ -2773,10 +2772,20 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
         gasCache.set(fundedChain, MIN_NATIVE_WEI_FOR_GAS);
       }
 
-      if (result.status !== "pass") {
-        if (mode === "allChains") {
+      if (result.status === "pass") {
+        results.push(result);
+      } else if (mode === "allChains") {
+        // Track initial failure with per-asset-per-chain context before attempting fallbacks
+        const toChainPrefix = String(route.toAsset || '').split(':')[0].toLowerCase();
+        results.push({
+          testId: `${route.toAsset}_on_${toChainPrefix}`,
+          label: `${route.toMeta?.name || route.toAsset} on ${toChainPrefix} (insufficient liquidity)`,
+          status: "fail",
+          error: "insufficient_liquidity",
+          ts: new Date().toISOString(),
+        });
+
           // Dest fallback: try other assets on the same destination chain
-          const toChainPrefix = String(route.toAsset || '').split(':')[0].toLowerCase();
           const triedDests = new Set([route.toAsset]);
           const destCandidates = supportedAssets
             .filter(a => {
@@ -2802,9 +2811,30 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
               label: `${route.fromMeta?.name || route.fromAsset} [${route.fromChain}] → ${cand.name || cand.id} [${route.toChain}] [dest fallback]`,
             };
             const candCheck = await resolveToAssetWithGasSubstitution(candRoute, supportedAssets, gasCache);
-            if (!candCheck.ok) continue;
+            if (!candCheck.ok) {
+              // Track fallback destination attempts that fail gas check
+              results.push({
+                testId: `${cand.id}_on_${toChainPrefix}`,
+                label: `${cand.name || cand.id} on ${toChainPrefix} (fallback - gas check failed)`,
+                status: "fail",
+                error: "gas_check_failed",
+                ts: new Date().toISOString(),
+              });
+              continue;
+            }
             const tryRes = await runRoute({ ...candCheck.route, suiteEpoch, executionMode: "allChains" });
-            results.push(tryRes);
+            if (tryRes.status === "fail") {
+              // Track fallback destination attempts that failed execution
+              results.push({
+                testId: `${cand.id}_on_${toChainPrefix}`,
+                label: `${cand.name || cand.id} on ${toChainPrefix} (fallback - insufficient liquidity)`,
+                status: "fail",
+                error: "insufficient_liquidity",
+                ts: new Date().toISOString(),
+              });
+            } else {
+              results.push(tryRes);
+            }
             if (tryRes.status === "pass") {
               replaced = true;
               if (i + 1 < chainRoutes.length) {
@@ -2884,6 +2914,9 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
               : `Chain broken at ${route.label} — ${result.error || result.status}`,
         });
         break;
+      } else {
+        // Non-allChains failure (allTests mode)
+        results.push(result);
       }
 
       // ── Patch next hop from received output ──────────────────────────
