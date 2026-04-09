@@ -2274,10 +2274,11 @@ async function simulateExecutionPreflight(amountOverrides = {}, mode = "allTests
         bySeed.get(r._chainStart).push(r);
       }
     }
-    // Check all seeds and pick one with sufficient balance; only consolidate if none are sufficient
+    // Check all seeds and pick one with sufficient balance (randomly if multiple); only consolidate if none are sufficient
     const seedEntries = pickRandomizedSeedEntries(bySeed);
     let pickedSeed = null;
     let insufficientSeeds = [];
+    let sufficientSeeds = [];
 
     for (const [seedId, chainRoutes] of seedEntries) {
       const req = await computeChainRequiredSeed(chainRoutes).catch(() => null);
@@ -2286,22 +2287,28 @@ async function simulateExecutionPreflight(amountOverrides = {}, mode = "allTests
       const sufficient = req && seedBalNum !== null ? seedBalNum >= req.requiredSeedAtomic : null;
 
       if (sufficient) {
-        // Found a seed with enough balance — use this one
-        pickedSeed = [seedId, chainRoutes];
-        emit("allchains_preflight", {
-          seedAsset: seedId,
-          hopCount: chainRoutes.length,
-          requiredSeedAtomic: req?.requiredSeedAtomic ?? null,
-          seedBalanceAtomic: seedBalNum,
-          sufficient: true,
-          shortfall: 0,
-          hopBreakdown: req?.hopBreakdown ?? null,
-        });
-        break;
+        // Sufficient balance — add to pool for random selection
+        sufficientSeeds.push([seedId, chainRoutes, req, seedBalNum]);
       } else {
         // Insufficient balance — save for potential consolidation fallback
         insufficientSeeds.push({ seedId, chainRoutes, req, seedBalNum });
       }
+    }
+
+    // Pick a random seed from sufficient ones
+    if (sufficientSeeds.length > 0) {
+      const randomIdx = Math.floor(Math.random() * sufficientSeeds.length);
+      const [seedId, chainRoutes, req, seedBalNum] = sufficientSeeds[randomIdx];
+      pickedSeed = [seedId, chainRoutes];
+      emit("allchains_preflight", {
+        seedAsset: seedId,
+        hopCount: chainRoutes.length,
+        requiredSeedAtomic: req?.requiredSeedAtomic ?? null,
+        seedBalanceAtomic: seedBalNum,
+        sufficient: true,
+        shortfall: 0,
+        hopBreakdown: req?.hopBreakdown ?? null,
+      });
     }
 
     // If no seed had sufficient balance, offer consolidation for the first insufficient seed
