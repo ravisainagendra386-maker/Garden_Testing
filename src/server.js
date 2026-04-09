@@ -356,7 +356,27 @@ app.post("/api/consolidate-and-run", async (req, res) => {
     if (!fromChainType) continue;
     const minAmt = Math.max(1, parseInt(String(fromMeta.min_amount ?? 50000), 10) || 50000);
     const maxAmt = fromMeta.max_amount ? parseInt(String(fromMeta.max_amount), 10) : null;
-    let useAmount = Math.max(minAmt, Math.floor(amount));
+
+    // For consolidation: reserve gas buffer to ensure tx can execute
+    // This prevents "insufficient funds for gas" errors when consolidating full balance
+    // EVM chains need higher buffer (~0.1 ETH for gas), others use 1% reserve
+    let amountWithGasBuffer = amount;
+    if (fromChainType === 'evm') {
+      // Reserve ~0.1 ETH equivalent for gas (in atomic units, assuming 18 decimals)
+      const GAS_RESERVE_WEI = BigInt('100000000000000000'); // 0.1 ETH
+      const amountBig = BigInt(Math.floor(amount));
+      if (amountBig > GAS_RESERVE_WEI) {
+        amountWithGasBuffer = Number(amountBig - GAS_RESERVE_WEI);
+      } else {
+        amountWithGasBuffer = Math.max(minAmt, Math.floor(amount * 0.5)); // Use 50% if balance is small
+      }
+    } else {
+      // Non-EVM chains: simple 1% reserve
+      const gasBufferPercent = 0.01;
+      amountWithGasBuffer = Math.floor(amount * (1 - gasBufferPercent));
+    }
+
+    let useAmount = Math.max(minAmt, amountWithGasBuffer);
     if (maxAmt && useAmount > maxAmt) useAmount = maxAmt;
     consolidationRoutes.push({
       fromAsset: srcId, toAsset: String(targetId),
