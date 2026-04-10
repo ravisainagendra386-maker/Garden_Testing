@@ -79,6 +79,21 @@ async function getAssetsForRunner() {
   return _runnerAssetInFlight;
 }
 
+// In-flight order cache (prevents duplicate BTC orders while waiting on confirmations/indexer).
+// Keyed per hop (from/to asset + owners). Cleared when order reaches a terminal state.
+const _inFlightOrderByHopKey = new Map();
+function hopKey({ fromAsset, toAsset, fromOwner, toOwner }) {
+  return `${fromAsset}|${toAsset}|${fromOwner}|${toOwner}`;
+}
+function isTerminalGardenStatus(statusRaw) {
+  const s = String(statusRaw || "").toLowerCase().replace(/\s+/g, "");
+  return ["expired", "refunded", "failed", "cancelled", "redeemed", "completed"].some(t => s.includes(t));
+}
+function isPastInitiationGardenStatus(statusRaw) {
+  const s = String(statusRaw || "").toLowerCase().replace(/\s+/g, "");
+  return ["initiatedetected", "initiated", "counterpartyinitiatedetected", "counterpartyinitiated", "redeemed", "completed"]
+    .some(t => s.includes(t));
+}
 
 let _emit = null;
 let _approvalQueue = [];
@@ -127,8 +142,8 @@ function patchNextChainHopFromReceive(nextRoute, prevPassResult) {
   const amount = clampGardenQuoteAmount(nextHopAmountAtomic, actualDestMeta);
   const fromName = actualDestMeta.name || actualDestAsset;
   const toName = nextRoute.toMeta?.name || nextRoute.toAsset;
-  const toChainName = config.chains[nextRoute.toChain]?.name || nextRoute.toChain;
-  const fromChainName = config.chains[fromChain]?.name || fromChain;
+  const fromChainName = getChainDisplayName(actualDestMeta);
+  const toChainName = nextRoute.toMeta ? getChainDisplayName(nextRoute.toMeta) : (config.chains[nextRoute.toChain]?.name || nextRoute.toChain);
   Object.assign(nextRoute, {
     fromAsset: actualDestAsset,
     fromMeta: actualDestMeta,
@@ -234,6 +249,19 @@ function getWalletTypeForAsset(asset) {
     return null;
   }
   return null;
+}
+
+/** Resolve a human-readable chain name from an asset (e.g. "Base", "Arbitrum").
+ *  Uses the asset ID prefix (before ':') to look up config.chains[key].name.
+ *  Falls back to getWalletTypeForAsset() if no match found. */
+function getChainDisplayName(asset) {
+  const prefix = (asset.id || "").split(":")[0].toLowerCase();
+  const cfg = require("../config").chains || {};
+  if (cfg[prefix]?.name) return cfg[prefix].name;
+  // Strip network suffixes (e.g. "hyperevm_testnet" → "hyperevm", "ethereum_sepolia" → "ethereum")
+  const base = prefix.replace(/_sepolia|_testnet\d*|_mainnet|_signet|_devnet/g, "");
+  if (base !== prefix && cfg[base]?.name) return cfg[base].name;
+  return getWalletTypeForAsset(asset) || prefix || "unknown";
 }
 
 function pickTokenAddress(...candidates) {
@@ -746,6 +774,10 @@ async function runRoute({
   let swapDestMeta = toMeta;
 
   try {
+    // Bitcoin orders take much longer (10min+ block times, multiple confirmations).
+    // All timeouts scale up when BTC is involved to prevent abandoning live orders.
+    const isBtcInvolved = fromChain === "bitcoin" || toChain === "bitcoin";
+
     // 1. Wallet addresses
     const envEvmAvailable = envkey.isAvailable();
     const envEvmAddress = envkey.getEvmAddress?.() || null;
@@ -1058,6 +1090,33 @@ async function runRoute({
     step("Create Order", "running");
     checkAbort();
     let orderRes;
+    let orderId;
+    const hopCacheKey = isBtcInvolved
+      ? hopKey({ fromAsset, toAsset: swapDestAsset, fromOwner: fromAddress, toOwner: toAddress })
+      : null;
+
+    // If BTC is involved and we already have an in-flight order for this hop, reuse it.
+    // This prevents creating multiple BTC orders while waiting on long confirmation/indexer delays.
+    if (hopCacheKey && _inFlightOrderByHopKey.has(hopCacheKey)) {
+      const cachedId = _inFlightOrderByHopKey.get(hopCacheKey);
+      try {
+        const existing = await garden.getOrder(cachedId);
+        const ord = existing?.result || existing;
+        const st = (ord?.status || ord?.order_status || ord?.state || "").toLowerCase().replace(/\s+/g, "");
+        if (!isTerminalGardenStatus(st)) {
+          orderRes = { status: "Ok", result: ord };
+          orderId = cachedId;
+          step("Create Order", "pass", `Reusing in-flight order ID: ${orderId} (status: ${st || "unknown"})`);
+        } else {
+          _inFlightOrderByHopKey.delete(hopCacheKey);
+        }
+      } catch (_) {
+        // If we can't load it, drop cache and proceed to create a fresh order.
+        _inFlightOrderByHopKey.delete(hopCacheKey);
+      }
+    }
+
+    if (!orderRes) {
     for (let attempt = 0; attempt < 2; attempt++) {
       // Fresh quote immediately before order — keeps the window as small as possible
       try {
@@ -1090,9 +1149,10 @@ async function runRoute({
         throw orderErr;
       }
     }
+    }
     console.log("[order response]", JSON.stringify(orderRes).slice(0, 400));
 
-    const orderId     = orderRes.result?.order_id || orderRes.result?.id;
+    orderId = orderId || orderRes.result?.order_id || orderRes.result?.id;
     const htlcAddress = orderRes.result?.source?.htlc_address
                      || orderRes.result?.source?.swap_id
                      || orderRes.result?.to;
@@ -1100,6 +1160,7 @@ async function runRoute({
 
     if (!orderId) throw new Error(`No order_id in response: ${JSON.stringify(orderRes).slice(0, 200)}`);
     step("Create Order", "pass", `Order ID: ${orderId}`);
+    if (hopCacheKey) _inFlightOrderByHopKey.set(hopCacheKey, orderId);
 
     // 6. Manual approval gate
     if (config.manualApprove) {
@@ -1235,10 +1296,29 @@ async function runRoute({
     checkAbort();
     let initTxHash;
     if (fromChain === "bitcoin") {
+      // If this order was already initiated (or detected) don't broadcast a second BTC tx.
+      try {
+        const cur = await garden.getOrder(orderId);
+        const ord = cur?.result || cur;
+        const st = (ord?.status || ord?.order_status || ord?.state || "").toLowerCase().replace(/\s+/g, "");
+        const srcSwap = ord?.source_swap || ord?.source || null;
+        const existingInit =
+          srcSwap?.initiate_tx_hash ||
+          srcSwap?.initiate_txid ||
+          srcSwap?.initiate_tx ||
+          ord?.initiate_tx_hash ||
+          ord?.initiate_txid;
+        if (existingInit || isPastInitiationGardenStatus(st)) {
+          initTxHash = existingInit || "btc_initiate_already_detected";
+          step("Initiate HTLC", "pass", `Skipped — already initiated/detected (${st || "unknown"})`, typeof initTxHash === "string" ? initTxHash : null);
+        }
+      } catch (_) {}
+      if (!initTxHash) {
       const btcWif     = walletState.getBtcWif();
       const btcAddress = walletState.getBtcAddress();
       if (!btcWif) throw new Error("BTC private key (WIF) not saved");
       initTxHash = await initiateHtlc({ htlcAddress, amountSats: htlcAmount, wif: btcWif, fromAddress: btcAddress });
+      }
     } else if (fromChain === "evm") {
       const prebuiltTx = orderRes.result?.initiate_transaction;
       const signData   = orderRes.result?.sign_data || orderRes.result?.eip712_data || orderRes.result?.permit_data;
@@ -1390,10 +1470,11 @@ async function runRoute({
 
       // Notify Garden can take a long time depending on chain/indexer latency.
       // We use a "soft timeout": retry frequently for 20 minutes, then back off
-      // to every 10 minutes. Hard timeout at 30 minutes to prevent indefinite hang
-      // when the RPC is down and confirmation wait already failed.
-      const NOTIFY_SOFT_TIMEOUT = 20 * 60 * 1000;
-      const NOTIFY_HARD_TIMEOUT = 30 * 60 * 1000;
+      // to every 10 minutes. Hard timeout varies by chain — Bitcoin blocks take
+      // ~10 minutes and may need multiple confirmations, so we allow 90 minutes.
+      const isBtcInvolved = fromChain === "bitcoin" || toChain === "bitcoin";
+      const NOTIFY_SOFT_TIMEOUT = isBtcInvolved ? 60 * 60 * 1000 : 20 * 60 * 1000;
+      const NOTIFY_HARD_TIMEOUT = isBtcInvolved ? 90 * 60 * 1000 : 30 * 60 * 1000;
       const NOTIFY_POST_SOFT_INTERVAL = 10 * 60 * 1000;
       function getNotifyInterval(elapsedMs) {
         if (elapsedMs < 2 * 60 * 1000)  return 10000;
@@ -1410,6 +1491,12 @@ async function runRoute({
         checkAbort();
         const elapsed = Date.now() - notifyStart;
         if (elapsed > NOTIFY_HARD_TIMEOUT) {
+          if (isBtcInvolved) {
+            // Bitcoin orders must not be abandoned — the tx is already on-chain.
+            // Garden's indexer will detect it eventually; continue to solver polling.
+            step("Notify Garden", "running", `Notify timed out after ${Math.round(elapsed / 60000)}m — continuing to poll order (Bitcoin tx on-chain, waiting for Garden indexer)`);
+            break;
+          }
           throw new Error(`Notify Garden timed out after ${Math.round(elapsed / 60000)}m — RPC may be unreachable (tx: ${initTxHash})`);
         }
         notifyAttempts++;
@@ -1477,10 +1564,11 @@ async function runRoute({
       step("Solver Initiated", "running", "Waiting for solver to lock on destination chain…");
       checkAbort();
 
+      const SOLVER_POLL_TIMEOUT = isBtcInvolved ? 3600000 : 600000; // 60min BTC, 10min others
       const solverResult = await garden.pollOrder(
         orderId,
         "counterpartyinitiated",
-        600000,
+        SOLVER_POLL_TIMEOUT,
         5000,
         (status, order) => {
           const pretty = {
@@ -1570,7 +1658,7 @@ async function runRoute({
 
     // 11. Poll for completion
     step("Completion", "running", "Waiting for redeem_tx_hash on destination…");
-    const COMPLETION_TIMEOUT = 300000;
+    const COMPLETION_TIMEOUT = isBtcInvolved ? 1800000 : 300000; // 30min BTC, 5min others
     const COMPLETION_INTERVAL = 5000;
     const completionStart = Date.now();
     let lastStatus = "";
@@ -1648,6 +1736,8 @@ async function runRoute({
 
     emit("test_end", { testId, label, status: "pass", steps, duration: elapsed });
     _activeTests.delete(testId);
+    // Clear hop cache once order is complete/terminal.
+    if (hopCacheKey) _inFlightOrderByHopKey.delete(hopCacheKey);
     return {
       testId,
       label,
@@ -1676,6 +1766,17 @@ async function runRoute({
         ts: new Date().toISOString(),
         agent: "runner", error: err.message, steps,
       });
+    } catch (_) {}
+    // If BTC is involved, keep the in-flight order cached unless it reached a terminal state.
+    // This prevents the next retry loop from creating a second BTC order while the first is still pending.
+    try {
+      if (hopCacheKey && typeof orderId === "string" && orderId) {
+        const cur = await garden.getOrder(orderId);
+        const ord = cur?.result || cur;
+        const st = (ord?.status || ord?.order_status || ord?.state || "").toLowerCase().replace(/\s+/g, "");
+        if (isTerminalGardenStatus(st)) _inFlightOrderByHopKey.delete(hopCacheKey);
+        else _inFlightOrderByHopKey.set(hopCacheKey, orderId);
+      }
     } catch (_) {}
     _activeTests.delete(testId);
     return { testId, label, status: "fail", error: err.message, steps };
@@ -1815,7 +1916,7 @@ async function buildRoutes(amountOverrides = {}, mode = "allTests", seedAllowlis
         amount:    chosenAmount,
         fromMeta:  from,
         toMeta:    to,
-        label:     `${from.name} [${fromChain}] → ${to.name} [${toChain}]`,
+        label:     `${from.name} [${getChainDisplayName(from)}] → ${to.name} [${getChainDisplayName(to)}]`,
         executionMode: mode,
       });
     }
@@ -2420,7 +2521,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
       const gasRoute = {
         fromAsset: fromMeta.id, toAsset: nativeMeta.id,
         fromChain, toChain: 'evm', amount, fromMeta, toMeta: nativeMeta,
-        label: `${fromMeta.name || fromMeta.id} [${fromChain}] → ${nativeMeta.name || nativeMeta.id} [evm] [gas fill: ${destChainKey}]`,
+        label: `${fromMeta.name || fromMeta.id} [${getChainDisplayName(fromMeta)}] → ${nativeMeta.name || nativeMeta.id} [${getChainDisplayName(nativeMeta)}] [gas fill: ${destChainKey}]`,
         executionMode: 'allTests', suiteEpoch,
       };
       emit("suite_info", { message: `Pre-filling gas on ${destChainKey}: ${gasRoute.label}` });
@@ -2511,7 +2612,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
             fromAsset: altFromMeta.id, toAsset: childMeta.id,
             fromChain: altFromChain, toChain, amount,
             fromMeta: altFromMeta, toMeta: childMeta,
-            label: `${altFromMeta.name || altFromMeta.id} [${altFromChain}] → ${childMeta.name || childMeta.id} [${toChain}] [fallback parent]`,
+            label: `${altFromMeta.name || altFromMeta.id} [${getChainDisplayName(altFromMeta)}] → ${childMeta.name || childMeta.id} [${getChainDisplayName(childMeta)}] [fallback parent]`,
             executionMode: 'allTests', suiteEpoch,
           };
           emit("suite_info", { message: `Fallback parent for ${childMeta.id}: trying ${altFromMeta.id}` });
@@ -2743,7 +2844,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
           // Bypass skipped chain: re-route to next chain's destination.
           // Keep current source, skip the intermediary chain that has no gas.
           const nextHop = chainRoutes[i + 1];
-          const bypassLabel = `${chainRoutes[i].fromMeta?.name || chainRoutes[i].fromAsset} [${chainRoutes[i].fromChain}] → ${nextHop.toMeta?.name || nextHop.toAsset} [${nextHop.toChain}]`;
+          const bypassLabel = `${chainRoutes[i].fromMeta?.name || chainRoutes[i].fromAsset} [${chainRoutes[i].fromMeta ? getChainDisplayName(chainRoutes[i].fromMeta) : chainRoutes[i].fromChain}] → ${nextHop.toMeta?.name || nextHop.toAsset} [${nextHop.toMeta ? getChainDisplayName(nextHop.toMeta) : nextHop.toChain}]`;
           Object.assign(nextHop, {
             fromAsset: chainRoutes[i].fromAsset,
             fromMeta:  chainRoutes[i].fromMeta,
@@ -2808,7 +2909,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
               ...route,
               toAsset: cand.id,
               toMeta: cand,
-              label: `${route.fromMeta?.name || route.fromAsset} [${route.fromChain}] → ${cand.name || cand.id} [${route.toChain}] [dest fallback]`,
+              label: `${route.fromMeta?.name || route.fromAsset} [${route.fromMeta ? getChainDisplayName(route.fromMeta) : route.fromChain}] → ${cand.name || cand.id} [${getChainDisplayName(cand)}] [dest fallback]`,
             };
             const candCheck = await resolveToAssetWithGasSubstitution(candRoute, supportedAssets, gasCache);
             if (!candCheck.ok) {
@@ -2860,7 +2961,7 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
           if (i + 1 < chainRoutes.length) {
             const nextHop = chainRoutes[i + 1];
             const nextChainPrefix = String(nextHop.toAsset || '').split(':')[0].toLowerCase();
-            const bypassLabel = `${route.fromMeta?.name || route.fromAsset} [${route.fromChain}] → ${nextHop.toMeta?.name || nextHop.toAsset} [${nextHop.toChain}] [chain skip: ${toChainPrefix}]`;
+            const bypassLabel = `${route.fromMeta?.name || route.fromAsset} [${route.fromMeta ? getChainDisplayName(route.fromMeta) : route.fromChain}] → ${nextHop.toMeta?.name || nextHop.toAsset} [${nextHop.toMeta ? getChainDisplayName(nextHop.toMeta) : nextHop.toChain}] [chain skip: ${toChainPrefix}]`;
             const bypassRoute = {
               ...route,
               toAsset: nextHop.toAsset,
@@ -2906,7 +3007,6 @@ async function runAll(amountOverrides = {}, mode = "allTests", seedAllowlist = n
             });
             continue;
           }
-        }
         emit("suite_info", {
           message:
             result.status === "skipped"
@@ -3162,7 +3262,7 @@ async function buildFundingTreePlan(amountOverrides = {}, opts = {}) {
         amount,
         fromMeta,
         toMeta,
-        label: `${fromMeta.name || fromMeta.id} [${fromChain}] → ${toMeta.name || toMeta.id} [${toChain}]`,
+        label: `${fromMeta.name || fromMeta.id} [${getChainDisplayName(fromMeta)}] → ${toMeta.name || toMeta.id} [${getChainDisplayName(toMeta)}]`,
         _fundingTree: {
           parentIndex: e.parent,
           childIndex: e.child,
@@ -3198,7 +3298,7 @@ async function buildFundingTreePlan(amountOverrides = {}, opts = {}) {
         amount,
         fromMeta,
         toMeta,
-        label: `${fromMeta.name || fromMeta.id} [${fromChain}] → ${toMeta.name || toMeta.id} [${toChain}] [return to root]`,
+        label: `${fromMeta.name || fromMeta.id} [${getChainDisplayName(fromMeta)}] → ${toMeta.name || toMeta.id} [${getChainDisplayName(toMeta)}] [return to root]`,
         _fundingTree: {
           kind: "return_to_root",
           leafIndex: r.leafIndex,
